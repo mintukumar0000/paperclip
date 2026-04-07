@@ -55,6 +55,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  createPostgresUser?: boolean;
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -300,6 +301,21 @@ if (config.databaseUrl) {
     logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PostgreSQL");
   }
 
+  const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  const createPostgresUser = parseBooleanEnv(
+    process.env.PAPERCLIP_EMBEDDED_POSTGRES_CREATE_USER,
+    runningAsRoot,
+  );
+
+  if (runningAsRoot) {
+    logger.warn(
+      {
+        createPostgresUser,
+      },
+      "Process is running as root; embedded PostgreSQL will create and run under a postgres user",
+    );
+  }
+
   const clusterVersionFile = resolve(dataDir, "PG_VERSION");
   const clusterAlreadyInitialized = existsSync(clusterVersionFile);
   const postmasterPidFile = resolve(dataDir, "postmaster.pid");
@@ -341,6 +357,7 @@ if (config.databaseUrl) {
       password: "paperclip",
       port,
       persistent: true,
+      createPostgresUser,
       onLog: appendEmbeddedPostgresLog,
       onError: appendEmbeddedPostgresLog,
     });
