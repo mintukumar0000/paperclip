@@ -14,6 +14,7 @@ import {
   storageCheck,
   type CheckResult,
 } from "../checks/index.js";
+import { loadAgentJwtEnvFile, resolveAgentJwtEnvFile } from "../config/env.js";
 import { printPaperclipCliBanner } from "../utils/banner.js";
 
 const STATUS_ICON = {
@@ -57,6 +58,9 @@ export async function doctor(opts: {
     printResult(readResult);
     return printSummary(results);
   }
+
+  // Load .env next to the resolved config before checks that read process.env.
+  loadAgentJwtEnvFile(resolveAgentJwtEnvFile(configPath));
 
   // 2. Deployment/auth mode check
   const deploymentAuthResult = deploymentAuthCheck(config);

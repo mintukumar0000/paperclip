@@ -1,6 +1,7 @@
 import { readConfigFile } from "./config-file.js";
 import { existsSync } from "node:fs";
 import { config as loadDotenv } from "dotenv";
+import path from "node:path";
 import { resolvePaperclipEnvPath } from "./paths.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -25,6 +26,22 @@ import {
 const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
 if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
   loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+}
+
+function findNearestDotenvPath(startDir: string): string | null {
+  let currentDir = path.resolve(startDir);
+  while (true) {
+    const candidate = path.resolve(currentDir, ".env");
+    if (existsSync(candidate)) return candidate;
+    const parent = path.resolve(currentDir, "..");
+    if (parent === currentDir) return null;
+    currentDir = parent;
+  }
+}
+
+const nearestDotenvPath = findNearestDotenvPath(process.cwd());
+if (nearestDotenvPath && nearestDotenvPath !== PAPERCLIP_ENV_FILE_PATH) {
+  loadDotenv({ path: nearestDotenvPath, override: false, quiet: true });
 }
 
 type DatabaseMode = "embedded-postgres" | "postgres";
@@ -59,6 +76,8 @@ export interface Config {
   storageS3ForcePathStyle: boolean;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  executionLoopSchedulerEnabled: boolean;
+  executionLoopSchedulerIntervalMs: number;
   companyDeletionEnabled: boolean;
 }
 
@@ -216,6 +235,8 @@ export function loadConfig(): Config {
     storageS3ForcePathStyle,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    executionLoopSchedulerEnabled: process.env.EXECUTION_LOOP_SCHEDULER_ENABLED !== "false",
+    executionLoopSchedulerIntervalMs: Math.max(10000, Number(process.env.EXECUTION_LOOP_SCHEDULER_INTERVAL_MS) || 30000),
     companyDeletionEnabled,
   };
 }

@@ -1,6 +1,17 @@
 import type { Approval, Issue, IssueAttachment, IssueComment, IssueLabel } from "@paperclipai/shared";
 import { api } from "./client";
 
+export interface IssueArtifact {
+  id: string;
+  source: "attachment" | "run_result";
+  kind: "image" | "html" | "file" | "link" | "log";
+  title: string;
+  url: string | null;
+  runId: string | null;
+  contentType: string | null;
+  createdAt: string;
+}
+
 export const issuesApi = {
   list: (
     companyId: string,
@@ -49,6 +60,7 @@ export const issuesApi = {
       },
     ),
   listAttachments: (id: string) => api.get<IssueAttachment[]>(`/issues/${id}/attachments`),
+  listArtifacts: (id: string) => api.get<IssueArtifact[]>(`/issues/${id}/artifacts`),
   uploadAttachment: (
     companyId: string,
     issueId: string,

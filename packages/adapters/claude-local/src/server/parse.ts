@@ -138,6 +138,25 @@ export function detectClaudeLoginRequired(input: {
   };
 }
 
+export function detectClaudeCreditLow(input: {
+  parsed: Record<string, unknown> | null;
+  stdout: string;
+  stderr: string;
+}): { creditLow: boolean; detail: string | null } {
+  const resultText = asString(input.parsed?.result, "").trim();
+  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const match = messages.find((line) => /credit[\s_-]*balance[\s_-]*too[\s_-]*low|insufficient[\s_-]*credits?/i.test(line));
+  return {
+    creditLow: Boolean(match),
+    detail: match ?? null,
+  };
+}
+
 export function describeClaudeFailure(parsed: Record<string, unknown>): string | null {
   const subtype = asString(parsed.subtype, "");
   const resultText = asString(parsed.result, "").trim();

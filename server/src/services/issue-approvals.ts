@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";

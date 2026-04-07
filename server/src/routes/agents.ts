@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import { agents as agentsTable, companies, heartbeatRuns } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, not, sql } from "@paperclipai/db";
 import {
   createAgentKeySchema,
   createAgentHireSchema,
@@ -27,7 +27,7 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { conflict, forbidden, unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { findServerAdapter, listAdapterModels } from "../adapters/index.js";
 import { redactEventPayload } from "../redaction.js";
@@ -58,6 +58,7 @@ export function agentRoutes(db: Db) {
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
   function canCreateAgents(agent: { role: string; permissions: Record<string, unknown> | null | undefined }) {
+    if (agent.role === "ceo") return true;
     if (!agent.permissions || typeof agent.permissions !== "object") return false;
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
@@ -123,36 +124,12 @@ export function agentRoutes(db: Db) {
     throw forbidden("Only CEO or agent creators can modify other agents");
   }
 
-  async function resolveCompanyIdForAgentReference(req: Request): Promise<string | null> {
-    const companyIdQuery = req.query.companyId;
-    const requestedCompanyId =
-      typeof companyIdQuery === "string" && companyIdQuery.trim().length > 0
-        ? companyIdQuery.trim()
-        : null;
-    if (requestedCompanyId) {
-      assertCompanyAccess(req, requestedCompanyId);
-      return requestedCompanyId;
-    }
-    if (req.actor.type === "agent" && req.actor.companyId) {
-      return req.actor.companyId;
-    }
-    return null;
-  }
-
-  async function normalizeAgentReference(req: Request, rawId: string): Promise<string> {
+  async function normalizeAgentReference(_req: Request, rawId: string): Promise<string> {
     const raw = rawId.trim();
-    if (isUuidLike(raw)) return raw;
-
-    const companyId = await resolveCompanyIdForAgentReference(req);
-    if (!companyId) {
-      throw unprocessable("Agent shortname lookup requires companyId query parameter");
+    if (!isUuidLike(raw)) {
+      throw unprocessable("Agent routes require a UUID reference. Use agent.id.");
     }
-
-    const resolved = await svc.resolveByReference(companyId, raw);
-    if (resolved.ambiguous) {
-      throw conflict("Agent shortname is ambiguous in this company. Use the agent ID.");
-    }
-    return resolved.agent?.id ?? raw;
+    return raw;
   }
 
   function parseSourceIssueIds(input: {
@@ -379,6 +356,31 @@ export function agentRoutes(db: Db) {
 
   router.get("/companies/:companyId/agents", async (req, res) => {
     const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const result = await svc.list(companyId);
+    const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
+    if (canReadConfigs || req.actor.type === "board") {
+      res.json(result);
+      return;
+    }
+    res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+  });
+
+  // Backward-compatible list route for clients that still call /api/agents?companyId=...
+  router.get("/agents", async (req, res) => {
+    const companyIdParam = req.query.companyId;
+    const companyId =
+      typeof companyIdParam === "string" && companyIdParam.trim().length > 0
+        ? companyIdParam.trim()
+        : req.actor.type === "agent"
+          ? req.actor.companyId
+          : null;
+
+    if (!companyId) {
+      res.status(400).json({ error: "companyId query parameter is required" });
+      return;
+    }
+
     assertCompanyAccess(req, companyId);
     const result = await svc.list(companyId);
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
@@ -1314,7 +1316,7 @@ export function agentRoutes(db: Db) {
   router.get("/issues/:issueId/live-runs", async (req, res) => {
     const rawId = req.params.issueId as string;
     const issueSvc = issueService(db);
-    const isIdentifier = /^[A-Z]+-\d+$/i.test(rawId);
+    const isIdentifier = /^[A-Z0-9-]+-\d+$/i.test(rawId);
     const issue = isIdentifier ? await issueSvc.getByIdentifier(rawId) : await issueSvc.getById(rawId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -1352,7 +1354,7 @@ export function agentRoutes(db: Db) {
   router.get("/issues/:issueId/active-run", async (req, res) => {
     const rawId = req.params.issueId as string;
     const issueSvc = issueService(db);
-    const isIdentifier = /^[A-Z]+-\d+$/i.test(rawId);
+    const isIdentifier = /^[A-Z0-9-]+-\d+$/i.test(rawId);
     const issue = isIdentifier ? await issueSvc.getByIdentifier(rawId) : await issueSvc.getById(rawId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });

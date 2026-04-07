@@ -9,6 +9,19 @@ import {
   SquarePen,
   Network,
   Settings,
+  Blocks,
+  GitBranch,
+  Brain,
+  Sparkles,
+  MessageSquare,
+  Activity,
+  Globe,
+  Store,
+  GraduationCap,
+  Expand,
+  Shield,
+  HeartPulse,
+  FlaskConical,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SidebarSection } from "./SidebarSection";
@@ -89,13 +102,32 @@ export function Sidebar() {
         <SidebarSection label="Work">
           <SidebarNavItem to="/issues" label="Issues" icon={CircleDot} />
           <SidebarNavItem to="/goals" label="Goals" icon={Target} />
+          <SidebarNavItem to="/workflows" label="Workflows" icon={GitBranch} />
         </SidebarSection>
 
         <SidebarProjects />
 
         <SidebarAgents />
 
+        <SidebarSection label="Intelligence">
+          <SidebarNavItem to="/strategy" label="Strategy" icon={Sparkles} />
+          <SidebarNavItem to="/memory" label="Memory" icon={Brain} />
+          <SidebarNavItem to="/messages" label="Messages" icon={MessageSquare} />
+          <SidebarNavItem to="/ai-dashboard" label="AI Dashboard" icon={Activity} />
+          <SidebarNavItem to="/learning" label="Learning" icon={GraduationCap} />
+        </SidebarSection>
+
+        <SidebarSection label="Governance">
+          <SidebarNavItem to="/governance" label="Constitution" icon={Shield} />
+          <SidebarNavItem to="/ecosystem" label="Ecosystem" icon={Globe} />
+          <SidebarNavItem to="/economy" label="Economy" icon={Store} />
+          <SidebarNavItem to="/expansion" label="Expansion" icon={Expand} />
+          <SidebarNavItem to="/stability" label="Stability" icon={HeartPulse} />
+          <SidebarNavItem to="/simulation" label="Simulation" icon={FlaskConical} />
+        </SidebarSection>
+
         <SidebarSection label="Company">
+          <SidebarNavItem to="/templates" label="Templates" icon={Blocks} />
           <SidebarNavItem to="/org" label="Org" icon={Network} />
           <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
           <SidebarNavItem to="/activity" label="Activity" icon={History} />

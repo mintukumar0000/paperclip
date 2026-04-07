@@ -55,7 +55,14 @@ import {
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { AgentIcon, AgentIconPicker } from "../components/AgentIconPicker";
-import { isUuidLike, type Agent, type HeartbeatRun, type HeartbeatRunEvent, type AgentRuntimeState } from "@paperclipai/shared";
+import {
+  isUuidLike,
+  type Agent,
+  type HeartbeatRun,
+  type HeartbeatRunEvent,
+  type AgentRuntimeState,
+  type AgentTaskSession,
+} from "@paperclipai/shared";
 import { agentRouteRef } from "../lib/utils";
 
 const runStatusIcons: Record<string, { icon: typeof CheckCircle2; color: string }> = {
@@ -269,12 +276,21 @@ export function AgentDetail() {
     queryKey: queryKeys.agents.runtimeState(agentLookupRef),
     queryFn: () => agentsApi.runtimeState(agentLookupRef, resolvedCompanyId ?? undefined),
     enabled: Boolean(agentLookupRef),
+    refetchInterval: 2000,
+  });
+
+  const { data: taskSessions } = useQuery({
+    queryKey: queryKeys.agents.taskSessions(agentLookupRef),
+    queryFn: () => agentsApi.taskSessions(agentLookupRef, resolvedCompanyId ?? undefined),
+    enabled: Boolean(agentLookupRef),
+    refetchInterval: 2000,
   });
 
   const { data: heartbeats } = useQuery({
     queryKey: queryKeys.heartbeats(resolvedCompanyId!, agent?.id ?? undefined),
     queryFn: () => heartbeatsApi.list(resolvedCompanyId!, agent?.id ?? undefined),
     enabled: !!resolvedCompanyId && !!agent?.id,
+    refetchInterval: 2000,
   });
 
   const { data: allIssues } = useQuery({
@@ -626,6 +642,7 @@ export function AgentDetail() {
           runs={heartbeats ?? []}
           assignedIssues={assignedIssues}
           runtimeState={runtimeState}
+          taskSessions={taskSessions ?? []}
           reportsToAgent={reportsToAgent ?? null}
           directReports={directReports}
           agentId={agent.id}
@@ -747,6 +764,7 @@ function AgentOverview({
   runs,
   assignedIssues,
   runtimeState,
+  taskSessions,
   reportsToAgent,
   directReports,
   agentId,
@@ -756,6 +774,7 @@ function AgentOverview({
   runs: HeartbeatRun[];
   assignedIssues: { id: string; title: string; status: string; priority: string; identifier?: string | null; createdAt: Date }[];
   runtimeState?: AgentRuntimeState;
+  taskSessions: AgentTaskSession[];
   reportsToAgent: Agent | null;
   directReports: Agent[];
   agentId: string;
@@ -812,6 +831,17 @@ function AgentOverview({
         )}
       </div>
 
+      <div className="space-y-3">
+        <h3 className="text-sm font-medium">Execution Trust</h3>
+        <ReliabilityPanel
+          agentId={agent.id}
+          companyId={agent.companyId}
+          runs={runs}
+          runtimeState={runtimeState}
+          taskSessions={taskSessions}
+        />
+      </div>
+
       {/* Costs */}
       <div className="space-y-3">
         <h3 className="text-sm font-medium">Costs</h3>
@@ -825,6 +855,162 @@ function AgentOverview({
         reportsToAgent={reportsToAgent}
         directReports={directReports}
       />
+    </div>
+  );
+}
+
+function ReliabilityPanel({
+  agentId,
+  companyId,
+  runs,
+  runtimeState,
+  taskSessions,
+}: {
+  agentId: string;
+  companyId: string;
+  runs: HeartbeatRun[];
+  runtimeState?: AgentRuntimeState;
+  taskSessions: AgentTaskSession[];
+}) {
+  const queryClient = useQueryClient();
+  const sortedRuns = [...runs].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const latestRun = sortedRuns[0] ?? null;
+  const latestFailedRun = sortedRuns.find((run) => run.status === "failed" || run.status === "timed_out") ?? null;
+
+  const latestRunLog = useQuery({
+    queryKey: ["agent-overview-log", latestRun?.id ?? "none"],
+    queryFn: () => heartbeatsApi.log(latestRun!.id, 0, 12_000),
+    enabled: Boolean(latestRun?.id),
+    refetchInterval:
+      latestRun && (latestRun.status === "running" || latestRun.status === "queued")
+        ? 2000
+        : false,
+  });
+
+  const retryFailedRun = useMutation({
+    mutationFn: async () => {
+      if (!latestFailedRun) throw new Error("No failed run available");
+      const context = asRecord(latestFailedRun.contextSnapshot);
+      const payload: Record<string, unknown> = {};
+      const issueId = asNonEmptyString(context?.issueId);
+      const taskId = asNonEmptyString(context?.taskId);
+      const taskKey = asNonEmptyString(context?.taskKey);
+      if (issueId) payload.issueId = issueId;
+      if (taskId) payload.taskId = taskId;
+      if (taskKey) payload.taskKey = taskKey;
+
+      const result = await agentsApi.wakeup(
+        agentId,
+        {
+          source: "on_demand",
+          triggerDetail: "manual",
+          reason: "retry_failed_run_from_overview",
+          payload,
+        },
+        companyId,
+      );
+
+      if (!("id" in result)) {
+        throw new Error("Retry skipped because the agent is not currently invokable.");
+      }
+      return result;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(companyId, agentId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.runtimeState(agentId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.taskSessions(agentId) });
+    },
+  });
+
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <div className="rounded-lg border border-border p-3 space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Runtime</span>
+          {latestRun && <StatusBadge status={latestRun.status} />}
+        </div>
+
+        <div className="space-y-1 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Last run</span>
+            <span className="font-mono">{latestRun ? latestRun.id.slice(0, 8) : "-"}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Last update</span>
+            <span>{runtimeState?.updatedAt ? relativeTime(runtimeState.updatedAt) : "-"}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Task sessions</span>
+            <span>{taskSessions.length}</span>
+          </div>
+        </div>
+
+        {runtimeState?.lastError && (
+          <div className="rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-300">
+            <div className="font-medium">Last error</div>
+            <div className="mt-1 break-words">{runtimeState.lastError}</div>
+          </div>
+        )}
+
+        {latestFailedRun && (
+          <div className="space-y-2">
+            <div className="text-xs text-muted-foreground">
+              Failed run {latestFailedRun.id.slice(0, 8)} · {relativeTime(latestFailedRun.createdAt)}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => retryFailedRun.mutate()}
+              disabled={retryFailedRun.isPending}
+            >
+              <RotateCcw className="h-3.5 w-3.5 mr-1" />
+              {retryFailedRun.isPending ? "Retrying..." : "Retry failed run"}
+            </Button>
+            {retryFailedRun.isError && (
+              <p className="text-xs text-destructive">
+                {retryFailedRun.error instanceof Error ? retryFailedRun.error.message : "Retry failed"}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-lg border border-border p-3 space-y-3">
+        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Task History + Logs</span>
+
+        {taskSessions.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No task session history yet.</p>
+        ) : (
+          <div className="max-h-28 overflow-y-auto rounded border border-border/70">
+            <table className="min-w-full text-xs">
+              <thead className="bg-muted/20 text-muted-foreground">
+                <tr>
+                  <th className="px-2 py-1 text-left font-medium">Task</th>
+                  <th className="px-2 py-1 text-left font-medium">Last Run</th>
+                  <th className="px-2 py-1 text-left font-medium">Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {taskSessions.slice(0, 8).map((session) => (
+                  <tr key={session.id} className="border-t border-border/70">
+                    <td className="px-2 py-1 font-mono">{session.taskKey.slice(0, 16)}</td>
+                    <td className="px-2 py-1 font-mono text-muted-foreground">{session.lastRunId ? session.lastRunId.slice(0, 8) : "-"}</td>
+                    <td className="px-2 py-1 text-muted-foreground">{relativeTime(session.updatedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="rounded border border-border/70 bg-neutral-950 p-2">
+          <div className="mb-1 text-[11px] text-neutral-400">Latest run log preview</div>
+          <pre className="max-h-32 overflow-y-auto whitespace-pre-wrap text-[11px] text-neutral-100">
+            {latestRunLog.data?.content || "No log output available yet."}
+          </pre>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1057,7 +1243,6 @@ function AgentConfigurePage({
     mutationFn: (revisionId: string) => agentsApi.rollbackConfigRevision(agent.id, revisionId, companyId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
     },
   });
@@ -1162,7 +1347,6 @@ function ConfigurationTab({
     mutationFn: (data: Record<string, unknown>) => agentsApi.update(agent.id, data, companyId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.id) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.agents.detail(agent.urlKey) });
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.configRevisions(agent.id) });
     },
   });

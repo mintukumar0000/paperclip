@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions } from "@paperclipai/db";
 import type { AgentEnvConfig, EnvBinding, SecretProvider } from "@paperclipai/shared";

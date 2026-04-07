@@ -1,11 +1,12 @@
 /// <reference path="./types/express.d.ts" />
+process.setMaxListeners(25);
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import type { Request as ExpressRequest, RequestHandler } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq } from "@paperclipai/db";
 import {
   createDb,
   ensurePostgresDatabase,
@@ -24,10 +25,12 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
-import { heartbeatService } from "./services/index.js";
+import { heartbeatService, issueService } from "./services/index.js";
+import { getRedisUrl, isRedisReachable } from "./redis/index.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
+import { performPlaywrightRealActionForIssue } from "./services/real-action.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -57,6 +60,20 @@ type EmbeddedPostgresCtor = new (opts: {
 }) => EmbeddedPostgresInstance;
 
 const config = loadConfig();
+const isWorkerOnly = process.env.WORKER_ONLY === "true";
+
+function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (typeof value !== "string") return defaultValue;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return defaultValue;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return defaultValue;
+}
+
+const aiEnabled = parseBooleanEnv(process.env.AI_ENABLED, true);
+const autoExecutionEnabled = parseBooleanEnv(process.env.AUTO_EXECUTION, true);
+const revenuePriorityModeEnabled = parseBooleanEnv(process.env.REVENUE_PRIORITY_MODE, false);
 if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
   process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
 }
@@ -222,6 +239,7 @@ let db;
 let embeddedPostgres: EmbeddedPostgresInstance | null = null;
 let embeddedPostgresStartedByThisProcess = false;
 let migrationSummary: MigrationSummary = "skipped";
+const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
 let activeDatabaseConnectionString: string;
 let startupDbInfo:
   | { mode: "external-postgres"; connectionString: string }
@@ -430,117 +448,376 @@ if (config.deploymentMode === "authenticated") {
   authReady = true;
 }
 
-const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
-const storageService = createStorageServiceFromConfig(config);
-const app = await createApp(db as any, {
-  uiMode,
-  storageService,
-  deploymentMode: config.deploymentMode,
-  deploymentExposure: config.deploymentExposure,
-  allowedHostnames: config.allowedHostnames,
-  bindHost: config.host,
-  authReady,
-  companyDeletionEnabled: config.companyDeletionEnabled,
-  betterAuthHandler,
-  resolveSession,
-});
-const server = createServer(app);
-const listenPort = await detectPort(config.port);
+let server: ReturnType<typeof createServer> | null = null;
+let listenPort = config.port;
 
-if (listenPort !== config.port) {
-  logger.warn(`Requested port is busy; using next free port (requestedPort=${config.port}, selectedPort=${listenPort})`);
-}
+if (!isWorkerOnly) {
+  const storageService = createStorageServiceFromConfig(config);
+  const app = await createApp(db as any, {
+    uiMode,
+    storageService,
+    deploymentMode: config.deploymentMode,
+    deploymentExposure: config.deploymentExposure,
+    allowedHostnames: config.allowedHostnames,
+    bindHost: config.host,
+    authReady,
+    companyDeletionEnabled: config.companyDeletionEnabled,
+    betterAuthHandler,
+    resolveSession,
+  });
+  server = createServer(app as any);
+  listenPort = await detectPort(config.port);
 
-const runtimeListenHost = config.host;
-const runtimeApiHost =
-  runtimeListenHost === "0.0.0.0" || runtimeListenHost === "::"
-    ? "localhost"
-    : runtimeListenHost;
-process.env.PAPERCLIP_LISTEN_HOST = runtimeListenHost;
-process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
-process.env.PAPERCLIP_API_URL = `http://${runtimeApiHost}:${listenPort}`;
+  if (listenPort !== config.port) {
+    logger.warn(`Requested port is busy; using next free port (requestedPort=${config.port}, selectedPort=${listenPort})`);
+  }
 
-setupLiveEventsWebSocketServer(server, db as any, {
-  deploymentMode: config.deploymentMode,
-  resolveSessionFromHeaders,
-});
+  const runtimeListenHost = config.host;
+  const runtimeApiHost =
+    runtimeListenHost === "0.0.0.0" || runtimeListenHost === "::"
+      ? "localhost"
+      : runtimeListenHost;
+  process.env.PAPERCLIP_LISTEN_HOST = runtimeListenHost;
+  process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
+  process.env.PAPERCLIP_API_URL = `http://${runtimeApiHost}:${listenPort}`;
 
-if (config.heartbeatSchedulerEnabled) {
-  const heartbeat = heartbeatService(db as any);
-
-  // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
-  void heartbeat.reapOrphanedRuns().catch((err) => {
-    logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
+  setupLiveEventsWebSocketServer(server, db as any, {
+    deploymentMode: config.deploymentMode,
+    resolveSessionFromHeaders,
   });
 
-  setInterval(() => {
-    void heartbeat
-      .tickTimers(new Date())
-      .then((result) => {
-        if (result.enqueued > 0) {
-          logger.info({ ...result }, "heartbeat timer tick enqueued runs");
-        }
-      })
-      .catch((err) => {
-        logger.error({ err }, "heartbeat timer tick failed");
-      });
+  if (config.heartbeatSchedulerEnabled) {
+    const heartbeat = heartbeatService(db as any);
 
-    // Periodically reap orphaned runs (5-min staleness threshold)
-    void heartbeat
-      .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-      .catch((err) => {
-        logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
-      });
-  }, config.heartbeatSchedulerIntervalMs);
-}
+    // Reap orphaned runs at startup (no threshold -- runningProcesses is empty)
+    void heartbeat.reapOrphanedRuns().catch((err) => {
+      logger.error({ err }, "startup reap of orphaned heartbeat runs failed");
+    });
 
-if (config.databaseBackupEnabled) {
-  const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
-  let backupInFlight = false;
+    setInterval(() => {
+      void heartbeat
+        .tickTimers(new Date())
+        .then((result) => {
+          if (result.enqueued > 0) {
+            logger.info({ ...result }, "heartbeat timer tick enqueued runs");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "heartbeat timer tick failed");
+        });
 
-  const runScheduledBackup = async () => {
-    if (backupInFlight) {
-      logger.warn("Skipping scheduled database backup because a previous backup is still running");
-      return;
-    }
+      // Periodically reap orphaned runs (5-min staleness threshold)
+      void heartbeat
+        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+        .catch((err) => {
+          logger.error({ err }, "periodic reap of orphaned heartbeat runs failed");
+        });
+    }, config.heartbeatSchedulerIntervalMs);
+  }
 
-    backupInFlight = true;
-    try {
-      const result = await runDatabaseBackup({
-        connectionString: activeDatabaseConnectionString,
-        backupDir: config.databaseBackupDir,
-        retentionDays: config.databaseBackupRetentionDays,
-        filenamePrefix: "paperclip",
-      });
-      logger.info(
-        {
-          backupFile: result.backupFile,
-          sizeBytes: result.sizeBytes,
-          prunedCount: result.prunedCount,
+  if (config.databaseBackupEnabled) {
+    const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
+    let backupInFlight = false;
+
+    const runScheduledBackup = async () => {
+      if (backupInFlight) {
+        logger.warn("Skipping scheduled database backup because a previous backup is still running");
+        return;
+      }
+
+      backupInFlight = true;
+      try {
+        const result = await runDatabaseBackup({
+          connectionString: activeDatabaseConnectionString,
           backupDir: config.databaseBackupDir,
           retentionDays: config.databaseBackupRetentionDays,
-        },
-        `Automatic database backup complete: ${formatDatabaseBackupResult(result)}`,
-      );
-    } catch (err) {
-      logger.error({ err, backupDir: config.databaseBackupDir }, "Automatic database backup failed");
-    } finally {
-      backupInFlight = false;
-    }
-  };
+          filenamePrefix: "paperclip",
+        });
+        logger.info(
+          {
+            backupFile: result.backupFile,
+            sizeBytes: result.sizeBytes,
+            prunedCount: result.prunedCount,
+            backupDir: config.databaseBackupDir,
+            retentionDays: config.databaseBackupRetentionDays,
+          },
+          `Automatic database backup complete: ${formatDatabaseBackupResult(result)}`,
+        );
+      } catch (err) {
+        logger.error({ err, backupDir: config.databaseBackupDir }, "Automatic database backup failed");
+      } finally {
+        backupInFlight = false;
+      }
+    };
 
-  logger.info(
+    logger.info(
+      {
+        intervalMinutes: config.databaseBackupIntervalMinutes,
+        retentionDays: config.databaseBackupRetentionDays,
+        backupDir: config.databaseBackupDir,
+      },
+      "Automatic database backups enabled",
+    );
+    setInterval(() => {
+      void runScheduledBackup();
+    }, backupIntervalMs);
+  }
+
+  // --- AI Company Execution Loop ---
+  // Start the autonomous AI company loop on a periodic timer.
+  if (aiEnabled) {
+    const { startCompanyLoop } = await import("./ai/orchestration/companyLoop.js");
+    const AI_LOOP_INTERVAL_MS = 30_000; // 30 seconds
+    const stopLoop = startCompanyLoop(db as any, AI_LOOP_INTERVAL_MS);
+    process.once("SIGINT", stopLoop);
+    process.once("SIGTERM", stopLoop);
+    logger.info({ intervalMs: AI_LOOP_INTERVAL_MS }, "AI company execution loop started");
+  } else {
+    logger.warn("AI loop startup skipped because AI_ENABLED=false");
+  }
+
+  // --- Issue Execution Loop Scheduler ---
+  // Periodically assign and dispatch backlog/todo issues without manual triggers.
+  if (autoExecutionEnabled && config.executionLoopSchedulerEnabled) {
+    const { executionLoop } = await import("./core/executionLoop.js");
+    const loop = executionLoop(db as any);
+    let cycleInFlight = false;
+
+    const runScheduledExecutionLoop = async () => {
+      if (cycleInFlight) {
+        logger.warn("Skipping execution loop scheduler tick because previous cycle is still running");
+        return;
+      }
+
+      cycleInFlight = true;
+      try {
+        const results = await loop.runAll();
+        const dispatched = results.reduce((sum, result) => sum + result.tasksDispatched, 0);
+        if (dispatched > 0) {
+          logger.info(
+            {
+              companiesProcessed: results.length,
+              tasksDispatched: dispatched,
+            },
+            "Execution loop scheduler tick dispatched work",
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, "Execution loop scheduler tick failed");
+      } finally {
+        cycleInFlight = false;
+      }
+    };
+
+    setInterval(() => {
+      void runScheduledExecutionLoop();
+    }, config.executionLoopSchedulerIntervalMs);
+
+    logger.info(
+      { intervalMs: config.executionLoopSchedulerIntervalMs },
+      "Execution loop scheduler started",
+    );
+  } else if (!autoExecutionEnabled) {
+    logger.warn("Execution loop scheduler skipped because AUTO_EXECUTION=false");
+  }
+
+  // --- Traffic Generation Loop ---
+  if (aiEnabled) {
+    const { startTrafficLoop } = await import("./core/trafficLoop.js");
+    const stopTrafficLoop = startTrafficLoop(db as any, 3 * 60 * 60_000);
+    process.once("SIGINT", stopTrafficLoop);
+    process.once("SIGTERM", stopTrafficLoop);
+  }
+
+  if (aiEnabled) {
+    // --- Reddit Reply Agent ---
     {
-      intervalMinutes: config.databaseBackupIntervalMinutes,
-      retentionDays: config.databaseBackupRetentionDays,
-      backupDir: config.databaseBackupDir,
-    },
-    "Automatic database backups enabled",
-  );
-  setInterval(() => {
-    void runScheduledBackup();
-  }, backupIntervalMs);
+      const { startRedditReplyAgent } = await import("./ai/distribution/redditReplyAgent.js");
+      const stopReplyAgent = startRedditReplyAgent(db as any, 15 * 60_000);
+      process.once("SIGINT", stopReplyAgent);
+      process.once("SIGTERM", stopReplyAgent);
+    }
+
+    // --- Email Sequence Scheduler ---
+    {
+      const { startEmailSequenceScheduler } = await import("./ai/distribution/emailSequence.js");
+      const stopEmailSeq = startEmailSequenceScheduler(db as any, 60 * 60_000);
+      process.once("SIGINT", stopEmailSeq);
+      process.once("SIGTERM", stopEmailSeq);
+    }
+
+    if (!revenuePriorityModeEnabled) {
+      // --- Strategy Brain (Persistent Thinking Layer) — 2h cycles for faster iteration ---
+      {
+        const { startStrategyBrain } = await import("./ai/brain/strategyBrain.js");
+        const stopBrain = startStrategyBrain(db as any, 2 * 60 * 60_000);
+        process.once("SIGINT", stopBrain);
+        process.once("SIGTERM", stopBrain);
+      }
+    } else {
+      logger.warn("Strategy brain skipped because REVENUE_PRIORITY_MODE=true");
+    }
+
+    // --- Conversion Controller (promote winners, kill losers, generate challengers) ---
+    {
+      const { startConversionController } = await import("./ai/conversion/conversionController.js");
+      const stopConversion = startConversionController(db as any, 2 * 60 * 60_000);
+      process.once("SIGINT", stopConversion);
+      process.once("SIGTERM", stopConversion);
+    }
+
+    if (!revenuePriorityModeEnabled) {
+      // --- SEO Content Engine ---
+      {
+        const { startSEOContentEngine } = await import("./ai/distribution/seoContentEngine.js");
+        const stopSEO = startSEOContentEngine(db as any, 12 * 60 * 60_000);
+        process.once("SIGINT", stopSEO);
+        process.once("SIGTERM", stopSEO);
+      }
+    } else {
+      logger.warn("SEO content engine skipped because REVENUE_PRIORITY_MODE=true");
+    }
+
+    if (!revenuePriorityModeEnabled) {
+      // --- Agent Coordinator (CEO/CMO/CRO/CFO) — 2h cycles for faster iteration ---
+      {
+        const { startAgentCoordinator } = await import("./ai/agents/agentCoordinator.js");
+        const stopCoordinator = startAgentCoordinator(db as any, 2 * 60 * 60_000);
+        process.once("SIGINT", stopCoordinator);
+        process.once("SIGTERM", stopCoordinator);
+      }
+    } else {
+      logger.warn("Agent coordinator skipped because REVENUE_PRIORITY_MODE=true");
+    }
+
+    if (!revenuePriorityModeEnabled) {
+      // --- Continuous Thinking Loop (15-min micro-decisions) ---
+      {
+        const { startContinuousThinking } = await import("./ai/brain/continuousThinking.js");
+        const stopThinking = startContinuousThinking(db as any, 15 * 60_000);
+        process.once("SIGINT", stopThinking);
+        process.once("SIGTERM", stopThinking);
+      }
+    } else {
+      logger.warn("Continuous thinking loop skipped because REVENUE_PRIORITY_MODE=true");
+    }
+  }
 }
+
+// --- Evolution: Distributed Worker & Queue System ---
+// Initialize BullMQ worker when Redis is configured.
+// In WORKER_ONLY mode, start the worker and skip the HTTP server entirely.
+const redisReachable = await isRedisReachable();
+
+if (aiEnabled && isWorkerOnly && redisReachable) {
+  try {
+    const { createAgentWorker } = await import("./workers/agentWorker.js");
+    const hbSvc = heartbeatService(db as any);
+    const issuesSvc = issueService(db as any);
+
+    createAgentWorker({
+      invokeHeartbeat: async (params) => {
+        const result = await hbSvc.invoke(
+          params.agentId,
+          "automation",
+          {
+            ...(params.context ?? {}),
+            ...(params.issueId ? { issueId: params.issueId, taskId: params.issueId } : {}),
+          },
+          "system",
+        );
+        return { runId: result?.id ?? "unknown" };
+      },
+      markIssueCompleted: async ({ issueId, agentId }) => {
+        const existing = await issuesSvc.getById(issueId);
+        if (!existing) return;
+        if (existing.assigneeAgentId && existing.assigneeAgentId !== agentId) return;
+        await issuesSvc.update(issueId, {
+          status: "done",
+          assigneeAgentId: agentId,
+          assigneeUserId: null,
+        });
+      },
+      markIssueFailed: async ({ issueId, agentId }) => {
+        const existing = await issuesSvc.getById(issueId);
+        if (!existing) return;
+        if (existing.assigneeAgentId && existing.assigneeAgentId !== agentId) return;
+        await issuesSvc.update(issueId, {
+          status: "blocked",
+          assigneeAgentId: agentId,
+          assigneeUserId: null,
+        });
+      },
+      executeRealAction: async ({ issueId, agentId, companyId, runId }) =>
+        performPlaywrightRealActionForIssue(db as any, {
+          issueId,
+          agentId,
+          companyId,
+          runId,
+        }),
+    });
+
+    logger.info({ redisUrl: getRedisUrl() }, "Distributed agent worker started (BullMQ + Redis)");
+  } catch (err) {
+    logger.warn({ err }, "Distributed worker system not available (Redis may not be configured)");
+  }
+} else if (isWorkerOnly && !aiEnabled) {
+  logger.warn("Distributed worker system disabled because AI_ENABLED=false");
+} else if (isWorkerOnly) {
+  logger.warn(
+    { redisUrl: getRedisUrl() },
+    "Distributed worker system disabled because Redis is not reachable",
+  );
+}
+
+if (aiEnabled && redisReachable) {
+  try {
+    const { createDecisionWorker } = await import("./workers/decisionWorker.js");
+    const { runDecisionCycleForCompany } = await import("./services/decision-dispatch.js");
+
+    createDecisionWorker({
+      runDecisionCycle: async ({ companyId, source, windowMinutes, reason }) => {
+        await runDecisionCycleForCompany(db as any, {
+          companyId,
+          source,
+          windowMinutes,
+          reason,
+        });
+      },
+    });
+
+    logger.info({ redisUrl: getRedisUrl() }, "Decision-cycle worker started (BullMQ + Redis)");
+  } catch (err) {
+    logger.warn({ err }, "Decision-cycle worker not available");
+  }
+} else if (!aiEnabled) {
+  logger.warn("Decision-cycle worker skipped because AI_ENABLED=false");
+}
+
+// Load company templates at startup
+try {
+  const { loadTemplates } = await import("./templates/templateLoader.js");
+  const templates = loadTemplates();
+  logger.info({ templateCount: templates.length }, "Company templates loaded");
+} catch (err) {
+  logger.warn({ err }, "Failed to load company templates");
+}
+
+// In WORKER_ONLY mode, skip HTTP server startup — this process only runs workers.
+if (isWorkerOnly) {
+  logger.info("Running in WORKER_ONLY mode — HTTP server skipped, worker processing queue jobs");
+  // Keep the process alive; the BullMQ worker keeps its own event loop running.
+  // Graceful shutdown on SIGINT/SIGTERM
+  const workerShutdown = (signal: string) => {
+    logger.info({ signal }, "Worker shutting down");
+    process.exit(0);
+  };
+  process.once("SIGINT", () => workerShutdown("SIGINT"));
+  process.once("SIGTERM", () => workerShutdown("SIGTERM"));
+} else {
+  if (!server) {
+    throw new Error("HTTP server initialization failed in non-worker mode");
+  }
 
 server.listen(listenPort, config.host, () => {
   logger.info(`Server listening on ${config.host}:${listenPort}`);
@@ -610,3 +887,4 @@ if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
     void shutdown("SIGTERM");
   });
 }
+} // end of else (non-WORKER_ONLY mode)

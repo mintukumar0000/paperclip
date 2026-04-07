@@ -1,0 +1,61 @@
+{
+  "id": "ai-agency",
+  "name": "AI Agency",
+  "description": "AI company template for an agency that builds AI solutions for clients.",
+  "agents": [
+    {
+      "name": "Agency Director",
+      "role": "ceo",
+      "systemPrompt": "You are the director of an AI agency. You manage client relationships, scope projects, and ensure delivery quality."
+    },
+    {
+      "name": "AI Engineer",
+      "role": "engineer",
+      "systemPrompt": "You are an AI engineer. You build ML models, data pipelines, and AI-powered features for client projects."
+    },
+    {
+      "name": "Project Coordinator",
+      "role": "manager",
+      "systemPrompt": "You are the project coordinator. You track timelines, manage resources, and communicate progress to stakeholders."
+    },
+    {
+      "name": "Research Analyst",
+      "role": "researcher",
+      "systemPrompt": "You are a research analyst. You evaluate new AI techniques, benchmark models, and recommend technical approaches."
+    }
+  ],
+  "goals": [
+    {
+      "title": "Deliver first client project",
+      "level": "company",
+      "description": "Successfully complete and deliver the first client engagement."
+    },
+    {
+      "title": "Build reusable AI toolkit",
+      "level": "company",
+      "description": "Create a library of reusable components and patterns across client projects."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Client Engagements",
+      "description": "Active client projects and deliverables."
+    },
+    {
+      "name": "Internal R&D",
+      "description": "Research and reusable tooling development."
+    }
+  ],
+  "workflows": [
+    {
+      "name": "Client Onboarding",
+      "description": "New client project kickoff flow.",
+      "steps": [
+        { "id": "scope", "agent": "ceo", "description": "Scope project requirements" },
+        { "id": "plan", "agent": "manager", "description": "Create project plan and timeline", "dependsOn": ["scope"] },
+        { "id": "research", "agent": "researcher", "description": "Research technical approach", "dependsOn": ["scope"] },
+        { "id": "begin", "agent": "engineer", "description": "Begin implementation", "dependsOn": ["plan", "research"] }
+      ]
+    }
+  ]
+}

@@ -6,6 +6,8 @@ import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { Sparkles } from "lucide-react";
+import { posthog, posthogConfigured } from "@/lib/posthog";
+import { trackCtaClicked, trackEmailSubmitted } from "@/lib/analytics";
 
 type AuthMode = "sign_in" | "sign_up";
 
@@ -46,12 +48,35 @@ export function AuthPage() {
     },
     onSuccess: async () => {
       setError(null);
+      const signedUp = mode === "sign_up";
+      const session = await authApi.getSession();
+
+      if (posthogConfigured && session?.user?.id) {
+        posthog.identify(session.user.id, {
+          email: session.user.email ?? undefined,
+          name: session.user.name ?? undefined,
+          auth_mode: mode,
+        });
+
+        if (signedUp) {
+          posthog.capture("user_signed_up", {
+            method: "email",
+            email: session.user.email ?? undefined,
+          });
+        }
+      }
+
       await queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
       await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
       navigate(nextPath, { replace: true });
     },
     onError: (err) => {
-      setError(err instanceof Error ? err.message : "Authentication failed");
+      const message = err instanceof Error ? err.message : "Authentication failed";
+      if (mode === "sign_in" && /invalid email or password/i.test(message)) {
+        setError('Invalid email or password. If this is your first login on this instance, click "Create one" below.');
+        return;
+      }
+      setError(message);
     },
   });
 
@@ -91,6 +116,8 @@ export function AuthPage() {
             className="mt-6 space-y-4"
             onSubmit={(event) => {
               event.preventDefault();
+              trackCtaClicked("auth_submit", "auth");
+              trackEmailSubmitted("auth_form", email.trim(), "auth");
               mutation.mutate();
             }}
           >

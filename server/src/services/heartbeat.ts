@@ -1,12 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  companies,
   heartbeatRunEvents,
   heartbeatRuns,
   costEvents,
@@ -22,7 +23,11 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { secretService } from "./secrets.js";
+import { debitCompanyFinanceForUsage, getCompanyFinanceSnapshot } from "./company-finance.js";
+import { dispatchDecisionCycle } from "./decision-dispatch.js";
+import { logActivity } from "./activity-log.js";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { contextRetriever } from "../memory/contextRetriever.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
@@ -30,6 +35,7 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
+const FINANCE_DECISION_WINDOW_MS = 5 * 60 * 1000;
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithCap(prev, chunk, MAX_EXCERPT_BYTES);
@@ -406,6 +412,7 @@ function resolveNextSessionState(input: {
 export function heartbeatService(db: Db) {
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
+  const ctxRetriever = contextRetriever(db);
 
   async function getAgent(agentId: string) {
     return db
@@ -997,7 +1004,112 @@ export function heartbeatService(db: Db) {
           updatedAt: new Date(),
         })
         .where(eq(agents.id, agent.id));
+
+      const financeSnapshot = await debitCompanyFinanceForUsage(db, {
+        companyId: agent.companyId,
+        costCents: additionalCostCents,
+      });
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "heartbeat-runtime",
+        agentId: agent.id,
+        runId: run.id,
+        action: "billing.finance.debited",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          costCents: additionalCostCents,
+          provider: result.provider ?? "unknown",
+          model: result.model ?? "unknown",
+          creditsCents: financeSnapshot.creditsCents,
+          revenueCents: financeSnapshot.revenueCents,
+          spentCents: financeSnapshot.spentCents,
+        },
+      });
+
+      const decisionDedupeKey = `finance:cost:${agent.companyId}:${Math.floor(Date.now() / FINANCE_DECISION_WINDOW_MS)}`;
+      const decisionDispatch = await dispatchDecisionCycle(db, {
+        companyId: agent.companyId,
+        source: "manual",
+        reason: "finance.cost.debited",
+        dedupeKey: decisionDedupeKey,
+      });
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "heartbeat-runtime",
+        agentId: agent.id,
+        runId: run.id,
+        action: "finance.decision.dispatch",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          reason: "finance.cost.debited",
+          decisionDispatch,
+          costCents: additionalCostCents,
+          creditsCents: financeSnapshot.creditsCents,
+          spentCents: financeSnapshot.spentCents,
+        },
+      });
     }
+  }
+
+  async function evaluateFinanceExecutionGuard(companyId: string): Promise<
+    | {
+        allowed: true;
+      }
+    | {
+        allowed: false;
+        reason: string;
+        errorCode: "credits_exhausted" | "budget_exceeded";
+        finance: { creditsCents: number; revenueCents: number; spentCents: number };
+        budgetMonthlyCents: number;
+      }
+  > {
+    const [finance, company] = await Promise.all([
+      getCompanyFinanceSnapshot(db, companyId),
+      db
+        .select({ budgetMonthlyCents: companies.budgetMonthlyCents })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    const budgetMonthlyCents = company?.budgetMonthlyCents ?? 0;
+    if (budgetMonthlyCents > 0 && finance.spentCents >= budgetMonthlyCents) {
+      return {
+        allowed: false,
+        reason: "Company budget threshold reached. Execution throttled.",
+        errorCode: "budget_exceeded",
+        finance: {
+          creditsCents: finance.creditsCents,
+          revenueCents: finance.revenueCents,
+          spentCents: finance.spentCents,
+        },
+        budgetMonthlyCents,
+      };
+    }
+
+    const hasEconomicHistory = finance.revenueCents > 0 || finance.spentCents > 0;
+    if (hasEconomicHistory && finance.creditsCents <= 0) {
+      return {
+        allowed: false,
+        reason: "Company credits exhausted. Add funds to continue execution.",
+        errorCode: "credits_exhausted",
+        finance: {
+          creditsCents: finance.creditsCents,
+          revenueCents: finance.revenueCents,
+          spentCents: finance.spentCents,
+        },
+        budgetMonthlyCents,
+      };
+    }
+
+    return { allowed: true };
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
@@ -1063,6 +1175,84 @@ export function heartbeatService(db: Db) {
       return;
     }
 
+    const financeGuard = await evaluateFinanceExecutionGuard(agent.companyId);
+    if (!financeGuard.allowed) {
+      const now = new Date();
+      await setRunStatus(runId, "failed", {
+        error: financeGuard.reason,
+        errorCode: financeGuard.errorCode,
+        finishedAt: now,
+      });
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: now,
+        error: financeGuard.reason,
+      });
+
+      await db
+        .update(agents)
+        .set({ status: "paused", updatedAt: now })
+        .where(eq(agents.id, agent.id));
+
+      const blockedRun = await getRun(runId);
+      if (blockedRun) {
+        await appendRunEvent(blockedRun, 1, {
+          eventType: "error",
+          stream: "system",
+          level: "error",
+          message: financeGuard.reason,
+          payload: {
+            errorCode: financeGuard.errorCode,
+            budgetMonthlyCents: financeGuard.budgetMonthlyCents,
+            ...financeGuard.finance,
+          },
+        });
+        await releaseIssueExecutionAndPromote(blockedRun);
+      }
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "finance-guard",
+        agentId: agent.id,
+        runId: run.id,
+        action: "finance.execution.throttled",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          reason: financeGuard.reason,
+          errorCode: financeGuard.errorCode,
+          budgetMonthlyCents: financeGuard.budgetMonthlyCents,
+          ...financeGuard.finance,
+        },
+      });
+
+      const decisionDedupeKey = `finance:guard:${agent.companyId}:${financeGuard.errorCode}:${Math.floor(Date.now() / FINANCE_DECISION_WINDOW_MS)}`;
+      const decisionDispatch = await dispatchDecisionCycle(db, {
+        companyId: agent.companyId,
+        source: "manual",
+        reason: `finance.guard.${financeGuard.errorCode}`,
+        dedupeKey: decisionDedupeKey,
+      });
+
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "finance-guard",
+        agentId: agent.id,
+        runId: run.id,
+        action: "finance.decision.dispatch",
+        entityType: "company",
+        entityId: agent.companyId,
+        details: {
+          reason: `finance.guard.${financeGuard.errorCode}`,
+          decisionDispatch,
+          ...financeGuard.finance,
+          budgetMonthlyCents: financeGuard.budgetMonthlyCents,
+        },
+      });
+      return;
+    }
+
     const runtime = await ensureRuntimeState(agent);
     const context = parseObject(run.contextSnapshot);
     const taskKey = deriveTaskKey(context, null);
@@ -1073,6 +1263,7 @@ export function heartbeatService(db: Db) {
           .select({
             assigneeAgentId: issues.assigneeAgentId,
             assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+            title: issues.title,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
@@ -1084,6 +1275,25 @@ export function heartbeatService(db: Db) {
             issueAssigneeConfig.assigneeAdapterOverrides,
           )
         : null;
+
+    // Retrieve memory context for the agent
+    const taskDescription =
+      issueAssigneeConfig?.title ??
+      readNonEmptyString(context.wakeReason) ??
+      "general task";
+    try {
+      const memoryContext = await ctxRetriever.retrieveRelevantContext({
+        companyId: agent.companyId,
+        agentId: agent.id,
+        taskDescription,
+      });
+      if (memoryContext) {
+        context.memoryContext = memoryContext;
+      }
+    } catch (err) {
+      logger.warn({ err, agentId: agent.id, runId }, "Failed to retrieve memory context; continuing without it");
+    }
+
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;

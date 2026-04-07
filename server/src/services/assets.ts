@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { assets } from "@paperclipai/db";
 

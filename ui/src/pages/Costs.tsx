@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { costsApi } from "../api/costs";
+import { billingApi } from "../api/billing";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
@@ -58,6 +59,7 @@ export function Costs() {
   const [preset, setPreset] = useState<DatePreset>("mtd");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
+  const [checkoutError, setCheckoutError] = useState<string | null>(null);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Costs" }]);
@@ -85,6 +87,82 @@ export function Costs() {
     },
     enabled: !!selectedCompanyId,
   });
+
+  const financeQuery = useQuery({
+    queryKey: queryKeys.billing.finance(selectedCompanyId!),
+    queryFn: () => billingApi.financeSnapshot(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 2_000,
+  });
+
+  const checkoutMutation = useMutation({
+    mutationFn: async () => {
+      if (!selectedCompanyId) {
+        throw new Error("Select a company before starting checkout.");
+      }
+      const origin = window.location.origin;
+      return billingApi.createCheckoutSession(selectedCompanyId, {
+        provider: "stripe",
+        lineItems: [
+          {
+            name: "Paperclip Credits Top-up",
+            amountCents: 5000,
+            quantity: 1,
+            currency: "usd",
+          },
+        ],
+        mode: "payment",
+        currency: "usd",
+        successUrl: `${origin}/costs?checkout=success`,
+        cancelUrl: `${origin}/costs?checkout=cancel`,
+      });
+    },
+    onMutate: () => {
+      setCheckoutError(null);
+    },
+    onSuccess: (response) => {
+      const checkoutUrl = response.checkoutUrl ?? response.checkout_url ?? null;
+      if (!checkoutUrl) {
+        setCheckoutError("Checkout session was created but no redirect URL was returned.");
+        return;
+      }
+      window.location.href = checkoutUrl;
+    },
+    onError: (err) => {
+      setCheckoutError(err instanceof Error ? err.message : "Could not start checkout.");
+    },
+  });
+
+  const walletSignals = useMemo(() => {
+    const creditsCents = financeQuery.data?.creditsCents ?? 0;
+    const spendCents = data?.summary.spendCents ?? 0;
+    const budgetCents = data?.summary.budgetCents ?? 0;
+
+    const fromMs = from ? new Date(from).getTime() : Number.NaN;
+    const toMs = to ? new Date(to).getTime() : Number.NaN;
+    const rangeMinutes =
+      Number.isFinite(fromMs) && Number.isFinite(toMs) && toMs > fromMs
+        ? Math.max(1, Math.round((toMs - fromMs) / 60000))
+        : null;
+    const burnCentsPerMinute = rangeMinutes ? spendCents / rangeMinutes : 0;
+    const remainingMinutes = burnCentsPerMinute > 0 ? creditsCents / burnCentsPerMinute : null;
+
+    const riskLevel =
+      creditsCents <= 0 || (budgetCents > 0 && spendCents >= budgetCents)
+        ? "HIGH"
+        : remainingMinutes != null && remainingMinutes <= 240
+          ? "MEDIUM"
+          : "LOW";
+
+    return {
+      creditsCents,
+      burnCentsPerMinute,
+      remainingMinutes,
+      riskLevel,
+      budgetCents,
+      spendCents,
+    };
+  }, [data?.summary.budgetCents, data?.summary.spendCents, financeQuery.data?.creditsCents, from, to]);
 
   if (!selectedCompanyId) {
     return <EmptyState icon={DollarSign} message="Select a company to view costs." />;
@@ -133,6 +211,66 @@ export function Costs() {
 
       {data && (
         <>
+          <Card>
+            <CardContent className="p-4">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <p className="text-sm text-muted-foreground">Economic Wallet</p>
+                <Button
+                  size="sm"
+                  onClick={() => checkoutMutation.mutate()}
+                  disabled={checkoutMutation.isPending}
+                >
+                  {checkoutMutation.isPending ? "Opening Checkout..." : "Buy Credits"}
+                </Button>
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <p className="text-xs text-muted-foreground">Credits</p>
+                  <p className="text-xl font-semibold">
+                    {formatCents(financeQuery.data?.creditsCents ?? 0)}
+                  </p>
+                </div>
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <p className="text-xs text-muted-foreground">Revenue</p>
+                  <p className="text-xl font-semibold">
+                    {formatCents(financeQuery.data?.revenueCents ?? 0)}
+                  </p>
+                </div>
+                <div className="rounded-md border border-border bg-muted/20 p-3">
+                  <p className="text-xs text-muted-foreground">Spent</p>
+                  <p className="text-xl font-semibold">
+                    {formatCents(financeQuery.data?.spentCents ?? 0)}
+                  </p>
+                </div>
+              </div>
+
+              {checkoutError && (
+                <p className="mt-3 text-xs text-destructive">{checkoutError}</p>
+              )}
+
+              <div className="mt-3 rounded-md border border-border bg-muted/20 p-3 text-xs text-muted-foreground">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-foreground">
+                    Budget Risk: {walletSignals.riskLevel}
+                  </span>
+                  <span>
+                    Remaining: {formatCents(walletSignals.creditsCents)}
+                  </span>
+                  <span>
+                    Burn rate: {walletSignals.burnCentsPerMinute > 0 ? `${formatCents(Math.round(walletSignals.burnCentsPerMinute))}/min` : "n/a"}
+                  </span>
+                </div>
+                {walletSignals.remainingMinutes != null && (
+                  <div className="mt-1">
+                    Estimated runway: {walletSignals.remainingMinutes < 60
+                      ? `${Math.max(1, Math.round(walletSignals.remainingMinutes))} min`
+                      : `${Math.max(1, Math.round(walletSignals.remainingMinutes / 60))} h`}
+                  </div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
           {/* Summary card */}
           <Card>
             <CardContent className="p-4 space-y-3">

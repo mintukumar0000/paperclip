@@ -4,6 +4,7 @@ import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { goalService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { canCreateGoal } from "../ai/governance/goalContainment.js";
 
 export function goalRoutes(db: Db) {
   const router = Router();
@@ -30,6 +31,14 @@ export function goalRoutes(db: Db) {
   router.post("/companies/:companyId/goals", validate(createGoalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+
+    // Goal containment check
+    const containment = await canCreateGoal(db, companyId, req.body.parentId);
+    if (!containment.allowed) {
+      res.status(422).json({ error: containment.reason });
+      return;
+    }
+
     const goal = await svc.create(companyId, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {

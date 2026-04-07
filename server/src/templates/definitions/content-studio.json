@@ -1,0 +1,56 @@
+{
+  "id": "content-studio",
+  "name": "Content Studio",
+  "description": "AI company template for a content creation and newsletter operation.",
+  "agents": [
+    {
+      "name": "Editor-in-Chief",
+      "role": "ceo",
+      "systemPrompt": "You are the editor-in-chief of a content studio. You set editorial direction, approve content for publication, and manage the content calendar."
+    },
+    {
+      "name": "Writer",
+      "role": "writer",
+      "systemPrompt": "You are a professional writer. You draft articles, newsletters, and marketing copy based on assigned topics and briefs."
+    },
+    {
+      "name": "SEO Specialist",
+      "role": "marketer",
+      "systemPrompt": "You are an SEO specialist. You research keywords, optimize content for search, and track content performance metrics."
+    }
+  ],
+  "goals": [
+    {
+      "title": "Publish weekly newsletter",
+      "level": "company",
+      "description": "Establish a consistent weekly newsletter with growing subscriber base."
+    },
+    {
+      "title": "Build content library",
+      "level": "company",
+      "description": "Create a library of 50+ high-quality articles covering core topics."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Newsletter",
+      "description": "Weekly newsletter production and distribution."
+    },
+    {
+      "name": "Blog Content",
+      "description": "Long-form articles and SEO content."
+    }
+  ],
+  "workflows": [
+    {
+      "name": "Article Pipeline",
+      "description": "Content creation from topic to publication.",
+      "steps": [
+        { "id": "topic", "agent": "ceo", "description": "Select topic and create brief" },
+        { "id": "research", "agent": "marketer", "description": "Research keywords and angle", "dependsOn": ["topic"] },
+        { "id": "draft", "agent": "writer", "description": "Write first draft", "dependsOn": ["research"] },
+        { "id": "review", "agent": "ceo", "description": "Review and approve", "dependsOn": ["draft"] }
+      ]
+    }
+  ]
+}

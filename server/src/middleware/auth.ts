@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Request, RequestHandler } from "express";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, agents, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";

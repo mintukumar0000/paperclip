@@ -8,8 +8,7 @@ import type {
   Approval,
   AgentConfigRevision,
 } from "@paperclipai/shared";
-import { isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
-import { ApiError, api } from "./client";
+import { api } from "./client";
 
 export interface AgentKey {
   id: string;
@@ -60,32 +59,7 @@ export const agentsApi = {
   org: (companyId: string) => api.get<OrgNode[]>(`/companies/${companyId}/org`),
   listConfigurations: (companyId: string) =>
     api.get<Record<string, unknown>[]>(`/companies/${companyId}/agent-configurations`),
-  get: async (id: string, companyId?: string) => {
-    try {
-      return await api.get<Agent>(agentPath(id, companyId));
-    } catch (error) {
-      // Backward-compat fallback: if backend shortname lookup reports ambiguity,
-      // resolve using company agent list while ignoring terminated agents.
-      if (
-        !(error instanceof ApiError) ||
-        error.status !== 409 ||
-        !companyId ||
-        isUuidLike(id)
-      ) {
-        throw error;
-      }
-
-      const urlKey = normalizeAgentUrlKey(id);
-      if (!urlKey) throw error;
-
-      const agents = await api.get<Agent[]>(`/companies/${companyId}/agents`);
-      const matches = agents.filter(
-        (agent) => agent.status !== "terminated" && normalizeAgentUrlKey(agent.urlKey) === urlKey,
-      );
-      if (matches.length !== 1) throw error;
-      return api.get<Agent>(agentPath(matches[0]!.id, companyId));
-    }
-  },
+  get: async (id: string, companyId?: string) => api.get<Agent>(agentPath(id, companyId)),
   getConfiguration: (id: string, companyId?: string) =>
     api.get<Record<string, unknown>>(agentPath(id, companyId, "/configuration")),
   listConfigRevisions: (id: string, companyId?: string) =>

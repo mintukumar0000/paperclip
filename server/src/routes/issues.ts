@@ -22,6 +22,7 @@ import {
   logActivity,
   projectService,
 } from "../services/index.js";
+import { activityService } from "../services/activity.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -38,6 +39,7 @@ const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
   const svc = issueService(db);
+  const activitySvc = activityService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db);
   const agentsSvc = agentService(db);
@@ -54,6 +56,54 @@ export function issueRoutes(db: Db, storage: StorageService) {
       ...attachment,
       contentPath: `/api/attachments/${attachment.id}/content`,
     };
+  }
+
+  type ArtifactKind = "image" | "html" | "file" | "link" | "log";
+
+  function artifactKindFromName(value: string, contentType?: string | null): ArtifactKind {
+    const lower = value.toLowerCase();
+    const normalizedType = (contentType ?? "").toLowerCase();
+    if (normalizedType.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/.test(lower)) return "image";
+    if (normalizedType.includes("html") || /\.html?$/.test(lower)) return "html";
+    if (/^https?:\/\//.test(lower)) return "link";
+    if (/\.(log|txt)$/.test(lower)) return "log";
+    return "file";
+  }
+
+  function asRecord(value: unknown): Record<string, unknown> | null {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    return value as Record<string, unknown>;
+  }
+
+  function extractArtifactCandidates(
+    value: unknown,
+    prefix = "result",
+    depth = 0,
+  ): Array<{ key: string; value: string }> {
+    if (depth > 4 || value == null) return [];
+    if (typeof value === "string") {
+      const lower = value.toLowerCase();
+      const keyLooksRelevant = /(artifact|file|path|url|html|screenshot|output|report)/i.test(prefix);
+      const valueLooksRelevant =
+        lower.startsWith("http://") ||
+        lower.startsWith("https://") ||
+        lower.startsWith("/") ||
+        /\.(html?|png|jpe?g|gif|webp|svg|log|txt)$/.test(lower);
+      if (!keyLooksRelevant && !valueLooksRelevant) return [];
+      return [{ key: prefix, value }];
+    }
+
+    if (Array.isArray(value)) {
+      return value.flatMap((entry, index) =>
+        extractArtifactCandidates(entry, `${prefix}[${index}]`, depth + 1),
+      );
+    }
+
+    const record = asRecord(value);
+    if (!record) return [];
+    return Object.entries(record).flatMap(([key, entry]) =>
+      extractArtifactCandidates(entry, `${prefix}.${key}`, depth + 1),
+    );
   }
 
   async function runSingleFileUpload(req: Request, res: Response) {
@@ -154,7 +204,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
   }
 
   async function normalizeIssueIdentifier(rawId: string): Promise<string> {
-    if (/^[A-Z]+-\d+$/i.test(rawId)) {
+    // Issue identifiers can include hyphens inside the prefix (e.g. R-5DB4-57)
+    // so we only require a trailing numeric issue number segment.
+    if (/^[A-Z0-9-]+-\d+$/i.test(rawId)) {
       const issue = await svc.getByIdentifier(rawId);
       if (issue) {
         return issue.id;
@@ -185,6 +237,44 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
+    const assigneeUserId =
+      assigneeUserFilterRaw === "me" && req.actor.type === "board"
+        ? req.actor.userId
+        : assigneeUserFilterRaw;
+
+    if (assigneeUserFilterRaw === "me" && (!assigneeUserId || req.actor.type !== "board")) {
+      res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+      return;
+    }
+
+    const result = await svc.list(companyId, {
+      status: req.query.status as string | undefined,
+      assigneeAgentId: req.query.assigneeAgentId as string | undefined,
+      assigneeUserId,
+      projectId: req.query.projectId as string | undefined,
+      labelId: req.query.labelId as string | undefined,
+      q: req.query.q as string | undefined,
+    });
+    res.json(result);
+  });
+
+  // Backward-compatible list route for clients that still call /api/issues?companyId=...
+  router.get("/issues", async (req, res) => {
+    const companyIdParam = req.query.companyId;
+    const companyId =
+      typeof companyIdParam === "string" && companyIdParam.trim().length > 0
+        ? companyIdParam.trim()
+        : req.actor.type === "agent"
+          ? req.actor.companyId
+          : null;
+
+    if (!companyId) {
+      res.status(400).json({ error: "companyId query parameter is required" });
+      return;
+    }
+
     assertCompanyAccess(req, companyId);
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
     const assigneeUserId =
@@ -934,6 +1024,76 @@ export function issueRoutes(db: Db, storage: StorageService) {
     assertCompanyAccess(req, issue.companyId);
     const attachments = await svc.listAttachments(issueId);
     res.json(attachments.map(withContentPath));
+  });
+
+  router.get("/issues/:id/artifacts", async (req, res) => {
+    const issueId = req.params.id as string;
+    const issue = await svc.getById(issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    const [attachments, runs] = await Promise.all([
+      svc.listAttachments(issueId),
+      activitySvc.runsForIssue(issue.companyId, issueId),
+    ]);
+
+    const artifacts: Array<{
+      id: string;
+      source: "attachment" | "run_result";
+      kind: ArtifactKind;
+      title: string;
+      url: string | null;
+      runId: string | null;
+      contentType: string | null;
+      createdAt: string;
+    }> = [];
+
+    for (const attachment of attachments) {
+      const contentPath = `/api/attachments/${attachment.id}/content`;
+      artifacts.push({
+        id: attachment.id,
+        source: "attachment",
+        kind: artifactKindFromName(attachment.originalFilename ?? contentPath, attachment.contentType),
+        title: attachment.originalFilename ?? attachment.id,
+        url: contentPath,
+        runId: null,
+        contentType: attachment.contentType,
+        createdAt: new Date(attachment.createdAt).toISOString(),
+      });
+    }
+
+    for (const run of runs) {
+      const candidates = extractArtifactCandidates(run.resultJson);
+      for (const candidate of candidates) {
+        const value = candidate.value.trim();
+        const isNavigable = value.startsWith("http://") || value.startsWith("https://") || value.startsWith("/");
+        artifacts.push({
+          id: `${run.runId}:${candidate.key}:${value}`,
+          source: "run_result",
+          kind: artifactKindFromName(value),
+          title: `${candidate.key}`,
+          url: isNavigable ? value : null,
+          runId: run.runId,
+          contentType: null,
+          createdAt: new Date(run.createdAt).toISOString(),
+        });
+      }
+    }
+
+    const deduped = new Map<string, (typeof artifacts)[number]>();
+    for (const artifact of artifacts) {
+      const key = `${artifact.source}:${artifact.url ?? artifact.title}:${artifact.runId ?? ""}`;
+      if (!deduped.has(key)) deduped.set(key, artifact);
+    }
+
+    res.json(
+      Array.from(deduped.values()).sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+      ),
+    );
   });
 
   router.post("/companies/:companyId/issues/:issueId/attachments", async (req, res) => {

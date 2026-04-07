@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { issuesApi } from "../api/issues";
+import { issuesApi, type IssueArtifact } from "../api/issues";
 import { activityApi } from "../api/activity";
 import { heartbeatsApi } from "../api/heartbeats";
 import { agentsApi } from "../api/agents";
@@ -32,14 +32,20 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Activity as ActivityIcon,
+  AlertTriangle,
   ChevronDown,
   ChevronRight,
   EyeOff,
+  FileText,
+  Files,
+  Image,
   Hexagon,
+  Hourglass,
   ListTree,
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  RotateCcw,
   SlidersHorizontal,
   Trash2,
 } from "lucide-react";
@@ -94,6 +100,47 @@ function usageNumber(usage: Record<string, unknown> | null, ...keys: string[]) {
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return text.slice(0, max - 1) + "\u2026";
+}
+
+function extractReason(details: Record<string, unknown> | null | undefined): string | null {
+  if (!details) return null;
+  const candidates = [
+    details.reason,
+    details.error,
+    details.errorMessage,
+    details.message,
+    details.detail,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) return candidate.trim();
+  }
+  return null;
+}
+
+function extractRunSummary(run: {
+  status: string;
+  usageJson: Record<string, unknown> | null;
+  resultJson: Record<string, unknown> | null;
+}): { summary: string; errorReason: string | null } {
+  const result = asRecord(run.resultJson);
+  const usage = asRecord(run.usageJson);
+  const summary =
+    (typeof result?.summary === "string" && result.summary.trim()) ||
+    (typeof result?.result === "string" && result.result.trim()) ||
+    (typeof result?.message === "string" && result.message.trim()) ||
+    (typeof usage?.message === "string" && usage.message.trim()) ||
+    "-";
+
+  const errorReason =
+    (typeof result?.error === "string" && result.error.trim()) ||
+    (typeof result?.errorMessage === "string" && result.errorMessage.trim()) ||
+    (typeof usage?.error === "string" && usage.error.trim()) ||
+    null;
+
+  return {
+    summary,
+    errorReason,
+  };
 }
 
 function formatAction(action: string, details?: Record<string, unknown> | null): string {
@@ -154,6 +201,8 @@ export function IssueDetail() {
   const [moreOpen, setMoreOpen] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
   const [detailTab, setDetailTab] = useState("comments");
+  const [outputTab, setOutputTab] = useState("logs");
+  const [selectedExecutionRunId, setSelectedExecutionRunId] = useState<string | null>(null);
   const [secondaryOpen, setSecondaryOpen] = useState({
     approvals: false,
     cost: false,
@@ -177,13 +226,14 @@ export function IssueDetail() {
     queryKey: queryKeys.issues.activity(issueId!),
     queryFn: () => activityApi.forIssue(issueId!),
     enabled: !!issueId,
+    refetchInterval: 2000,
   });
 
   const { data: linkedRuns } = useQuery({
     queryKey: queryKeys.issues.runs(issueId!),
     queryFn: () => activityApi.runsForIssue(issueId!),
     enabled: !!issueId,
-    refetchInterval: 5000,
+    refetchInterval: 2000,
   });
 
   const { data: linkedApprovals } = useQuery({
@@ -198,21 +248,114 @@ export function IssueDetail() {
     enabled: !!issueId,
   });
 
+  const { data: artifacts } = useQuery({
+    queryKey: queryKeys.issues.artifacts(issueId!),
+    queryFn: () => issuesApi.listArtifacts(issueId!),
+    enabled: !!issueId,
+    refetchInterval: 2000,
+  });
+
   const { data: liveRuns } = useQuery({
     queryKey: queryKeys.issues.liveRuns(issueId!),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueId!),
     enabled: !!issueId,
-    refetchInterval: 3000,
+    refetchInterval: 2000,
   });
 
   const { data: activeRun } = useQuery({
     queryKey: queryKeys.issues.activeRun(issueId!),
     queryFn: () => heartbeatsApi.activeRunForIssue(issueId!),
     enabled: !!issueId,
-    refetchInterval: 3000,
+    refetchInterval: 2000,
   });
 
   const hasLiveRuns = (liveRuns ?? []).length > 0 || !!activeRun;
+
+  const executionRuns = useMemo(() => {
+    const rows = [...(linkedRuns ?? [])];
+    if (activeRun && !rows.some((run) => run.runId === activeRun.id)) {
+      rows.push({
+        runId: activeRun.id,
+        status: activeRun.status,
+        agentId: activeRun.agentId,
+        startedAt: activeRun.startedAt ? new Date(activeRun.startedAt).toISOString() : null,
+        finishedAt: activeRun.finishedAt ? new Date(activeRun.finishedAt).toISOString() : null,
+        createdAt: new Date(activeRun.createdAt).toISOString(),
+        invocationSource: activeRun.invocationSource,
+        usageJson: activeRun.usageJson,
+        resultJson: activeRun.resultJson,
+      });
+    }
+    return rows.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  }, [linkedRuns, activeRun]);
+
+  useEffect(() => {
+    if (executionRuns.length === 0) {
+      setSelectedExecutionRunId(null);
+      return;
+    }
+    if (selectedExecutionRunId && executionRuns.some((run) => run.runId === selectedExecutionRunId)) {
+      return;
+    }
+    setSelectedExecutionRunId(executionRuns[executionRuns.length - 1]?.runId ?? null);
+  }, [executionRuns, selectedExecutionRunId]);
+
+  const selectedExecutionRun = useMemo(() => {
+    if (!selectedExecutionRunId) return executionRuns[executionRuns.length - 1] ?? null;
+    return executionRuns.find((run) => run.runId === selectedExecutionRunId) ?? executionRuns[executionRuns.length - 1] ?? null;
+  }, [executionRuns, selectedExecutionRunId]);
+
+  const runActivityMeta = useMemo(() => {
+    const map = new Map<string, { reason: string | null; retryReason: string | null; attempts: number | null }>();
+    for (const evt of activity ?? []) {
+      if (!evt.runId) continue;
+      const details = asRecord(evt.details);
+      const action = evt.action.toLowerCase();
+      const current = map.get(evt.runId) ?? { reason: null, retryReason: null, attempts: null };
+      const reason = extractReason(details);
+
+      if ((action.includes("failed") || action.includes("error") || action.includes("blocked")) && reason) {
+        current.reason = reason;
+      }
+
+      if (action.includes("retry") && reason) {
+        current.retryReason = reason;
+      }
+
+      const attemptRaw = details?.attempt ?? details?.attemptNumber ?? details?.retryCount;
+      const attemptParsed = typeof attemptRaw === "number" ? attemptRaw : Number(attemptRaw);
+      if (Number.isFinite(attemptParsed) && attemptParsed > 0) {
+        current.attempts = Math.round(attemptParsed);
+      }
+
+      map.set(evt.runId, current);
+    }
+    return map;
+  }, [activity]);
+
+  const runAttempts = useMemo(() => {
+    return executionRuns.map((run, index) => {
+      const runMeta = runActivityMeta.get(run.runId);
+      const summary = extractRunSummary(run);
+      const reason = runMeta?.reason ?? summary.errorReason;
+      const attempt = runMeta?.attempts ?? index + 1;
+      return {
+        run,
+        attempt,
+        reason,
+      };
+    });
+  }, [executionRuns, runActivityMeta]);
+
+  const { data: selectedRunLog } = useQuery({
+    queryKey: ["issues", "run-log", selectedExecutionRun?.runId ?? "none"],
+    queryFn: () => heartbeatsApi.log(selectedExecutionRun!.runId, 0, 320000),
+    enabled: !!selectedExecutionRun,
+    refetchInterval:
+      selectedExecutionRun && (selectedExecutionRun.status === "running" || selectedExecutionRun.status === "queued")
+        ? 2000
+        : false,
+  });
 
   // Filter out runs already shown by the live widget to avoid duplication
   const timelineRuns = useMemo(() => {
@@ -222,6 +365,168 @@ export function IssueDetail() {
     if (liveIds.size === 0) return linkedRuns ?? [];
     return (linkedRuns ?? []).filter((r) => !liveIds.has(r.runId));
   }, [linkedRuns, liveRuns, activeRun]);
+
+  const statusTimeline = useMemo(() => {
+    const assignedEvent = (activity ?? []).find((evt) => {
+      if (evt.action !== "issue.updated") return false;
+      const details = evt.details as Record<string, unknown> | null;
+      if (!details) return false;
+      return details.assigneeAgentId !== undefined || details.assigneeUserId !== undefined;
+    });
+    const firstStartedRun = executionRuns.find((run) => run.startedAt);
+    const isDone = issue?.status === "done" || issue?.status === "cancelled";
+
+    return [
+      { key: "created", label: "created", at: issue?.createdAt ?? null, state: "done" },
+      {
+        key: "assigned",
+        label: "assigned",
+        at: assignedEvent?.createdAt ?? null,
+        state:
+          issue?.assigneeAgentId || issue?.assigneeUserId || assignedEvent
+            ? "done"
+            : "pending",
+      },
+      {
+        key: "in_progress",
+        label: "in_progress",
+        at: firstStartedRun?.startedAt ?? null,
+        state:
+          issue?.status === "in_progress"
+            ? "active"
+            : firstStartedRun || isDone
+              ? "done"
+              : "pending",
+      },
+      {
+        key: "done",
+        label: "done",
+        at: isDone ? issue?.updatedAt ?? null : null,
+        state: isDone ? "done" : "pending",
+      },
+    ] as const;
+  }, [activity, executionRuns, issue]);
+
+  const taskTimeline = useMemo(() => {
+    const items: Array<{ id: string; at: string; label: string; detail: string; tone: "neutral" | "good" | "warn" | "bad" }> = [];
+
+    if (issue?.createdAt) {
+      items.push({
+        id: `issue-created-${issue.id}`,
+        at: new Date(issue.createdAt).toISOString(),
+        label: "task created",
+        detail: issue.identifier ?? issue.id.slice(0, 8),
+        tone: "neutral",
+      });
+    }
+
+    const assignedEvents = (activity ?? []).filter((evt) => {
+      if (evt.action !== "issue.updated") return false;
+      const details = asRecord(evt.details);
+      return !!details && (details.assigneeAgentId !== undefined || details.assigneeUserId !== undefined);
+    });
+
+    for (const evt of assignedEvents) {
+      const details = asRecord(evt.details);
+      const target =
+        (typeof details?.assigneeAgentId === "string" && details.assigneeAgentId) ||
+        (typeof details?.assigneeUserId === "string" && details.assigneeUserId) ||
+        "unassigned";
+      items.push({
+        id: `assign-${evt.id}`,
+        at: new Date(evt.createdAt).toISOString(),
+        label: "assigned",
+        detail: target,
+        tone: "neutral",
+      });
+    }
+
+    executionRuns.forEach((run, index) => {
+      const attempt = index + 1;
+      const runMeta = runActivityMeta.get(run.runId);
+      const summary = extractRunSummary(run);
+
+      items.push({
+        id: `run-created-${run.runId}`,
+        at: run.createdAt,
+        label: `attempt ${attempt} queued`,
+        detail: run.invocationSource,
+        tone: "neutral",
+      });
+
+      if (run.startedAt) {
+        items.push({
+          id: `run-start-${run.runId}`,
+          at: run.startedAt,
+          label: `attempt ${attempt} started`,
+          detail: run.agentId.slice(0, 8),
+          tone: "neutral",
+        });
+      }
+
+      if (run.status === "failed") {
+        items.push({
+          id: `run-failed-${run.runId}`,
+          at: run.finishedAt ?? run.createdAt,
+          label: `attempt ${attempt} failed`,
+          detail: runMeta?.reason ?? summary.errorReason ?? "execution failure",
+          tone: "bad",
+        });
+
+        const nextRun = executionRuns[index + 1];
+        if (nextRun) {
+          items.push({
+            id: `run-retry-${nextRun.runId}`,
+            at: nextRun.createdAt,
+            label: `retry ${attempt + 1}`,
+            detail: runMeta?.retryReason ?? runMeta?.reason ?? summary.errorReason ?? "automatic retry",
+            tone: "warn",
+          });
+        }
+      }
+
+      if (run.status === "completed" || run.status === "done") {
+        items.push({
+          id: `run-complete-${run.runId}`,
+          at: run.finishedAt ?? run.createdAt,
+          label: `attempt ${attempt} completed`,
+          detail: summary.summary,
+          tone: "good",
+        });
+      }
+    });
+
+    if (issue?.status === "done" || issue?.status === "cancelled") {
+      items.push({
+        id: `issue-finished-${issue.id}`,
+        at: new Date(issue.updatedAt).toISOString(),
+        label: issue.status === "done" ? "task completed" : "task cancelled",
+        detail: issue.status,
+        tone: issue.status === "done" ? "good" : "warn",
+      });
+    }
+
+    return items.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+  }, [activity, executionRuns, issue, runActivityMeta]);
+
+  const outputArtifacts = useMemo(() => {
+    const all = artifacts ?? [];
+    const html = all.find((artifact) => artifact.kind === "html" && !!artifact.url) ?? null;
+    const screenshot =
+      all.find(
+        (artifact) =>
+          artifact.kind === "image" &&
+          !!artifact.url &&
+          /screen|screenshot|preview/i.test(artifact.title),
+      ) ??
+      all.find((artifact) => artifact.kind === "image" && !!artifact.url) ??
+      null;
+    const log = all.find((artifact) => artifact.kind === "log" && !!artifact.url) ?? null;
+    const files = all.filter(
+      (artifact) => artifact.id !== html?.id && artifact.id !== screenshot?.id && artifact.id !== log?.id,
+    );
+    return { html, screenshot, log, files };
+  }, [artifacts]);
 
   const { data: allIssues } = useQuery({
     queryKey: queryKeys.issues.list(selectedCompanyId!),
@@ -379,6 +684,7 @@ export function IssueDetail() {
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.runs(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.approvals(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.attachments(issueId!) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.issues.artifacts(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.liveRuns(issueId!) });
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.activeRun(issueId!) });
     if (selectedCompanyId) {
@@ -754,6 +1060,10 @@ export function IssueDetail() {
             <MessageSquare className="h-3.5 w-3.5" />
             Comments
           </TabsTrigger>
+          <TabsTrigger value="execution" className="gap-1.5">
+            <ActivityIcon className="h-3.5 w-3.5" />
+            Execution
+          </TabsTrigger>
           <TabsTrigger value="subissues" className="gap-1.5">
             <ListTree className="h-3.5 w-3.5" />
             Sub-issues
@@ -791,6 +1101,210 @@ export function IssueDetail() {
             }}
             liveRunSlot={<LiveRunWidget issueId={issueId!} companyId={issue.companyId} />}
           />
+        </TabsContent>
+
+        <TabsContent value="execution" className="space-y-4">
+          <div className="rounded-md border border-border bg-muted/20 p-3">
+            <h4 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Execution Progress</h4>
+            <div className="grid gap-2 sm:grid-cols-4">
+              {statusTimeline.map((node) => (
+                <div key={node.key} className="rounded border border-border/70 bg-background p-2">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        "h-2 w-2 rounded-full",
+                        node.state === "done"
+                          ? "bg-green-500"
+                          : node.state === "active"
+                            ? "bg-cyan-500 animate-pulse"
+                            : "bg-muted",
+                      )}
+                    />
+                    <span className="text-xs font-medium">{node.label.replace(/_/g, " ")}</span>
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">{node.at ? relativeTime(node.at) : "pending"}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid gap-3 xl:grid-cols-[1.4fr_1fr]">
+            <div className="space-y-3 rounded-md border border-border p-3">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Retry Attempts</h4>
+                <span className="text-[11px] text-muted-foreground">{runAttempts.length} total</span>
+              </div>
+              {runAttempts.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No runs yet.</p>
+              ) : (
+                <div className="grid gap-2 md:grid-cols-2">
+                  {runAttempts.map(({ run, attempt, reason }) => {
+                    const summary = extractRunSummary(run);
+                    const isSelected = selectedExecutionRun?.runId === run.runId;
+                    const isFailure = run.status === "failed";
+                    return (
+                      <button
+                        key={run.runId}
+                        type="button"
+                        onClick={() => setSelectedExecutionRunId(run.runId)}
+                        className={cn(
+                          "rounded border px-3 py-2 text-left transition-colors",
+                          isSelected ? "border-cyan-500/60 bg-cyan-500/10" : "border-border hover:bg-accent/20",
+                        )}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2">
+                            {isFailure ? (
+                              <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                            ) : (
+                              <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
+                            )}
+                            <span className="text-xs font-medium">Attempt {attempt}</span>
+                          </div>
+                          <StatusBadge status={run.status} />
+                        </div>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {run.startedAt ? relativeTime(run.startedAt) : relativeTime(run.createdAt)}
+                        </p>
+                        <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                          {reason ?? summary.summary}
+                        </p>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-md border border-border p-3">
+              <h4 className="mb-2 text-xs font-medium text-muted-foreground uppercase tracking-wide">Task Timeline</h4>
+              {taskTimeline.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No timeline events yet.</p>
+              ) : (
+                <div className="max-h-64 space-y-2 overflow-y-auto pr-1">
+                  {taskTimeline.map((item) => (
+                    <div key={item.id} className="flex items-start gap-2 rounded border border-border/70 bg-muted/20 p-2">
+                      <Hourglass
+                        className={cn(
+                          "mt-0.5 h-3.5 w-3.5",
+                          item.tone === "good"
+                            ? "text-green-500"
+                            : item.tone === "bad"
+                              ? "text-red-500"
+                              : item.tone === "warn"
+                                ? "text-amber-500"
+                                : "text-muted-foreground",
+                        )}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <p className="text-xs font-medium">{item.label}</p>
+                          <span className="text-[11px] text-muted-foreground">{relativeTime(item.at)}</span>
+                        </div>
+                        <p className="truncate text-[11px] text-muted-foreground" title={item.detail}>{item.detail}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-md border border-border p-3">
+            <div className="mb-3 flex items-center justify-between">
+              <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Output Viewer</h4>
+              {selectedExecutionRun && (
+                <span className="text-[11px] text-muted-foreground">
+                  Run {selectedExecutionRun.runId.slice(0, 8)}
+                </span>
+              )}
+            </div>
+            <Tabs value={outputTab} onValueChange={setOutputTab}>
+              <TabsList variant="line" className="mb-3 w-full justify-start gap-1">
+                <TabsTrigger value="logs" className="gap-1.5">
+                  <FileText className="h-3.5 w-3.5" />
+                  Logs
+                </TabsTrigger>
+                <TabsTrigger value="html" className="gap-1.5">
+                  <Files className="h-3.5 w-3.5" />
+                  HTML Preview
+                </TabsTrigger>
+                <TabsTrigger value="screenshot" className="gap-1.5">
+                  <Image className="h-3.5 w-3.5" />
+                  Screenshot
+                </TabsTrigger>
+                <TabsTrigger value="files" className="gap-1.5">
+                  <Paperclip className="h-3.5 w-3.5" />
+                  Files
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent value="logs" className="space-y-2">
+                {!selectedRunLog?.content && outputArtifacts.log?.url && (
+                  <a
+                    href={outputArtifacts.log.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex text-xs text-cyan-600 hover:underline"
+                  >
+                    Open persisted log artifact
+                  </a>
+                )}
+                <pre className="max-h-80 overflow-y-auto rounded bg-neutral-950 p-3 font-mono text-xs text-neutral-100">
+                  {selectedRunLog?.content ?? "Select a run to inspect stdout/stderr logs."}
+                </pre>
+              </TabsContent>
+
+              <TabsContent value="html" className="space-y-2">
+                {!outputArtifacts.html?.url ? (
+                  <p className="text-sm text-muted-foreground">No HTML preview artifact found.</p>
+                ) : (
+                  <>
+                    <a
+                      href={outputArtifacts.html.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex text-xs text-cyan-600 hover:underline"
+                    >
+                      Open HTML in new tab
+                    </a>
+                    <iframe
+                      src={outputArtifacts.html.url}
+                      title={outputArtifacts.html.title || "HTML Preview"}
+                      className="h-[26rem] w-full rounded border border-border/70 bg-background"
+                    />
+                  </>
+                )}
+              </TabsContent>
+
+              <TabsContent value="screenshot" className="space-y-2">
+                {!outputArtifacts.screenshot?.url ? (
+                  <p className="text-sm text-muted-foreground">No screenshot artifact found.</p>
+                ) : (
+                  <a href={outputArtifacts.screenshot.url} target="_blank" rel="noreferrer">
+                    <img
+                      src={outputArtifacts.screenshot.url}
+                      alt={outputArtifacts.screenshot.title || "Execution screenshot"}
+                      className="max-h-[34rem] w-full rounded border border-border/70 object-contain bg-accent/20"
+                      loading="lazy"
+                    />
+                  </a>
+                )}
+              </TabsContent>
+
+              <TabsContent value="files" className="space-y-2">
+                {outputArtifacts.files.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">No additional files found for this task.</p>
+                ) : (
+                  <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+                    {outputArtifacts.files.map((artifact) => (
+                      <ExecutionArtifactCard key={artifact.id} artifact={artifact} />
+                    ))}
+                  </div>
+                )}
+              </TabsContent>
+            </Tabs>
+          </div>
         </TabsContent>
 
         <TabsContent value="subissues">
@@ -929,6 +1443,53 @@ export function IssueDetail() {
           </ScrollArea>
         </SheetContent>
       </Sheet>
+    </div>
+  );
+}
+
+function ExecutionArtifactCard({ artifact }: { artifact: IssueArtifact }) {
+  const canPreviewHtml = artifact.kind === "html" && !!artifact.url;
+  const canPreviewImage = artifact.kind === "image" && !!artifact.url;
+
+  return (
+    <div className="rounded border border-border/70 p-2 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium">{artifact.title}</span>
+        <span className="text-muted-foreground">{artifact.source}</span>
+      </div>
+
+      <div className="mt-1 text-muted-foreground">
+        {artifact.runId ? `run ${artifact.runId.slice(0, 8)} · ` : ""}
+        {relativeTime(artifact.createdAt)}
+      </div>
+
+      {artifact.url && (
+        <a
+          href={artifact.url}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1 inline-flex text-cyan-600 hover:underline"
+        >
+          Open artifact
+        </a>
+      )}
+
+      {canPreviewImage && (
+        <img
+          src={artifact.url!}
+          alt={artifact.title}
+          className="mt-2 max-h-44 rounded border border-border object-contain"
+          loading="lazy"
+        />
+      )}
+
+      {canPreviewHtml && (
+        <iframe
+          src={artifact.url!}
+          title={artifact.title}
+          className="mt-2 h-44 w-full rounded border border-border bg-background"
+        />
+      )}
     </div>
   );
 }

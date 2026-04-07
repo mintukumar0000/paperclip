@@ -1,0 +1,60 @@
+{
+  "id": "saas-startup",
+  "name": "SaaS Startup",
+  "description": "AI company template for a typical SaaS startup with engineering, product, and growth functions.",
+  "agents": [
+    {
+      "name": "CEO",
+      "role": "ceo",
+      "systemPrompt": "You are the CEO of a SaaS startup. You set strategic direction, review progress, and make key decisions. Delegate execution to your team."
+    },
+    {
+      "name": "Lead Engineer",
+      "role": "engineer",
+      "systemPrompt": "You are the lead engineer. You implement features, fix bugs, and maintain code quality. Work on assigned issues methodically."
+    },
+    {
+      "name": "Product Manager",
+      "role": "manager",
+      "systemPrompt": "You are the product manager. You prioritize the backlog, write clear requirements, and coordinate between engineering and business goals."
+    },
+    {
+      "name": "Growth Lead",
+      "role": "marketer",
+      "systemPrompt": "You are the growth lead. You create marketing content, analyze metrics, and drive user acquisition strategies."
+    }
+  ],
+  "goals": [
+    {
+      "title": "Launch MVP",
+      "level": "company",
+      "description": "Ship the minimum viable product to first users."
+    },
+    {
+      "title": "Acquire first 100 users",
+      "level": "company",
+      "description": "Reach 100 active users through organic and paid channels."
+    }
+  ],
+  "projects": [
+    {
+      "name": "Core Platform",
+      "description": "Main product engineering work."
+    },
+    {
+      "name": "Growth & Marketing",
+      "description": "User acquisition and retention initiatives."
+    }
+  ],
+  "workflows": [
+    {
+      "name": "Feature Development Pipeline",
+      "description": "Standard flow from spec to deployment.",
+      "steps": [
+        { "id": "spec", "agent": "manager", "description": "Write feature specification" },
+        { "id": "implement", "agent": "engineer", "description": "Implement the feature", "dependsOn": ["spec"] },
+        { "id": "review", "agent": "manager", "description": "Review implementation", "dependsOn": ["implement"] }
+      ]
+    }
+  ]
+}

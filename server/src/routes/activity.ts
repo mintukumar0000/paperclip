@@ -47,15 +47,21 @@ export function activityRoutes(db: Db) {
     res.status(201).json(event);
   });
 
+  async function normalizeIssueIdentifier(rawId: string): Promise<string> {
+    // Issue identifiers can include hyphens in the prefix (e.g. R-5DB4-121).
+    if (/^[A-Z0-9-]+-\d+$/i.test(rawId)) {
+      const issue = await issueSvc.getByIdentifier(rawId);
+      if (issue) {
+        return issue.id;
+      }
+    }
+    return rawId;
+  }
+
   // Resolve issue identifiers (e.g. "PAP-39") to UUIDs
   router.param("id", async (req, res, next, rawId) => {
     try {
-      if (/^[A-Z]+-\d+$/i.test(rawId)) {
-        const issue = await issueSvc.getByIdentifier(rawId);
-        if (issue) {
-          req.params.id = issue.id;
-        }
-      }
+      req.params.id = await normalizeIssueIdentifier(rawId);
       next();
     } catch (err) {
       next(err);

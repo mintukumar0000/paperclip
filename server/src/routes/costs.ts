@@ -2,7 +2,14 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { createCostEventSchema, updateBudgetSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { costService, companyService, agentService, logActivity } from "../services/index.js";
+import {
+  costService,
+  companyService,
+  agentService,
+  debitCompanyFinanceForUsage,
+  dispatchDecisionCycle,
+  logActivity,
+} from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function costRoutes(db: Db) {
@@ -25,6 +32,19 @@ export function costRoutes(db: Db) {
       occurredAt: new Date(req.body.occurredAt),
     });
 
+    const financeSnapshot = await debitCompanyFinanceForUsage(db, {
+      companyId,
+      costCents: event.costCents,
+    });
+
+    const financeDecisionDedupeKey = `finance:cost-event:${companyId}:${Math.floor(Date.now() / (5 * 60 * 1000))}`;
+    const decisionDispatch = await dispatchDecisionCycle(db, {
+      companyId,
+      source: "manual",
+      reason: "finance.cost.reported",
+      dedupeKey: financeDecisionDedupeKey,
+    });
+
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,
@@ -34,10 +54,62 @@ export function costRoutes(db: Db) {
       action: "cost.reported",
       entityType: "cost_event",
       entityId: event.id,
-      details: { costCents: event.costCents, model: event.model },
+      details: {
+        costCents: event.costCents,
+        model: event.model,
+        provider: event.provider,
+        finance: {
+          creditsCents: financeSnapshot.creditsCents,
+          revenueCents: financeSnapshot.revenueCents,
+          spentCents: financeSnapshot.spentCents,
+        },
+        decisionDispatch,
+      },
     });
 
-    res.status(201).json(event);
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "cost-reporter",
+      agentId: event.agentId,
+      action: "billing.finance.debited",
+      entityType: "cost_event",
+      entityId: event.id,
+      details: {
+        source: "cost_event_report",
+        costCents: event.costCents,
+        provider: event.provider,
+        model: event.model,
+        creditsCents: financeSnapshot.creditsCents,
+        revenueCents: financeSnapshot.revenueCents,
+        spentCents: financeSnapshot.spentCents,
+      },
+    });
+
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "cost-reporter",
+      agentId: event.agentId,
+      action: "finance.decision.dispatch",
+      entityType: "cost_event",
+      entityId: event.id,
+      details: {
+        reason: "finance.cost.reported",
+        decisionDispatch,
+        costCents: event.costCents,
+      },
+    });
+
+    res.status(201).json({
+      ...event,
+      finance: {
+        creditsCents: financeSnapshot.creditsCents,
+        revenueCents: financeSnapshot.revenueCents,
+        spentCents: financeSnapshot.spentCents,
+      },
+      decisionDispatch,
+    });
   });
 
   function parseDateRange(query: Record<string, unknown>) {

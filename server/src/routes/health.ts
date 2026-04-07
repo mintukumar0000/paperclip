@@ -1,6 +1,6 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { count, sql } from "drizzle-orm";
+import { count, sql } from "@paperclipai/db";
 import { instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 

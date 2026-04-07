@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { projects, projectGoals, goals, projectWorkspaces } from "@paperclipai/db";
 import {

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, inArray, ne } from "drizzle-orm";
+import { and, desc, eq, inArray, ne } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
   agents,

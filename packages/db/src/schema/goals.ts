@@ -5,7 +5,9 @@ import {
   text,
   timestamp,
   index,
+  check,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 
@@ -25,5 +27,7 @@ export const goals = pgTable(
   },
   (table) => ({
     companyIdx: index("goals_company_idx").on(table.companyId),
+    // DB-level safety: goal cannot be its own parent (self-cycle)
+    noSelfParent: check("goals_no_self_parent", sql`${table.parentId} IS NULL OR ${table.parentId} != ${table.id}`),
   }),
 );

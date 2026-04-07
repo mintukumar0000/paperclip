@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { IncomingMessage, Server as HttpServer } from "node:http";
 import type { Duplex } from "node:stream";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
@@ -229,7 +229,7 @@ export function setupLiveEventsWebSocketServer(
         const reqWithContext = req as IncomingMessageWithContext;
         reqWithContext.paperclipUpgradeContext = context;
 
-        wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.handleUpgrade(req as any, socket, head, (ws) => {
           wss.emit("connection", ws, reqWithContext);
         });
       })

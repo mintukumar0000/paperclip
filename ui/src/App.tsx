@@ -24,12 +24,26 @@ import { Inbox } from "./pages/Inbox";
 import { CompanySettings } from "./pages/CompanySettings";
 import { DesignGuide } from "./pages/DesignGuide";
 import { OrgChart } from "./pages/OrgChart";
+import { Templates } from "./pages/Templates";
+import { Workflows } from "./pages/Workflows";
+import { Memory } from "./pages/Memory";
+import { Strategy } from "./pages/Strategy";
+import { Messages } from "./pages/Messages";
+import { AIDashboard } from "./pages/AIDashboard";
+import { Ecosystem } from "./pages/Ecosystem";
+import { Economy } from "./pages/Economy";
+import { Learning } from "./pages/Learning";
+import { Expansion } from "./pages/Expansion";
+import { Governance } from "./pages/Governance";
+import { Stability } from "./pages/Stability";
+import { Simulation } from "./pages/Simulation";
 import { AuthPage } from "./pages/Auth";
 import { BoardClaimPage } from "./pages/BoardClaim";
 import { InviteLandingPage } from "./pages/InviteLanding";
 import { queryKeys } from "./lib/queryKeys";
 import { useCompany } from "./context/CompanyContext";
 import { useDialog } from "./context/DialogContext";
+import { trackScreen } from "./lib/analytics";
 
 function BootstrapPendingPage() {
   return (
@@ -127,6 +141,19 @@ function boardRoutes() {
       <Route path="inbox" element={<Navigate to="/inbox/new" replace />} />
       <Route path="inbox/new" element={<Inbox />} />
       <Route path="inbox/all" element={<Inbox />} />
+      <Route path="templates" element={<Templates />} />
+      <Route path="workflows" element={<Workflows />} />
+      <Route path="memory" element={<Memory />} />
+      <Route path="strategy" element={<Strategy />} />
+      <Route path="messages" element={<Messages />} />
+      <Route path="ai-dashboard" element={<AIDashboard />} />
+      <Route path="ecosystem" element={<Ecosystem />} />
+      <Route path="economy" element={<Economy />} />
+      <Route path="learning" element={<Learning />} />
+      <Route path="expansion" element={<Expansion />} />
+      <Route path="governance" element={<Governance />} />
+      <Route path="stability" element={<Stability />} />
+      <Route path="simulation" element={<Simulation />} />
       <Route path="design-guide" element={<DesignGuide />} />
     </>
   );
@@ -201,6 +228,12 @@ function NoCompaniesStartPage({ autoOpen = true }: { autoOpen?: boolean }) {
 }
 
 export function App() {
+  const location = useLocation();
+
+  useEffect(() => {
+    trackScreen(location.pathname, location.search);
+  }, [location.pathname, location.search]);
+
   return (
     <>
       <Routes>

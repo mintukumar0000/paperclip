@@ -48,6 +48,7 @@ import {
 } from "lucide-react";
 
 type Step = 1 | 2 | 3 | 4;
+type OnboardingMode = "quick" | "full";
 type AdapterType =
   | "claude_local"
   | "codex_local"
@@ -57,11 +58,36 @@ type AdapterType =
   | "http"
   | "openclaw";
 
+type QuickBootstrapResult = {
+  primaryIssueRef: string | null;
+};
+
 const DEFAULT_TASK_DESCRIPTION = `Setup yourself as the CEO. Use the ceo persona found here: [https://github.com/paperclipai/companies/blob/main/default/ceo/AGENTS.md](https://github.com/paperclipai/companies/blob/main/default/ceo/AGENTS.md)
 
 Ensure you have a folder agents/ceo and then download this AGENTS.md as well as the sibling HEARTBEAT.md, SOUL.md, and TOOLS.md. and set that AGENTS.md as the path to your agents instruction file
 
 And after you've finished that, hire yourself a Founding Engineer agent`;
+
+const ONBOARDING_MODE_STORAGE_KEY = "paperclip.onboarding.mode";
+
+function loadOnboardingModePreference(): OnboardingMode {
+  if (typeof window === "undefined") return "full";
+  const stored = window.localStorage.getItem(ONBOARDING_MODE_STORAGE_KEY);
+  return stored === "quick" || stored === "full" ? stored : "full";
+}
+
+function persistOnboardingModePreference(mode: OnboardingMode) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(ONBOARDING_MODE_STORAGE_KEY, mode);
+}
+
+function getErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Unknown error";
+  if (/instance admin required/i.test(message)) {
+    return "Instance admin required. Run pnpm paperclipai auth bootstrap-ceo --force, open the generated invite URL, accept it as Human, then retry Create Company.";
+  }
+  return message;
+}
 
 export function OnboardingWizard() {
   const { onboardingOpen, onboardingOptions, closeOnboarding } = useDialog();
@@ -71,6 +97,9 @@ export function OnboardingWizard() {
 
   const initialStep = onboardingOptions.initialStep ?? 1;
   const existingCompanyId = onboardingOptions.companyId;
+  const [onboardingMode, setOnboardingMode] = useState<OnboardingMode>(
+    () => loadOnboardingModePreference()
+  );
 
   const [step, setStep] = useState<Step>(initialStep);
   const [loading, setLoading] = useState(false);
@@ -131,6 +160,14 @@ export function OnboardingWizard() {
     setStep(onboardingOptions.initialStep ?? 1);
     setCreatedCompanyId(cId);
     setCreatedCompanyPrefix(null);
+
+    // If onboarding starts from step > 1, force full setup context.
+    if ((onboardingOptions.initialStep ?? 1) > 1) {
+      setOnboardingMode("full");
+      return;
+    }
+
+    setOnboardingMode(loadOnboardingModePreference());
   }, [
     onboardingOpen,
     onboardingOptions.companyId,
@@ -207,6 +244,11 @@ export function OnboardingWizard() {
     setCreatedCompanyPrefix(null);
     setCreatedAgentId(null);
     setCreatedIssueRef(null);
+  }
+
+  function handleOnboardingModeChange(mode: OnboardingMode) {
+    setOnboardingMode(mode);
+    persistOnboardingModePreference(mode);
   }
 
   function handleClose() {
@@ -310,6 +352,86 @@ export function OnboardingWizard() {
     }
   }
 
+  async function runQuickGoalBootstrap(
+    companyId: string,
+    goalText: string
+  ): Promise<QuickBootstrapResult> {
+    const normalizedGoal = goalText.trim();
+    if (!normalizedGoal) return { primaryIssueRef: null };
+
+    const companyGoal = await goalsApi.create(companyId, {
+      title: normalizedGoal,
+      description:
+        "Auto-created during Quick Create as the initial company goal.",
+      level: "company",
+      status: "active",
+      ownerAgentId: null
+    });
+
+    const kickoffIssue = await issuesApi.create(companyId, {
+      title: normalizedGoal.slice(0, 160),
+      description:
+        "Auto-created from Quick Create. Use this issue to start execution planning.",
+      goalId: companyGoal.id,
+      status: "todo",
+      priority: "high"
+    });
+
+    queryClient.invalidateQueries({ queryKey: queryKeys.goals.list(companyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(companyId) });
+
+    return {
+      primaryIssueRef: kickoffIssue.identifier ?? kickoffIssue.id
+    };
+  }
+
+  async function handleStep1CreateCompanyOnly() {
+    setLoading(true);
+    setError(null);
+    try {
+      const company = await companiesApi.create({ name: companyName.trim() });
+      setCreatedCompanyId(company.id);
+      setCreatedCompanyPrefix(company.issuePrefix);
+      setSelectedCompanyId(company.id);
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+
+      let primaryIssueRef: string | null = null;
+      if (companyGoal.trim()) {
+        try {
+          const bootstrap = await runQuickGoalBootstrap(
+            company.id,
+            companyGoal.trim()
+          );
+          primaryIssueRef = bootstrap.primaryIssueRef;
+        } catch (error) {
+          // Keep quick-create resilient; fallback to storing the user goal even if bootstrap fails.
+          console.warn("Quick bootstrap failed; falling back to basic goal", error);
+          await goalsApi.create(company.id, {
+            title: companyGoal.trim(),
+            level: "company",
+            status: "active"
+          });
+          queryClient.invalidateQueries({
+            queryKey: queryKeys.goals.list(company.id)
+          });
+        }
+      }
+
+      const companyPrefix = company.issuePrefix;
+      reset();
+      closeOnboarding();
+      if (primaryIssueRef) {
+        navigate(`/${companyPrefix}/issues/${primaryIssueRef}`);
+      } else {
+        navigate(`/${companyPrefix}/dashboard`);
+      }
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleStep2Next() {
     if (!createdCompanyId) return;
     setLoading(true);
@@ -318,6 +440,12 @@ export function OnboardingWizard() {
       if (isLocalAdapter) {
         const result = adapterEnvResult ?? (await runAdapterEnvironmentTest());
         if (!result) return;
+        if (result.status === "fail") {
+          setError(
+            "Adapter environment checks failed. Fix the errors above (for example command/auth) and retry before continuing."
+          );
+          return;
+        }
       }
 
       const agent = await agentsApi.create(createdCompanyId, {
@@ -442,7 +570,10 @@ export function OnboardingWizard() {
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      if (step === 1 && companyName.trim()) handleStep1Next();
+      if (step === 1 && companyName.trim()) {
+        if (onboardingMode === "quick") handleStep1CreateCompanyOnly();
+        else handleStep1Next();
+      }
       else if (step === 2 && agentName.trim()) handleStep2Next();
       else if (step === 3 && taskTitle.trim()) handleStep3Next();
       else if (step === 4) handleLaunch();
@@ -514,6 +645,40 @@ export function OnboardingWizard() {
                       </p>
                     </div>
                   </div>
+
+                  <div className="rounded-md border border-border p-3 space-y-2">
+                    <p className="text-xs text-muted-foreground">Setup mode</p>
+                    <div className="inline-flex rounded-md border border-border bg-muted/40 p-1 gap-1">
+                      <button
+                        type="button"
+                        onClick={() => handleOnboardingModeChange("quick")}
+                        className={cn(
+                          "px-2.5 py-1.5 text-xs rounded transition-colors",
+                          onboardingMode === "quick"
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        )}
+                      >
+                        Quick Create
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleOnboardingModeChange("full")}
+                        className={cn(
+                          "px-2.5 py-1.5 text-xs rounded transition-colors",
+                          onboardingMode === "full"
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        )}
+                      >
+                        Full Setup
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground/80">
+                      We remember this choice on this device.
+                    </p>
+                  </div>
+
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">
                       Company name
@@ -553,6 +718,15 @@ export function OnboardingWizard() {
                       </p>
                     </div>
                   </div>
+
+                  {initialStep > 1 && (
+                    <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
+                      You are adding an agent to an existing company. The Quick
+                      Create / Full Setup selector appears in Step 1 when
+                      starting from company creation.
+                    </div>
+                  )}
+
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">
                       Agent name
@@ -683,6 +857,25 @@ export function OnboardingWizard() {
                           />
                           <ChoosePathButton />
                         </div>
+                      </div>
+                      <div>
+                        <label className="text-xs text-muted-foreground mb-1 block">
+                          Command (optional)
+                        </label>
+                        <input
+                          className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm font-mono outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+                          placeholder={
+                            adapterType === "codex_local"
+                              ? "codex or /absolute/path/to/codex"
+                              : adapterType === "cursor"
+                                ? "agent or /absolute/path/to/agent"
+                                : adapterType === "opencode_local"
+                                  ? "opencode or /absolute/path/to/opencode"
+                                  : "claude or /absolute/path/to/claude"
+                          }
+                          value={command}
+                          onChange={(e) => setCommand(e.target.value)}
+                        />
                       </div>
                       <div>
                         <label className="text-xs text-muted-foreground mb-1 block">
@@ -998,14 +1191,24 @@ export function OnboardingWizard() {
                     <Button
                       size="sm"
                       disabled={!companyName.trim() || loading}
-                      onClick={handleStep1Next}
+                      onClick={
+                        onboardingMode === "quick"
+                          ? handleStep1CreateCompanyOnly
+                          : handleStep1Next
+                      }
                     >
                       {loading ? (
                         <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                      ) : onboardingMode === "quick" ? (
+                        <Check className="h-3.5 w-3.5 mr-1" />
                       ) : (
                         <ArrowRight className="h-3.5 w-3.5 mr-1" />
                       )}
-                      {loading ? "Creating..." : "Next"}
+                      {loading
+                        ? "Creating..."
+                        : onboardingMode === "quick"
+                          ? "Create Company"
+                          : "Next: Setup Agent"}
                     </Button>
                   )}
                   {step === 2 && (

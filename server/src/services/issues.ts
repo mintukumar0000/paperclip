@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -17,6 +17,7 @@ import {
 } from "@paperclipai/db";
 import { extractProjectMentionIds } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { publishEvent } from "../events/eventPublisher.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 
@@ -395,7 +396,7 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const [company] = await tx
           .update(companies)
           .set({ issueCounter: sql`${companies.issueCounter} + 1` })
@@ -421,8 +422,24 @@ export function issueService(db: Db) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
-        return enriched;
+
+        return {
+          enriched,
+          createdEvent: {
+          type: "issue.created",
+          companyId,
+          issueId: issue.id,
+          title: issue.title,
+          identifier: issue.identifier,
+          status: issue.status,
+          assigneeAgentId: issue.assigneeAgentId ?? undefined,
+          timestamp: new Date().toISOString(),
+          },
+        };
       });
+
+      await publishEvent("issue.created", result.createdEvent);
+      return result.enriched;
     },
 
     update: async (id: string, data: Partial<typeof issues.$inferInsert> & { labelIds?: string[] }) => {
@@ -479,7 +496,7 @@ export function issueService(db: Db) {
         patch.checkoutRunId = null;
       }
 
-      return db.transaction(async (tx) => {
+      const result = await db.transaction(async (tx) => {
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -491,12 +508,103 @@ export function issueService(db: Db) {
           await syncIssueLabels(updated.id, existing.companyId, nextLabelIds, tx);
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
-        return enriched;
+
+        // Emit specific events based on what changed
+        const eventBase = {
+          companyId: existing.companyId,
+          issueId: updated.id,
+          timestamp: new Date().toISOString(),
+        };
+        const deferredEvents: Array<{
+          name:
+            | "issue.closed"
+            | "issue.completed"
+            | "issue.cancelled"
+            | "issue.reopened"
+            | "issue.assigned"
+            | "issue.updated";
+          payload: Record<string, unknown>;
+        }> = [];
+
+        if (issueData.status === "done") {
+          deferredEvents.push({
+            name: "issue.closed",
+            payload: {
+            ...eventBase,
+            type: "issue.closed",
+            },
+          });
+          deferredEvents.push({
+            name: "issue.completed",
+            payload: {
+            ...eventBase,
+            type: "issue.completed",
+            },
+          });
+        } else if (issueData.status === "cancelled") {
+          deferredEvents.push({
+            name: "issue.closed",
+            payload: {
+            ...eventBase,
+            type: "issue.closed",
+            },
+          });
+          deferredEvents.push({
+            name: "issue.cancelled",
+            payload: {
+            ...eventBase,
+            type: "issue.cancelled",
+            },
+          });
+        } else if (
+          issueData.status !== undefined &&
+          (existing.status === "done" || existing.status === "cancelled")
+        ) {
+          deferredEvents.push({
+            name: "issue.reopened",
+            payload: {
+            ...eventBase,
+            type: "issue.reopened",
+            },
+          });
+        }
+
+        if (
+          issueData.assigneeAgentId !== undefined &&
+          issueData.assigneeAgentId !== existing.assigneeAgentId &&
+          issueData.assigneeAgentId !== null
+        ) {
+          deferredEvents.push({
+            name: "issue.assigned",
+            payload: {
+            ...eventBase,
+            type: "issue.assigned",
+            agentId: issueData.assigneeAgentId,
+            },
+          });
+        }
+
+        deferredEvents.push({
+          name: "issue.updated",
+          payload: {
+            ...eventBase,
+            type: "issue.updated",
+            changes: Object.keys(issueData),
+          },
+        });
+
+        return { enriched, deferredEvents };
       });
+
+      if (!result) return null;
+      for (const event of result.deferredEvents) {
+        await publishEvent(event.name, event.payload as any);
+      }
+      return result.enriched;
     },
 
-    remove: (id: string) =>
-      db.transaction(async (tx) => {
+    remove: async (id: string) => {
+      const result = await db.transaction(async (tx) => {
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)
@@ -516,8 +624,22 @@ export function issueService(db: Db) {
 
         if (!removedIssue) return null;
         const [enriched] = await withIssueLabels(tx, [removedIssue]);
-        return enriched;
-      }),
+
+        return {
+          enriched,
+          removedEvent: {
+            type: "issue.removed",
+            companyId: removedIssue.companyId,
+            issueId: removedIssue.id,
+            timestamp: new Date().toISOString(),
+          },
+        };
+      });
+
+      if (!result) return null;
+      await publishEvent("issue.removed", result.removedEvent);
+      return result.enriched;
+    },
 
     checkout: async (id: string, agentId: string, expectedStatuses: string[], checkoutRunId: string | null) => {
       const issueCompany = await db
@@ -562,6 +684,15 @@ export function issueService(db: Db) {
 
       if (updated) {
         const [enriched] = await withIssueLabels(db, [updated]);
+
+        await publishEvent("issue.assigned", {
+          type: "issue.assigned",
+          companyId: updated.companyId,
+          issueId: updated.id,
+          agentId,
+          timestamp: new Date().toISOString(),
+        });
+
         return enriched;
       }
 
@@ -740,6 +871,15 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!updated) return null;
       const [enriched] = await withIssueLabels(db, [updated]);
+
+      await publishEvent("issue.released", {
+        type: "issue.released",
+        companyId: updated.companyId,
+        issueId: updated.id,
+        previousAgentId: existing.assigneeAgentId ?? undefined,
+        timestamp: new Date().toISOString(),
+      });
+
       return enriched;
     },
 

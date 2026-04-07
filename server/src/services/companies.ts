@@ -1,4 +1,4 @@
-import { eq, count } from "drizzle-orm";
+import { eq, count } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import {
   companies,

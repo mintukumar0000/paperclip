@@ -1,0 +1,43 @@
+# Monitoring stack — use alongside docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    depends_on:
+      - server
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3200:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: paperclip
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - loki
+
+  loki:
+    image: grafana/loki:3.1.0
+    ports:
+      - "3101:3100"
+    volumes:
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:

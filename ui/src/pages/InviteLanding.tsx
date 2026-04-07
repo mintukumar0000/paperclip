@@ -6,6 +6,7 @@ import { authApi } from "../api/auth";
 import { healthApi } from "../api/health";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
+import { trackCtaClicked, trackLandingView } from "@/lib/analytics";
 import { AGENT_ADAPTER_TYPES } from "@paperclipai/shared";
 import type { AgentAdapterType, JoinRequest } from "@paperclipai/shared";
 
@@ -50,6 +51,10 @@ export function InviteLandingPage() {
   const [capabilities, setCapabilities] = useState("");
   const [result, setResult] = useState<{ kind: "bootstrap" | "join"; payload: unknown } | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    trackLandingView("invite_landing");
+  }, []);
 
   const healthQuery = useQuery({
     queryKey: queryKeys.health,
@@ -291,7 +296,12 @@ export function InviteLandingPage() {
             Sign in or create an account before submitting a human join request.
             <div className="mt-2">
               <Button asChild size="sm" variant="outline">
-                <Link to={`/auth?next=${encodeURIComponent(`/invite/${token}`)}`}>Sign in / Create account</Link>
+                <Link
+                  to={`/auth?next=${encodeURIComponent(`/invite/${token}`)}`}
+                  onClick={() => trackCtaClicked("invite_signin", "invite_landing")}
+                >
+                  Sign in / Create account
+                </Link>
               </Button>
             </div>
           </div>
@@ -306,7 +316,10 @@ export function InviteLandingPage() {
             (joinType === "agent" && invite.inviteType !== "bootstrap_ceo" && agentName.trim().length === 0) ||
             requiresAuthForHuman
           }
-          onClick={() => acceptMutation.mutate()}
+          onClick={() => {
+            trackCtaClicked("invite_accept", "invite_landing");
+            acceptMutation.mutate();
+          }}
         >
           {acceptMutation.isPending
             ? "Submitting…"

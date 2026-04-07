@@ -25,6 +25,39 @@ export type BetterAuthSessionResult = {
 
 type BetterAuthInstance = ReturnType<typeof betterAuth>;
 
+function normalizeOrigin(value: string): string | null {
+  try {
+    return new URL(value).origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function addHostOrigins(target: Set<string>, host: string, port: number) {
+  const trimmedHost = host.trim().toLowerCase();
+  if (!trimmedHost) return;
+  target.add(`http://${trimmedHost}:${port}`);
+  target.add(`https://${trimmedHost}:${port}`);
+}
+
+function resolveTrustedOrigins(config: Config, baseUrl: string | undefined): string[] {
+  const trustedOrigins = new Set<string>();
+
+  if (baseUrl) {
+    const normalized = normalizeOrigin(baseUrl);
+    if (normalized) trustedOrigins.add(normalized);
+  }
+
+  addHostOrigins(trustedOrigins, "localhost", config.port);
+  addHostOrigins(trustedOrigins, "127.0.0.1", config.port);
+  addHostOrigins(trustedOrigins, config.host, config.port);
+  for (const hostname of config.allowedHostnames) {
+    addHostOrigins(trustedOrigins, hostname, config.port);
+  }
+
+  return Array.from(trustedOrigins);
+}
+
 function headersFromNodeHeaders(rawHeaders: IncomingHttpHeaders): Headers {
   const headers = new Headers();
   for (const [key, raw] of Object.entries(rawHeaders)) {
@@ -45,9 +78,11 @@ function headersFromExpressRequest(req: Request): Headers {
 export function createBetterAuthInstance(db: Db, config: Config): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET ?? "paperclip-dev-secret";
+  const trustedOrigins = resolveTrustedOrigins(config, baseUrl);
 
   const authConfig = {
     baseURL: baseUrl,
+    trustedOrigins,
     secret,
     database: drizzleAdapter(db, {
       provider: "pg",

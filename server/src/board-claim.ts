@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
