@@ -306,6 +306,10 @@ if (config.databaseUrl) {
     process.env.PAPERCLIP_EMBEDDED_POSTGRES_CREATE_USER,
     runningAsRoot,
   );
+  const recoverStaleDataDirOnInitFailure = parseBooleanEnv(
+    process.env.PAPERCLIP_EMBEDDED_POSTGRES_RESET_STALE_DIR,
+    runningAsRoot,
+  );
 
   if (runningAsRoot) {
     logger.warn(
@@ -351,7 +355,7 @@ if (config.databaseUrl) {
     }
     port = detectedPort;
     logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-    embeddedPostgres = new EmbeddedPostgres({
+    const createEmbeddedPostgresInstance = () => new EmbeddedPostgres({
       databaseDir: dataDir,
       user: "paperclip",
       password: "paperclip",
@@ -362,12 +366,29 @@ if (config.databaseUrl) {
       onError: appendEmbeddedPostgresLog,
     });
 
+    embeddedPostgres = createEmbeddedPostgresInstance();
+
     if (!clusterAlreadyInitialized) {
       try {
         await embeddedPostgres.initialise();
       } catch (err) {
-        logEmbeddedPostgresFailure("initialise", err);
-        throw err;
+        const errMessage = err instanceof Error ? err.message : String(err ?? "");
+        const staleDirHint = /data directory.*already exist|might already exist/i.test(errMessage);
+        if (recoverStaleDataDirOnInitFailure && staleDirHint && existsSync(dataDir)) {
+          logger.warn(
+            {
+              dataDir,
+              err: errMessage,
+            },
+            "Embedded PostgreSQL init failed with stale data directory; resetting directory and retrying once",
+          );
+          rmSync(dataDir, { recursive: true, force: true });
+          embeddedPostgres = createEmbeddedPostgresInstance();
+          await embeddedPostgres.initialise();
+        } else {
+          logEmbeddedPostgresFailure("initialise", err);
+          throw err;
+        }
       }
     } else {
       logger.info(`Embedded PostgreSQL cluster already exists (${clusterVersionFile}); skipping init`);
