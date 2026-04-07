@@ -264,7 +264,7 @@ if (config.databaseUrl) {
     );
   }
 
-  const dataDir = resolve(config.embeddedPostgresDataDir);
+  let dataDir = resolve(config.embeddedPostgresDataDir);
   const configuredPort = config.embeddedPostgresPort;
   let port = configuredPort;
   const embeddedPostgresLogBuffer: string[] = [];
@@ -310,6 +310,10 @@ if (config.databaseUrl) {
     process.env.PAPERCLIP_EMBEDDED_POSTGRES_RESET_STALE_DIR,
     runningAsRoot,
   );
+  const useTmpDataDirForRoot = parseBooleanEnv(
+    process.env.PAPERCLIP_EMBEDDED_POSTGRES_USE_TMP_DIR,
+    runningAsRoot && createPostgresUser,
+  );
 
   if (runningAsRoot) {
     logger.warn(
@@ -320,8 +324,25 @@ if (config.databaseUrl) {
     );
   }
 
+  if (runningAsRoot && createPostgresUser && useTmpDataDirForRoot) {
+    const instanceId = (process.env.PAPERCLIP_INSTANCE_ID ?? "default").trim() || "default";
+    const tmpDataDir = resolve(
+      process.env.PAPERCLIP_EMBEDDED_POSTGRES_TMP_DIR ?? `/tmp/paperclip/instances/${instanceId}/db`,
+    );
+    if (tmpDataDir !== dataDir) {
+      logger.warn(
+        {
+          configuredDataDir: dataDir,
+          selectedDataDir: tmpDataDir,
+        },
+        "Root/container mode detected; switching embedded PostgreSQL data directory to tmp path",
+      );
+      dataDir = tmpDataDir;
+    }
+  }
+
   const clusterVersionFile = resolve(dataDir, "PG_VERSION");
-  const clusterAlreadyInitialized = existsSync(clusterVersionFile);
+  let clusterAlreadyInitialized = existsSync(clusterVersionFile);
   const postmasterPidFile = resolve(dataDir, "postmaster.pid");
   const isPidRunning = (pid: number): boolean => {
     try {
@@ -383,6 +404,7 @@ if (config.databaseUrl) {
             "Embedded PostgreSQL init failed with stale data directory; resetting directory and retrying once",
           );
           rmSync(dataDir, { recursive: true, force: true });
+          clusterAlreadyInitialized = false;
           embeddedPostgres = createEmbeddedPostgresInstance();
           await embeddedPostgres.initialise();
         } else {
