@@ -62,6 +62,8 @@ type EmbeddedPostgresCtor = new (opts: {
 
 const config = loadConfig();
 const isWorkerOnly = process.env.WORKER_ONLY === "true";
+const runningOnRender = parseBooleanEnv(process.env.RENDER, false)
+  || (process.env.RENDER_SERVICE_ID ?? "").trim().length > 0;
 
 function parseBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
   if (typeof value !== "string") return defaultValue;
@@ -245,6 +247,13 @@ let activeDatabaseConnectionString: string;
 let startupDbInfo:
   | { mode: "external-postgres"; connectionString: string }
   | { mode: "embedded-postgres"; dataDir: string; port: number };
+
+if (runningOnRender && !config.databaseUrl) {
+  throw new Error(
+    "Render deployment requires DATABASE_URL. Attach a Render PostgreSQL instance and set DATABASE_URL in service environment variables.",
+  );
+}
+
 if (config.databaseUrl) {
   migrationSummary = await ensureMigrations(config.databaseUrl, "PostgreSQL");
 
