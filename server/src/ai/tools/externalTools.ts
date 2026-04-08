@@ -36,6 +36,12 @@ const ALLOWED_HTTP_METHODS = new Set([
   "OPTIONS",
 ]);
 
+const REDDIT_MINIMUM_BODY = "Sharing something I built recently. Would love feedback.";
+
+const SUBREDDIT_TITLE_PREFIX_RULES: Record<string, string[]> = {
+  startups: ["i will not promote"],
+};
+
 function asObject(value: unknown): JsonObject {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as JsonObject;
@@ -85,6 +91,192 @@ function parseBoolean(value: unknown, defaultValue: boolean): boolean {
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return defaultValue;
+}
+
+function parseEngagementCount(raw: string | null): number {
+  if (!raw) return 0;
+  const cleaned = raw.replace(/,/g, "").trim().toLowerCase();
+  if (!cleaned) return 0;
+
+  const suffixMatch = cleaned.match(/^(-?\d+(?:\.\d+)?)([km])?$/i);
+  if (suffixMatch) {
+    const value = Number(suffixMatch[1]);
+    if (!Number.isFinite(value)) return 0;
+    const suffix = suffixMatch[2]?.toLowerCase();
+    const multiplier = suffix === "k" ? 1_000 : suffix === "m" ? 1_000_000 : 1;
+    return Math.max(0, Math.round(value * multiplier));
+  }
+
+  const firstNumber = cleaned.match(/-?\d+(?:\.\d+)?/);
+  if (!firstNumber) return 0;
+  const parsed = Number(firstNumber[0]);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.round(parsed));
+}
+
+async function readFirstVisibleInnerText(
+  page: {
+    locator: (selector: string) => {
+      first: () => {
+        isVisible: () => Promise<boolean>;
+        innerText: () => Promise<string>;
+      };
+    };
+  },
+  selectors: string[],
+): Promise<string | null> {
+  for (const selector of selectors) {
+    const node = page.locator(selector).first();
+    const visible = await node.isVisible().catch(() => false);
+    if (!visible) continue;
+    const text = await node.innerText().catch(() => "");
+    if (typeof text === "string" && text.trim().length > 0) {
+      return text.trim();
+    }
+  }
+  return null;
+}
+
+function parseRequiredTitlePhrase(validationText: string | null): string | null {
+  if (!validationText) return null;
+  const quoted = validationText.match(/requires\s+["']([^"']+)["']\s+in\s+post\s+titles?/i);
+  if (quoted?.[1]) return quoted[1].trim();
+  const bare = validationText.match(/requires\s+([^.,]+?)\s+in\s+post\s+titles?/i);
+  if (bare?.[1]) return bare[1].trim();
+  return null;
+}
+
+function withRequiredTitlePrefix(title: string, requiredPhrase: string): string {
+  const normalizedTitle = title.trim();
+  const normalizedRequired = requiredPhrase.trim();
+  if (!normalizedTitle || !normalizedRequired) return normalizedTitle;
+  if (normalizedTitle.toLowerCase().includes(normalizedRequired.toLowerCase())) return normalizedTitle;
+  return `${normalizedRequired}: ${normalizedTitle}`;
+}
+
+function applyKnownSubredditTitleRules(subreddit: string, title: string): string {
+  const required = SUBREDDIT_TITLE_PREFIX_RULES[subreddit.toLowerCase()] ?? [];
+  return required.reduce((nextTitle, phrase) => withRequiredTitlePrefix(nextTitle, phrase), title);
+}
+
+function mutateTitleForAttempt(baseTitle: string, attempt: number): string {
+  const cleaned = baseTitle.trim();
+  if (attempt <= 1) return cleaned;
+  const variants = [
+    `${cleaned} (looking for feedback)`,
+    `Quick build update: ${cleaned}`,
+    `${cleaned} - what would you improve?`,
+  ];
+  return variants[(attempt - 2) % variants.length] ?? cleaned;
+}
+
+function sanitizeSubreddit(value: string): string {
+  return value.trim().replace(/^r\//i, "");
+}
+
+function buildSubredditAttemptPlan(primary: string, rawFallback: unknown): string[] {
+  const fallback = normalizeStringList(rawFallback)
+    .map((item) => sanitizeSubreddit(item))
+    .filter((item) => item.length > 0);
+  const ordered = [sanitizeSubreddit(primary), ...fallback];
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of ordered) {
+    const key = entry.toLowerCase();
+    if (!entry || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+function mutateLinkUrlForAttempt(url: string, attempt: number): string {
+  if (!url || attempt <= 1) return url;
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set("pc_attempt", String(attempt));
+    parsed.searchParams.set("pc_ts", String(Date.now()));
+    return parsed.toString();
+  } catch {
+    const sep = url.includes("?") ? "&" : "?";
+    return `${url}${sep}pc_attempt=${attempt}&pc_ts=${Date.now()}`;
+  }
+}
+
+async function collectRedditValidationText(page: {
+  locator: (selector: string) => {
+    first: () => {
+      isVisible: () => Promise<boolean>;
+      innerText: () => Promise<string>;
+    };
+  };
+}): Promise<string | null> {
+  return readFirstVisibleInnerText(page, [
+    '[data-testid*="error"]',
+    '[data-testid*="validation"]',
+    '[aria-live="assertive"]',
+    'shreddit-ui-text[color="danger"]',
+    'faceplate-form-helper-text[error="true"]',
+    'text=/requires.+post titles?/i',
+  ]);
+}
+
+async function fillRedditBodyInput(
+  page: {
+    locator: (selector: string) => {
+      count: () => Promise<number>;
+      nth: (index: number) => {
+        isVisible: () => Promise<boolean>;
+        fill: (value: string) => Promise<void>;
+        type: (value: string, opts?: { delay?: number }) => Promise<void>;
+        click: () => Promise<void>;
+        inputValue: () => Promise<string>;
+        innerText: () => Promise<string>;
+      };
+    };
+    keyboard: {
+      press: (value: string) => Promise<void>;
+      type: (value: string, opts?: { delay?: number }) => Promise<void>;
+    };
+  },
+  body: string,
+): Promise<boolean> {
+  const selectors = [
+    '[data-testid="post-content-textarea"]',
+    'textarea[name="text"]',
+    'textarea[placeholder*="body" i]',
+    '[data-testid="post-content"] textarea',
+    'div[contenteditable="true"][role="textbox"]',
+    'div[contenteditable="true"]',
+  ];
+
+  for (const selector of selectors) {
+    const nodes = page.locator(selector);
+    const count = await nodes.count().catch(() => 0);
+    for (let i = 0; i < Math.min(count, 8); i += 1) {
+      const node = nodes.nth(i);
+      const visible = await node.isVisible().catch(() => false);
+      if (!visible) continue;
+
+      await node.click().catch(() => undefined);
+      await node.fill("").catch(() => undefined);
+      await node.fill(body).catch(() => undefined);
+
+      const inputValue = await node.inputValue().catch(() => "");
+      if (inputValue.trim().length > 0) return true;
+
+      await node.type(body, { delay: 8 }).catch(() => undefined);
+      const textValue = await node.innerText().catch(() => "");
+      if (textValue.trim().length > 0) return true;
+
+      await page.keyboard.press("Meta+A").catch(() => undefined);
+      await page.keyboard.type(body, { delay: 8 }).catch(() => undefined);
+      const typedValue = await node.innerText().catch(() => "");
+      if (typedValue.trim().length > 0) return true;
+    }
+  }
+
+  return false;
 }
 
 function isLoopbackHttpUrl(value: string): boolean {
@@ -428,7 +620,7 @@ export async function postToRedditPlaywright(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const playwright = await import("playwright");
-  const subreddit = typeof args.subreddit === "string" ? args.subreddit.trim().replace(/^r\//i, "") : "";
+  const subreddit = typeof args.subreddit === "string" ? sanitizeSubreddit(args.subreddit) : "";
   const title = typeof args.title === "string" ? args.title.trim() : "";
   if (!subreddit || !title) {
     throw new Error("subreddit and title are required for post_reddit");
@@ -436,6 +628,7 @@ export async function postToRedditPlaywright(
 
   const kind = args.kind === "link" ? "link" : "self";
   const text = typeof args.text === "string" ? args.text : "";
+  const fallbackSubreddits = buildSubredditAttemptPlan(subreddit, args.fallbackSubreddits);
   const linkUrl = typeof args.url === "string" ? args.url.trim() : "";
   if (kind === "link" && !linkUrl) {
     throw new Error("url is required when kind=link for post_reddit");
@@ -517,6 +710,10 @@ export async function postToRedditPlaywright(
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const plannedSubreddit = fallbackSubreddits[Math.min(attempt - 1, fallbackSubreddits.length - 1)] ?? subreddit;
+    let attemptTitle = applyKnownSubredditTitleRules(plannedSubreddit, mutateTitleForAttempt(title, attempt));
+    const minimumBody = (text || REDDIT_MINIMUM_BODY).trim();
+    const attemptLinkUrl = mutateLinkUrlForAttempt(linkUrl, attempt);
     let browser: Awaited<ReturnType<typeof playwright.chromium.launch>> | null = null;
     let context: Awaited<ReturnType<typeof playwright.chromium.launchPersistentContext>> | null = null;
 
@@ -541,11 +738,11 @@ export async function postToRedditPlaywright(
 
       const page = await context.newPage();
       await page.waitForTimeout(500 + Math.min(2_500, attempt * 400));
-      let submitAccess = await hasRedditSubmitAccess(page, subreddit, timeoutMs);
+      let submitAccess = await hasRedditSubmitAccess(page, plannedSubreddit, timeoutMs);
       console.log("REDDIT DEBUG:", {
         storageUsed: existsSync(sessionPath),
         currentUrl: page.url(),
-        subreddit,
+        subreddit: plannedSubreddit,
         attempt,
         submitAccess,
       });
@@ -554,7 +751,7 @@ export async function postToRedditPlaywright(
         console.log("REDDIT DEBUG:", {
           storageUsed: existsSync(sessionPath),
           currentUrl: page.url(),
-          subreddit,
+          subreddit: plannedSubreddit,
           attempt,
           submitAccess,
           welcomeBackLoop,
@@ -563,7 +760,7 @@ export async function postToRedditPlaywright(
         });
         if (!allowPasswordLogin) {
           throw new Error(
-            `Reddit session is not authenticated for /r/${subreddit}/submit (url=${page.url()}, welcomeBack=${welcomeBackLoop}). Re-bootstrap storage state and retry.`,
+            `Reddit session is not authenticated for /r/${plannedSubreddit}/submit (url=${page.url()}, welcomeBack=${welcomeBackLoop}). Re-bootstrap storage state and retry.`,
           );
         }
 
@@ -574,11 +771,11 @@ export async function postToRedditPlaywright(
         if (page.url().includes("/login") || welcomeBackLoop) {
           await ensureRedditLogin(page, { username, password: password || undefined, timeoutMs });
           await page.waitForTimeout(3000);
-          submitAccess = await hasRedditSubmitAccess(page, subreddit, timeoutMs);
+          submitAccess = await hasRedditSubmitAccess(page, plannedSubreddit, timeoutMs);
           console.log("REDDIT DEBUG:", {
             storageUsed: existsSync(sessionPath),
             currentUrl: page.url(),
-            subreddit,
+            subreddit: plannedSubreddit,
             attempt,
             submitAccess,
             phase: "post_login_recovery",
@@ -594,16 +791,12 @@ export async function postToRedditPlaywright(
         .locator('textarea[name="title"], textarea[name="title-textarea"], textarea#innerTextArea')
         .first();
       await finalTitleInput.waitFor({ timeout: timeoutMs });
-      await finalTitleInput.fill(title);
+      await finalTitleInput.fill(attemptTitle);
 
       if (kind === "self") {
-        const bodyInput = page.locator('[data-testid="post-content-textarea"]').first();
-        if (await bodyInput.isVisible().catch(() => false)) {
-          await bodyInput.fill(text || "Generated by Paperclip agent");
-        } else {
-          const fallbackEditor = page.locator('div[contenteditable="true"]').first();
-          await fallbackEditor.waitFor({ timeout: timeoutMs });
-          await fallbackEditor.fill(text || "Generated by Paperclip agent");
+        const bodyFilled = await fillRedditBodyInput(page, minimumBody);
+        if (!bodyFilled) {
+          throw new Error("Unable to locate a visible Reddit body input/editor for self post");
         }
       } else {
         const linkTab = page
@@ -622,7 +815,7 @@ export async function postToRedditPlaywright(
           if (!(await candidate.isVisible().catch(() => false))) {
             continue;
           }
-          await candidate.fill(linkUrl).catch(() => undefined);
+          await candidate.fill(attemptLinkUrl).catch(() => undefined);
           const value = await candidate.inputValue().catch(() => "");
           if (value && value.trim().length > 0) {
             filledUrl = true;
@@ -642,14 +835,106 @@ export async function postToRedditPlaywright(
         .locator('button:has-text("Post"), button[type="submit"], [data-testid*="post-submit"]')
         .first();
       await submitButton.waitFor({ timeout: timeoutMs });
+
+      let validationText = await collectRedditValidationText(page);
+      let finalBody = await readFirstVisibleInnerText(page, [
+        '[data-testid="post-content"]',
+        '[data-testid="post-content-textarea"]',
+        'div[contenteditable="true"]',
+      ]);
+      let postButtonEnabled = await submitButton.isEnabled().catch(() => false);
+
+      console.log("REDDIT FINAL CHECK:", {
+        url: page.url(),
+        title: await finalTitleInput.inputValue().catch(() => ""),
+        body: finalBody ?? "",
+        postButtonEnabled,
+      });
+
+      if (!postButtonEnabled) {
+        const requiredPhrase = parseRequiredTitlePhrase(validationText);
+        if (requiredPhrase) {
+          attemptTitle = withRequiredTitlePrefix(attemptTitle, requiredPhrase);
+          await finalTitleInput.fill(attemptTitle);
+          if (kind === "self") {
+            await fillRedditBodyInput(page, minimumBody);
+          }
+          await page.waitForTimeout(1200);
+          validationText = await collectRedditValidationText(page);
+          finalBody = await readFirstVisibleInnerText(page, [
+            '[data-testid="post-content"]',
+            '[data-testid="post-content-textarea"]',
+            'div[contenteditable="true"]',
+          ]);
+          postButtonEnabled = await submitButton.isEnabled().catch(() => false);
+          console.log("REDDIT FINAL CHECK:", {
+            url: page.url(),
+            title: await finalTitleInput.inputValue().catch(() => ""),
+            body: finalBody ?? "",
+            postButtonEnabled,
+          });
+        }
+      }
+
+      if (!postButtonEnabled) {
+        throw new Error(`POST_BUTTON_DISABLED: ${validationText ?? "validation_blocked_or_missing_required_fields"}`);
+      }
+
       await submitButton.click();
 
+      let postUrl: string | null = null;
+      await page.waitForURL(/\/comments\//, { timeout: timeoutMs }).catch(() => undefined);
       await page.waitForTimeout(3500);
-      const postUrl = page.url();
-      const looksLikeSubmitPage = postUrl.includes("/submit") || postUrl.includes("type=LINK");
-      if (looksLikeSubmitPage) {
-        throw new Error(`Reddit post was not confirmed. Final URL stayed on submit flow: ${postUrl}`);
+      if (/\/comments\//.test(page.url())) {
+        postUrl = page.url();
       }
+
+      if (!postUrl) {
+        await page.goto(`https://www.reddit.com/user/${username}/submitted/`, {
+          waitUntil: "domcontentloaded",
+          timeout: timeoutMs,
+        });
+        await page.waitForTimeout(2000);
+
+        const titleLower = attemptTitle.toLowerCase();
+        const submittedLinks = page.locator('a[href*="/comments/"]');
+        const submittedCount = await submittedLinks.count().catch(() => 0);
+        for (let i = 0; i < Math.min(submittedCount, 12); i += 1) {
+          const link = submittedLinks.nth(i);
+          const linkText = (await link.innerText().catch(() => "")).trim().toLowerCase();
+          const href = await link.getAttribute("href").catch(() => null);
+          if (!href) continue;
+          if (linkText.includes(titleLower.slice(0, Math.min(titleLower.length, 40)))) {
+            postUrl = href.startsWith("http") ? href : `https://www.reddit.com${href}`;
+            break;
+          }
+        }
+      }
+
+      const finalUrl = postUrl ?? page.url();
+      const looksLikeSubmitPage = finalUrl.includes("/submit") || finalUrl.includes("type=LINK");
+      if (looksLikeSubmitPage) {
+        throw new Error(`Reddit post was not confirmed. Final URL stayed on submit flow: ${finalUrl}`);
+      }
+      if (!/\/comments\//.test(finalUrl)) {
+        throw new Error(`Reddit post confirmation failed. Could not resolve comments permalink after submit (finalUrl=${finalUrl})`);
+      }
+
+      await page.goto(finalUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+      await page.waitForTimeout(1500);
+
+      const upvoteText = await readFirstVisibleInnerText(page, [
+        '[data-testid="upvoteRatio"]',
+        '[data-click-id="upvote"]',
+      ]);
+      const commentText = await readFirstVisibleInnerText(page, [
+        '[data-testid="comments-page-link-num-comments"]',
+        'a[data-testid="comments-page-link"]',
+      ]);
+
+      const upvotes = parseEngagementCount(upvoteText);
+      const comments = parseEngagementCount(commentText);
+      const verificationSuccess = upvotes > 5 || comments > 2;
 
       await saveStorageState(context, sessionPath);
 
@@ -657,15 +942,18 @@ export async function postToRedditPlaywright(
         posted: true,
         platform: "reddit",
         username,
-        subreddit,
+        subreddit: plannedSubreddit,
         kind,
-        postUrl,
+        postUrl: finalUrl,
         currentUrl: page.url(),
         userDataDir: attemptUserDataDir,
         storageStatePath: sessionPath,
         mode: "playwright",
         authMode: hasInitialStorageState ? "storage_state" : "password_login",
         attempt,
+        upvotes,
+        comments,
+        verificationSuccess,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

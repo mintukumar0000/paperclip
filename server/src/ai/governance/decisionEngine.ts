@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { and, eq, inArray } from "@paperclipai/db";
-import { activityLog, issues } from "@paperclipai/db";
+import { activityLog, companies, issues } from "@paperclipai/db";
 import pino from "pino";
 import { eventBus } from "../../events/eventBus.js";
 import { issueService } from "../../services/issues.js";
@@ -303,6 +303,73 @@ function dedupeDecisionActions(actions: DecisionAction[]): DecisionAction[] {
   });
 }
 
+function currentRPVCents(metrics: SystemMetricSnapshot): number {
+  if (metrics.traffic <= 0) return 0;
+  return metrics.revenue / metrics.traffic;
+}
+
+function projectedRPVDeltaCents(action: DecisionAction, currentRpv: number): number {
+  const key = action.key.toLowerCase();
+
+  if (key.includes("rpv") || key.includes("revenue") || key.includes("pricing") || key.includes("payment")) {
+    return Math.max(1, currentRpv * 0.2);
+  }
+
+  if (key.includes("landing") || key.includes("conversion") || key.includes("offer") || key.includes("checkout")) {
+    return Math.max(0.75, currentRpv * 0.15);
+  }
+
+  if (key.includes("audience") || key.includes("traffic_quality")) {
+    return Math.max(0.5, currentRpv * 0.1);
+  }
+
+  if (key.includes("scale") || key.includes("content") || key.includes("traffic")) {
+    // Scaling only passes the gate when it can preserve at least a small positive RPV uplift.
+    return currentRpv > 0 ? currentRpv * 0.02 : 0;
+  }
+
+  if (key.includes("expansion")) {
+    return Math.max(0.25, currentRpv * 0.05);
+  }
+
+  return 0;
+}
+
+function rejectAction(action: DecisionAction, currentRpv: number): boolean {
+  const projected = currentRpv + projectedRPVDeltaCents(action, currentRpv);
+  return projected <= currentRpv;
+}
+
+type RpvExecutionMode = "exploration" | "validation" | "optimization";
+
+function getValidationRevenueThresholdCents(): number {
+  const raw = Number(process.env.DECISION_RPV_VALIDATION_REVENUE_CENTS ?? 10_000);
+  if (!Number.isFinite(raw)) return 10_000;
+  return Math.max(0, Math.round(raw));
+}
+
+function selectRpvExecutionMode(metrics: SystemMetricSnapshot): RpvExecutionMode {
+  if (metrics.revenue <= 0) {
+    return "exploration";
+  }
+  if (metrics.revenue < getValidationRevenueThresholdCents()) {
+    return "validation";
+  }
+  return "optimization";
+}
+
+function rejectActionInValidationMode(action: DecisionAction, currentRpv: number): boolean {
+  const projected = currentRpv + projectedRPVDeltaCents(action, currentRpv);
+  if (projected > currentRpv) {
+    return false;
+  }
+
+  // In validation mode, only suppress expensive/no-uplift actions.
+  const key = action.key.toLowerCase();
+  const highCostAction = key.includes("scale") || key.includes("expansion");
+  return highCostAction;
+}
+
 async function issueAlreadyOpen(db: Db, companyId: string, title: string): Promise<boolean> {
   const row = await db
     .select({ id: issues.id })
@@ -427,6 +494,47 @@ async function executeAction(
   return { success: false, error: `Unsupported action type: ${action.type}` };
 }
 
+async function createFallbackForSkippedAction(
+  db: Db,
+  companyId: string,
+  action: DecisionAction,
+  skipReason: string,
+): Promise<Record<string, unknown> | null> {
+  const normalizedKey = action.key.toLowerCase();
+  let fallbackTitle = `Fallback: minimum viable execution for ${action.key}`;
+  let fallbackDescription = `Primary action ${action.key} was skipped (reason=${skipReason}). Run a minimal executable variant and report measurable outcome.`;
+
+  if (normalizedKey.includes("content") || normalizedKey.includes("distribution") || normalizedKey.includes("reddit")) {
+    fallbackTitle = "Fallback: publish one minimal Reddit validation post";
+    fallbackDescription = "Primary distribution action was skipped. Post one short text update in a safe subreddit (SideProject/indiehackers), include body text, and capture resulting post URL.";
+  } else if (normalizedKey.includes("payment") || normalizedKey.includes("checkout") || normalizedKey.includes("revenue")) {
+    fallbackTitle = "Fallback: run checkout smoke test";
+    fallbackDescription = "Monetization action was skipped. Run one end-to-end checkout smoke test and capture blockers with screenshots/errors.";
+  }
+
+  if (await issueAlreadyOpen(db, companyId, fallbackTitle)) {
+    return {
+      skipped: true,
+      reason: "fallback_issue_already_open",
+      fallbackTitle,
+    };
+  }
+
+  const issue = await issueService(db).create(companyId, {
+    title: fallbackTitle,
+    description: fallbackDescription,
+    priority: "high",
+    status: "backlog",
+  });
+
+  return {
+    fallbackIssueId: issue.id,
+    fallbackIssueIdentifier: issue.identifier ?? null,
+    fallbackTitle: issue.title,
+    fallbackReason: skipReason,
+  };
+}
+
 // STEP 2: Decision → Action bridge
 // When the decision engine creates an issue, also trigger direct execution
 // for action types that have automated handlers.
@@ -434,7 +542,7 @@ async function executeDirectAction(
   db: Db,
   companyId: string,
   action: DecisionAction,
-): Promise<void> {
+): Promise<{ attempted: boolean; success: boolean; details?: Record<string, unknown> }> {
   const key = action.key;
 
   if (key === "increase_content_output" || key === "auto_scale_distribution") {
@@ -445,9 +553,25 @@ async function executeDirectAction(
         "http://localhost:3100"
       ).trim();
       logger.info({ companyId, key }, "Decision → Action: triggering traffic loop cycle");
-      void _runTrafficCycleForTest({ db, baseUrl });
+      const summary = await _runTrafficCycleForTest({ db, baseUrl });
+      return {
+        attempted: true,
+        success: summary.successCount > 0,
+        details: {
+          successCount: summary.successCount,
+          failCount: summary.failCount,
+          error: summary.error ?? null,
+        },
+      };
     } catch (err) {
       logger.warn({ err, key }, "Direct action execution failed for traffic trigger");
+      return {
+        attempted: true,
+        success: false,
+        details: {
+          error: err instanceof Error ? err.message : String(err),
+        },
+      };
     }
   }
 
@@ -459,6 +583,11 @@ async function executeDirectAction(
       actionType: "landing_rewrite",
       timestamp: new Date().toISOString(),
     });
+    return {
+      attempted: true,
+      success: false,
+      details: { dispatched: true, dispatchType: "event" },
+    };
   }
 
   if (key === "payment_conversion_under_target" || key === "low_revenue_per_visitor") {
@@ -469,13 +598,40 @@ async function executeDirectAction(
       actionType: "monetization_optimization",
       timestamp: new Date().toISOString(),
     });
+    return {
+      attempted: true,
+      success: false,
+      details: { dispatched: true, dispatchType: "event" },
+    };
   }
+
+  return { attempted: false, success: false, details: { reason: "no_direct_handler" } };
 }
 
 export async function runAutonomousDecisionCycle(
   db: Db,
   input: DecisionCycleInput,
 ): Promise<DecisionCycleResult> {
+  const company = await db
+    .select({ id: companies.id, status: companies.status })
+    .from(companies)
+    .where(eq(companies.id, input.companyId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!company || company.status !== "active") {
+    logger.info(
+      { companyId: input.companyId, status: company?.status ?? "missing", source: input.source },
+      "Skipping autonomous decision cycle for inactive company",
+    );
+    return {
+      companyId: input.companyId,
+      source: input.source,
+      feedback: [],
+      actions: [],
+      executed: [],
+    };
+  }
+
   const feedback = runBehaviorFeedback(input.companyId, {
     traffic: input.metrics.traffic,
     conversions: input.metrics.conversions,
@@ -500,9 +656,83 @@ export async function runAutonomousDecisionCycle(
     }
   }
 
-  const actions = llmAdvice?.suggestedActions
+  const proposedActions = llmAdvice?.suggestedActions
     ? dedupeDecisionActions([...ruleActions, ...llmAdvice.suggestedActions])
     : ruleActions;
+
+  const currentRpv = currentRPVCents(input.metrics);
+  const rpvMode = selectRpvExecutionMode(input.metrics);
+  const actions = proposedActions.filter((action) => {
+    if (rpvMode === "exploration") return true;
+    if (rpvMode === "validation") return !rejectActionInValidationMode(action, currentRpv);
+    return !rejectAction(action, currentRpv);
+  });
+  const rejectedByRpv = proposedActions.filter((action) => {
+    if (rpvMode === "exploration") return false;
+    if (rpvMode === "validation") return rejectActionInValidationMode(action, currentRpv);
+    return rejectAction(action, currentRpv);
+  });
+
+  if (rpvMode === "exploration") {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "decision-engine",
+      agentId: null,
+      runId: null,
+      action: "ai.decision.rpv_gate.bypassed",
+      entityType: "company",
+      entityId: input.companyId,
+      details: {
+        source: input.source,
+        revenue: input.metrics.revenue,
+        traffic: input.metrics.traffic,
+        reason: "early_stage_zero_revenue",
+      },
+    });
+  }
+
+  await db.insert(activityLog).values({
+    companyId: input.companyId,
+    actorType: "system",
+    actorId: "decision-engine",
+    agentId: null,
+    runId: null,
+    action: "ai.decision.rpv_gate.mode",
+    entityType: "company",
+    entityId: input.companyId,
+    details: {
+      source: input.source,
+      mode: rpvMode,
+      revenue: input.metrics.revenue,
+      traffic: input.metrics.traffic,
+      currentRpv,
+      validationThresholdCents: getValidationRevenueThresholdCents(),
+      proposedCount: proposedActions.length,
+      allowedCount: actions.length,
+      rejectedCount: rejectedByRpv.length,
+    },
+  });
+
+  if (rejectedByRpv.length > 0) {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "system",
+      actorId: "decision-engine",
+      agentId: null,
+      runId: null,
+      action: "ai.decision.action.rejected.rpv",
+      entityType: "company",
+      entityId: input.companyId,
+      details: {
+        source: input.source,
+        mode: rpvMode,
+        currentRpv,
+        rejectedCount: rejectedByRpv.length,
+        rejectedKeys: rejectedByRpv.map((entry) => entry.key),
+      },
+    });
+  }
 
   if (llmAdvice) {
     await db.insert(activityLog).values({
@@ -529,22 +759,59 @@ export async function runAutonomousDecisionCycle(
   for (const action of actions) {
     try {
       const result = await executeAction(db, input.companyId, action);
-      executed.push({ action, success: result.success, details: result.details, error: result.error });
+      const details: Record<string, unknown> = result.details ? { ...result.details } : {};
+      const issueId = typeof details.issueId === "string" ? details.issueId : null;
+      const skipped = details.skipped === true;
 
-      // STEP 2: After creating an issue, also trigger direct execution
-      if (result.success && !result.details?.skipped) {
-        await executeDirectAction(db, input.companyId, action);
+      if (skipped) {
+        const fallbackReason = typeof details.reason === "string" ? details.reason : "skipped";
+        const fallback = await createFallbackForSkippedAction(db, input.companyId, action, fallbackReason);
+        if (fallback) {
+          details.fallback = fallback;
+          details.fallbackTriggered = true;
+        }
       }
 
+      // STEP 2: After creating an issue, also trigger direct execution
+      if (result.success && !skipped) {
+        const direct = await executeDirectAction(db, input.companyId, action);
+        details.directExecution = direct;
+
+        if (issueId && direct.success) {
+          await issueService(db).update(issueId, { status: "done" });
+          details.issueCompleted = true;
+          await db.insert(activityLog).values({
+            companyId: input.companyId,
+            actorType: "system",
+            actorId: "decision-engine",
+            agentId: null,
+            runId: null,
+            action: "ai.decision.action.completed",
+            entityType: "issue",
+            entityId: issueId,
+            details: {
+              source: input.source,
+              key: action.key,
+              reason: "direct_execution_success",
+            },
+          });
+        }
+      }
+
+      const completed = !skipped && (details.issueCompleted === true || action.type !== "create_issue");
+      details.completed = completed;
+      const successForTelemetry = result.success && !skipped;
+
+      executed.push({ action, success: successForTelemetry, details, error: result.error });
+
       // STEP 4: Record action outcome in vector memory for learning
-      await recordActionOutcome(db, input.companyId, action.key, result.success, {
+      await recordActionOutcome(db, input.companyId, action.key, successForTelemetry, {
         actionType: action.type,
         reason: action.reason,
-        skipped: result.details?.skipped ?? false,
+        skipped,
         source: input.source,
       }).catch(() => {});
 
-      const issueId = typeof result.details?.issueId === "string" ? result.details.issueId : null;
       await db.insert(activityLog).values({
         companyId: input.companyId,
         actorType: "system",
@@ -559,8 +826,8 @@ export async function runAutonomousDecisionCycle(
           actionType: action.type,
           key: action.key,
           reason: action.reason,
-          success: result.success,
-          ...result.details,
+          success: successForTelemetry,
+          ...details,
           error: result.error ?? null,
         },
       });
@@ -570,8 +837,8 @@ export async function runAutonomousDecisionCycle(
         source: input.source,
         actionType: action.type,
         key: action.key,
-        success: result.success,
-        details: result.details ?? null,
+        success: successForTelemetry,
+        details: details,
         error: result.error ?? null,
         timestamp: new Date().toISOString(),
       });
