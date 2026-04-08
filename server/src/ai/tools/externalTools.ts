@@ -2,6 +2,12 @@ import { createHmac, randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import {
+  getConfiguredRedditStorageStatePath,
+  isRedditStorageStateRequired,
+  resolveExistingRedditStorageStatePath,
+  resolveRedditStorageStatePath,
+} from "../../reddit-storage-state.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -449,18 +455,14 @@ export async function postToRedditPlaywright(
       ? args.password.trim()
       : (process.env.REDDIT_PASSWORD ?? "").trim();
 
-  const sessionPathRaw =
+  const explicitSessionPath =
     typeof args.storageStatePath === "string" && args.storageStatePath.trim().length > 0
       ? args.storageStatePath.trim()
-      : (process.env.REDDIT_STORAGE_STATE_PATH ?? "storage/reddit.json");
-  const configuredSessionPath = resolveSessionPath(sessionPathRaw);
+      : null;
+  const configuredSessionPathRaw = explicitSessionPath ?? getConfiguredRedditStorageStatePath();
+  const configuredSessionPath = resolveRedditStorageStatePath(configuredSessionPathRaw);
   const sessionPath =
-    resolveExistingSessionPath([
-      sessionPathRaw,
-      "storage/reddit.json",
-      "data/playwright/reddit-storage-state.json",
-      "server/data/playwright/reddit-storage-state.json",
-    ])
+    resolveExistingRedditStorageStatePath(configuredSessionPathRaw)
     ?? configuredSessionPath;
   const userDataDirRaw =
     typeof args.userDataDir === "string" && args.userDataDir.trim().length > 0
@@ -472,7 +474,7 @@ export async function postToRedditPlaywright(
   const requireStorageState =
     typeof args.requireStorageState === "boolean"
       ? args.requireStorageState
-      : parseBoolean(process.env.REDDIT_REQUIRE_STORAGE_STATE ?? process.env.REDDIT_REQUIRE_STORAGE, true);
+      : isRedditStorageStateRequired(true);
   const allowPasswordLogin =
     typeof args.allowPasswordLogin === "boolean"
       ? args.allowPasswordLogin
@@ -480,7 +482,7 @@ export async function postToRedditPlaywright(
 
   if (requireStorageState && !hasInitialStorageState) {
     throw new Error(
-      `Reddit storage state is required but missing. Looked for ${sessionPath}. Run 'pnpm --filter @paperclipai/server exec tsx scripts/playwright-social-bootstrap.ts reddit' to create a fresh session and set REDDIT_STORAGE_STATE_PATH to that file.`,
+      `Reddit storage state is required but missing. Looked for ${sessionPath}. Run 'pnpm reddit:bootstrap-session' to create a fresh session and set REDDIT_STORAGE_STATE_PATH (or REDDIT_STORAGE_PATH), or provide REDDIT_STORAGE_BASE64 for runtime materialization.`,
     );
   }
 

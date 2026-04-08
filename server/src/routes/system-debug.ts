@@ -1,10 +1,21 @@
 import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { sql, waitlistSignups } from "@paperclipai/db";
 import { getLLMBudgetSnapshot } from "../ai/llmRouter.js";
+import {
+  isLoopbackHttpUrl,
+  resolvePublicBaseUrl,
+  resolveSignupEndpoint,
+  type PublicBaseUrlHints,
+} from "../public-base-url.js";
+import {
+  getConfiguredRedditStorageStatePath,
+  getRedditStorageRuntimeInfo,
+  isRedditStorageStateRequired,
+  parseBooleanEnv,
+  resolveRedditStorageStatePath,
+} from "../reddit-storage-state.js";
 
 type LayerStatus = "ok" | "warn" | "fail";
 
@@ -20,48 +31,21 @@ type LayerResult<T extends Record<string, unknown>> = {
   details: T;
 };
 
-function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
-  if (typeof value !== "string") return fallback;
-  const normalized = value.trim().toLowerCase();
-  if (!normalized) return fallback;
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-  return fallback;
-}
+function extractRequestHints(req: {
+  protocol?: string;
+  get: (name: string) => string | undefined;
+}): PublicBaseUrlHints {
+  const forwardedProto = req.get("x-forwarded-proto") ?? req.protocol ?? "http";
+  const forwardedHost = req.get("x-forwarded-host") ?? null;
+  const host = req.get("host") ?? null;
+  const requestOrigin = host ? `${forwardedProto}://${host}` : null;
 
-function normalizeBaseUrl(value: string | null | undefined): string | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return trimmed.replace(/\/$/, "");
-}
-
-function isLoopbackUrl(value: string | null): boolean {
-  if (!value) return false;
-  try {
-    const parsed = new URL(value);
-    const host = parsed.hostname.toLowerCase();
-    return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1";
-  } catch {
-    return /^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(value);
-  }
-}
-
-function resolvePublicApiBaseUrl(): string | null {
-  return normalizeBaseUrl(
-    process.env.PUBLIC_API_BASE
-    ?? process.env.WAITLIST_PUBLIC_BASE_URL
-    ?? process.env.PAPERCLIP_PUBLIC_BASE_URL
-    ?? process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL
-    ?? null,
-  );
-}
-
-function resolveSignupEndpoint(publicApiBaseUrl: string | null): string | null {
-  const explicitSignup = normalizeBaseUrl(process.env.SIGNUP_ENDPOINT ?? null);
-  if (explicitSignup) return explicitSignup;
-  if (!publicApiBaseUrl) return null;
-  return `${publicApiBaseUrl}/api/waitlist/signup`;
+  return {
+    requestOrigin,
+    host,
+    forwardedHost,
+    forwardedProto,
+  };
 }
 
 async function probeEndpoint(
@@ -110,50 +94,12 @@ function summarizeStatus(statuses: LayerStatus[]): LayerStatus {
   return "ok";
 }
 
-function resolveRedditStoragePath(configuredPath: string): string {
-  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-  const roots = [
-    process.cwd(),
-    path.resolve(process.cwd(), ".."),
-    path.resolve(process.cwd(), "../.."),
-    path.resolve(moduleDir, "../../.."),
-    path.resolve(moduleDir, "../../../.."),
-  ];
-
-  const uniqueRoots = Array.from(new Set(roots));
-  const relativeCandidates = [
-    configuredPath,
-    "storage/reddit.json",
-    "data/playwright/reddit-storage-state.json",
-    "server/data/playwright/reddit-storage-state.json",
-  ].filter((value, index, arr) => value.length > 0 && arr.indexOf(value) === index);
-
-  for (const candidate of relativeCandidates) {
-    if (path.isAbsolute(candidate) && existsSync(candidate)) {
-      return candidate;
-    }
-    for (const root of uniqueRoots) {
-      const absolute = path.resolve(root, candidate);
-      if (existsSync(absolute)) {
-        return absolute;
-      }
-    }
-  }
-
-  if (path.isAbsolute(configuredPath)) {
-    return configuredPath;
-  }
-  return path.resolve(process.cwd(), configuredPath);
-}
-
 function inspectRedditSession(): LayerResult<Record<string, unknown>> {
-  const configuredPath = (process.env.REDDIT_STORAGE_STATE_PATH ?? "storage/reddit.json").trim() || "storage/reddit.json";
-  const resolvedPath = resolveRedditStoragePath(configuredPath);
+  const runtimeInfo = getRedditStorageRuntimeInfo();
+  const configuredPath = getConfiguredRedditStorageStatePath();
+  const resolvedPath = resolveRedditStorageStatePath(configuredPath);
 
-  const requireStorageState = parseBooleanEnv(
-    process.env.REDDIT_REQUIRE_STORAGE_STATE ?? process.env.REDDIT_REQUIRE_STORAGE,
-    true,
-  );
+  const requireStorageState = isRedditStorageStateRequired(true);
   const allowPasswordLogin = parseBooleanEnv(process.env.REDDIT_ALLOW_PASSWORD_LOGIN, false);
   const headful = parseBooleanEnv(process.env.REDDIT_HEADFUL, false);
 
@@ -163,7 +109,11 @@ function inspectRedditSession(): LayerResult<Record<string, unknown>> {
       status: missingStorageIsFailure ? "fail" : "warn",
       details: {
         storagePath: resolvedPath,
+        configuredStoragePath: configuredPath,
         storageExists: false,
+        base64Configured: runtimeInfo.base64Configured,
+        materializedStoragePath: runtimeInfo.materializedPath,
+        materializationError: runtimeInfo.materializationError,
         requireStorageState,
         allowPasswordLogin,
         headful,
@@ -201,7 +151,11 @@ function inspectRedditSession(): LayerResult<Record<string, unknown>> {
       status: valid ? "ok" : "fail",
       details: {
         storagePath: resolvedPath,
+        configuredStoragePath: configuredPath,
         storageExists: true,
+        base64Configured: runtimeInfo.base64Configured,
+        materializedStoragePath: runtimeInfo.materializedPath,
+        materializationError: runtimeInfo.materializationError,
         requireStorageState,
         allowPasswordLogin,
         headful,
@@ -216,7 +170,11 @@ function inspectRedditSession(): LayerResult<Record<string, unknown>> {
       status: "fail",
       details: {
         storagePath: resolvedPath,
+        configuredStoragePath: configuredPath,
         storageExists: true,
+        base64Configured: runtimeInfo.base64Configured,
+        materializedStoragePath: runtimeInfo.materializedPath,
+        materializationError: runtimeInfo.materializationError,
         requireStorageState,
         allowPasswordLogin,
         headful,
@@ -227,12 +185,16 @@ function inspectRedditSession(): LayerResult<Record<string, unknown>> {
   }
 }
 
-async function inspectBackend(db: Db): Promise<LayerResult<Record<string, unknown>>> {
+async function inspectBackend(
+  db: Db,
+  requestHints: PublicBaseUrlHints,
+): Promise<LayerResult<Record<string, unknown>>> {
   const port = (process.env.PORT ?? "3100").trim() || "3100";
   const localSignupEndpoint = `http://127.0.0.1:${port}/api/waitlist/signup`;
-  const publicApiBaseUrl = resolvePublicApiBaseUrl();
-  const signupEndpoint = resolveSignupEndpoint(publicApiBaseUrl);
-  const signupEndpointLooksLoopback = isLoopbackUrl(signupEndpoint);
+  const publicApiBaseUrl = resolvePublicBaseUrl(requestHints);
+  const signupResolution = resolveSignupEndpoint(publicApiBaseUrl);
+  const signupEndpoint = signupResolution.endpoint;
+  const signupEndpointLooksLoopback = isLoopbackHttpUrl(signupEndpoint);
 
   const [localProbe, publicProbe] = await Promise.all([
     probeEndpoint(localSignupEndpoint, { method: "OPTIONS", timeoutMs: 4000 }),
@@ -271,6 +233,9 @@ async function inspectBackend(db: Db): Promise<LayerResult<Record<string, unknow
       localSignupProbe: localProbe,
       publicApiBaseUrl,
       signupEndpoint,
+      explicitSignupEndpoint: signupResolution.explicitEndpoint,
+      explicitSignupEndpointLoopback: signupResolution.explicitEndpointLoopback,
+      ignoredExplicitLoopback: signupResolution.ignoredExplicitLoopback,
       signupEndpointLooksLoopback,
       publicSignupProbe: publicProbe,
       reason:
@@ -285,10 +250,13 @@ async function inspectBackend(db: Db): Promise<LayerResult<Record<string, unknow
   };
 }
 
-async function inspectLanding(): Promise<LayerResult<Record<string, unknown>>> {
-  const publicApiBaseUrl = resolvePublicApiBaseUrl();
-  const signupEndpoint = resolveSignupEndpoint(publicApiBaseUrl);
-  const signupEndpointLooksLoopback = isLoopbackUrl(signupEndpoint);
+async function inspectLanding(
+  requestHints: PublicBaseUrlHints,
+): Promise<LayerResult<Record<string, unknown>>> {
+  const publicApiBaseUrl = resolvePublicBaseUrl(requestHints);
+  const signupResolution = resolveSignupEndpoint(publicApiBaseUrl);
+  const signupEndpoint = signupResolution.endpoint;
+  const signupEndpointLooksLoopback = isLoopbackHttpUrl(signupEndpoint);
 
   const signupProbe = signupEndpoint && !signupEndpointLooksLoopback
     ? await probeEndpoint(signupEndpoint, { method: "OPTIONS", timeoutMs: 7000 })
@@ -305,6 +273,9 @@ async function inspectLanding(): Promise<LayerResult<Record<string, unknown>>> {
     details: {
       publicApiBaseUrl,
       signupEndpoint,
+      explicitSignupEndpoint: signupResolution.explicitEndpoint,
+      explicitSignupEndpointLoopback: signupResolution.explicitEndpointLoopback,
+      ignoredExplicitLoopback: signupResolution.ignoredExplicitLoopback,
       signupEndpointLooksLoopback,
       signupProbe,
       reason:
@@ -382,10 +353,11 @@ function inspectLlmUsage(): LayerResult<Record<string, unknown>> {
 export function systemDebugRoutes(db: Db) {
   const router = Router();
 
-  router.get("/debug/system", async (_req, res) => {
+  router.get("/debug/system", async (req, res) => {
+    const requestHints = extractRequestHints(req);
     const [backend, landing, resend] = await Promise.all([
-      inspectBackend(db),
-      inspectLanding(),
+      inspectBackend(db, requestHints),
+      inspectLanding(requestHints),
       inspectResend(),
     ]);
 

@@ -4,6 +4,10 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import {
+  getConfiguredRedditStorageStatePath,
+  resolveRedditStorageStatePath,
+} from "../src/reddit-storage-state.js";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "../..");
@@ -22,20 +26,6 @@ function resolvePreferredStoragePath(configuredPath: string, legacyPath: string)
   if (existsSync(resolvedConfigured)) return resolvedConfigured;
   if (existsSync(resolvedLegacy)) return resolvedLegacy;
   return resolvedConfigured;
-}
-
-function resolvePreferredRedditStoragePath(configuredPath: string): string {
-  const candidates = [
-    configuredPath,
-    "storage/reddit.json",
-    "data/playwright/reddit-storage-state.json",
-    "server/data/playwright/reddit-storage-state.json",
-  ];
-  for (const candidate of candidates) {
-    const resolved = resolvePath(candidate);
-    if (existsSync(resolved)) return resolved;
-  }
-  return resolvePath(configuredPath);
 }
 
 function getBootstrapLaunchOptions(): { headless: boolean; channel?: string; args?: string[] } {
@@ -70,17 +60,56 @@ async function waitForLoggedIn(page: import("playwright").Page, hostMatch: strin
   throw new Error(`Login timeout after ${Math.round(timeoutMs / 1000)}s`);
 }
 
+function isExpectedNavigationInterruption(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes("interrupted by another navigation") ||
+    message.includes("Navigation failed because page was closed") ||
+    message.includes("net::ERR_ABORTED")
+  );
+}
+
+async function gotoWithRedirectTolerance(
+  page: import("playwright").Page,
+  url: string,
+  timeoutMs: number,
+): Promise<void> {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  } catch (error) {
+    if (!isExpectedNavigationInterruption(error)) {
+      throw error;
+    }
+
+    // Reddit may bounce across login/challenge pages and abort the original navigation.
+    await page.waitForTimeout(1500);
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  }
+}
+
 async function waitForRedditSessionReady(page: import("playwright").Page, timeoutMs: number): Promise<void> {
   const start = Date.now();
+  const manualLoginCheckWindowMs = 30_000;
 
   while (Date.now() - start < timeoutMs) {
+    const currentUrl = page.url();
+    if (currentUrl.includes("/login")) {
+      // Give human login/challenge flow uninterrupted time before probing submit again.
+      await page
+        .waitForURL(
+          (url) => url.hostname.includes("reddit.com") && !url.pathname.includes("/login"),
+          { timeout: manualLoginCheckWindowMs },
+        )
+        .catch(() => undefined);
+    }
+
     const followLink = page.locator('a:has-text("this link"), a[href*="reddit.com"]').first();
     if (await followLink.isVisible().catch(() => false)) {
       await followLink.click().catch(() => undefined);
       await page.waitForTimeout(1500);
     }
 
-    await page.goto("https://www.reddit.com/submit", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    await gotoWithRedirectTolerance(page, "https://www.reddit.com/submit", 20_000);
     await page.waitForTimeout(2000);
 
     if (page.url().includes("/login")) {
@@ -95,14 +124,14 @@ async function waitForRedditSessionReady(page: import("playwright").Page, timeou
       return;
     }
 
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(3000);
   }
 
   throw new Error(`Reddit session readiness timeout after ${Math.round(timeoutMs / 1000)}s`);
 }
 
 async function verifyRedditSession(page: import("playwright").Page, timeoutMs: number): Promise<void> {
-  await page.goto("https://www.reddit.com/submit", { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  await gotoWithRedirectTolerance(page, "https://www.reddit.com/submit", timeoutMs);
   await page.waitForTimeout(3000);
   const titleInput = page
     .locator('textarea[name="title"], textarea[name="title-textarea"], textarea#innerTextArea')
@@ -151,9 +180,8 @@ async function bootstrapX(): Promise<void> {
 }
 
 async function bootstrapReddit(): Promise<void> {
-  const statePath = resolvePreferredRedditStoragePath(
-    process.env.REDDIT_STORAGE_STATE_PATH ?? "storage/reddit.json",
-  );
+  const configuredStatePath = getConfiguredRedditStorageStatePath();
+  const statePath = resolveRedditStorageStatePath(configuredStatePath);
   const userDataDir = resolveUserDataDir();
   let browser: import("playwright").Browser | null = null;
   let context: import("playwright").BrowserContext;
