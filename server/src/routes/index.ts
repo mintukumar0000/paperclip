@@ -19,6 +19,7 @@ export { expansionRoutes } from "./expansion.js";
 export { ecosystemRoutes } from "./ecosystem.js";
 export { economyRoutes } from "./economy.js";
 export { billingRoutes } from "./billing.js";
+export { coldEmailRoutes } from "./cold-email.js";
 export { governanceRoutes } from "./governance.js";
 export { stabilityRoutes } from "./stability.js";
 export { simulationRoutes } from "./simulation.js";

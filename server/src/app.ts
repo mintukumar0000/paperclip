@@ -44,6 +44,7 @@ import { governanceRoutes } from "./routes/governance.js";
 import { stabilityRoutes } from "./routes/stability.js";
 import { simulationRoutes } from "./routes/simulation.js";
 import { waitlistRoutes } from "./routes/waitlist.js";
+import { coldEmailRoutes } from "./routes/cold-email.js";
 import { systemDebugRoutes } from "./routes/system-debug.js";
 import { httpRequestDuration, httpRequestsTotal } from "./observability/metrics.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -185,6 +186,7 @@ export async function createApp(
     }),
   );
   api.use(waitlistRoutes(db));
+  api.use(coldEmailRoutes(db));
   api.use(systemDebugRoutes(db));
   api.use("/companies", companyRoutes(db));
   api.use(agentRoutes(db));

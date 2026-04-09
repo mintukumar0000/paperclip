@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { activityLog, aiLearningRecords, and, companies, eq, sql, type Db } from "@paperclipai/db";
+import { activityLog, aiLearningRecords, and, companies, eq, sql, type Db, waitlistSignups } from "@paperclipai/db";
 import {
   createDodoCheckoutSession,
   createStripeCheckoutSession,
@@ -19,6 +19,8 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 type JsonRecord = Record<string, unknown>;
 type BillingProvider = "stripe" | "dodo";
+type RevenueTrend = "increasing" | "flat" | "down";
+type RevenueDecision = "scale" | "improve" | "kill";
 
 const RECENT_TRANSACTION_CACHE_TTL_MS = 30 * 60 * 1000;
 const recentTransactionCache = new Map<string, number>();
@@ -203,6 +205,97 @@ function secureCompare(a: string, b: string): boolean {
   const bBuf = Buffer.from(b);
   if (aBuf.length !== bBuf.length) return false;
   return timingSafeEqual(aBuf, bBuf);
+}
+
+async function markColdEmailUserPaid(
+  db: Db,
+  args: {
+    companyId: string;
+    metadata: JsonRecord;
+    amountCents: number;
+    currency: string;
+    sessionId: string | null;
+  },
+): Promise<void> {
+  const source = readString(args.metadata.source)?.toLowerCase();
+  if (source !== "cold_email_tool") return;
+
+  const email = readString(args.metadata.email)?.toLowerCase();
+  if (!email) return;
+
+  const row = await db
+    .select({ id: waitlistSignups.id, metadata: waitlistSignups.metadata })
+    .from(waitlistSignups)
+    .where(eq(waitlistSignups.email, email))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  if (!row) return;
+
+  const currentMetadata = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+    ? row.metadata as JsonRecord
+    : {};
+
+  await db
+    .update(waitlistSignups)
+    .set({
+      companyId: args.companyId,
+      metadata: {
+        ...currentMetadata,
+        source: "cold_email_tool",
+        coldEmailPaid: true,
+        coldEmailPaidAt: new Date().toISOString(),
+        coldEmailLastPaymentCents: args.amountCents,
+        coldEmailLastPaymentCurrency: args.currency,
+        coldEmailLastPaymentSessionId: args.sessionId,
+      },
+    })
+    .where(eq(waitlistSignups.id, row.id));
+
+  await logActivity(db, {
+    companyId: args.companyId,
+    actorType: "system",
+    actorId: "billing-webhook",
+    agentId: null,
+    runId: null,
+    action: "cold_email.payment.unlimited_unlocked",
+    entityType: "company",
+    entityId: args.companyId,
+    details: {
+      email,
+      amountCents: args.amountCents,
+      currency: args.currency,
+      sessionId: args.sessionId,
+    },
+  });
+}
+
+function classifyRpvDecision(previousRpv: number, currentRpv: number): {
+  trend: RevenueTrend;
+  decision: RevenueDecision;
+} {
+  const previous = Math.max(0, previousRpv);
+  const current = Math.max(0, currentRpv);
+  const delta = current - previous;
+
+  const trend: RevenueTrend =
+    previous <= 0
+      ? current > 0
+        ? "increasing"
+        : "flat"
+      : delta > previous * 0.05
+        ? "increasing"
+        : delta < -previous * 0.05
+          ? "down"
+          : "flat";
+
+  const decision: RevenueDecision = trend === "increasing"
+    ? "scale"
+    : trend === "down"
+      ? "kill"
+      : "improve";
+
+  return { trend, decision };
 }
 
 function decodeWebhookSecret(secret: string): string | Buffer {
@@ -903,6 +996,26 @@ export function billingRoutes(db: Db) {
       (isCrossCurrency && settlementAmount != null) ? settlementAmount : (settlementAmount ?? rawAmount ?? 0),
     ));
     const currency = (isCrossCurrency ? settlementCurrency : localCurrency) ?? "usd";
+    const revenueSource =
+      readString(metadata.source)
+      ?? (() => {
+        const variantId = readString(metadata.variantId) ?? readString(metadata.variant_id);
+        return variantId ? `landing_variant_${variantId}` : null;
+      })()
+      ?? "landing_variant_unknown";
+    const revenueUserId =
+      readString(metadata.userId)
+      ?? readString(metadata.user_id)
+      ?? firstString(payload, [
+        "data.customer.id",
+        "data.object.customer.id",
+        "data.customer.email",
+        "data.object.customer_email",
+        "customer_id",
+        "customer_email",
+        "email",
+      ])
+      ?? "anonymous";
 
     console.log("[billing.webhook] Extracted payment details:", {
       sessionId,
@@ -966,6 +1079,8 @@ export function billingRoutes(db: Db) {
         sessionId,
         amountCents,
         currency,
+        revenueSource,
+        revenueUserId,
         goalId,
         issueId,
         metadata,
@@ -1014,6 +1129,8 @@ export function billingRoutes(db: Db) {
       },
     });
 
+    const preMetricSnapshot = await getRecentSystemMetricsSnapshot(db, companyId, 180);
+
     await recordSystemMetric(db, {
       companyId,
       sourceType: "tool_action",
@@ -1027,6 +1144,8 @@ export function billingRoutes(db: Db) {
         eventId: externalEventId,
         sessionId,
         webhookType: "payment_success",
+        source: revenueSource,
+        userId: revenueUserId,
         goalId,
         issueId,
         checkoutMetadata: metadata,
@@ -1051,10 +1170,51 @@ export function billingRoutes(db: Db) {
         sessionId,
         amountCents,
         currency,
+        revenueSource,
+        revenueUserId,
         goalId,
         issueId,
         metadata,
         signatureVerified: true,
+      },
+    });
+
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "billing-webhook",
+      agentId: null,
+      runId: null,
+      action: "billing.revenue.attributed",
+      entityType: "payment_transaction",
+      entityId: transactionKey,
+      details: {
+        revenue: amountCents,
+        userId: revenueUserId,
+        source: revenueSource,
+        sessionId,
+        currency,
+      },
+    });
+
+    const postMetricSnapshot = await getRecentSystemMetricsSnapshot(db, companyId, 180);
+    const rpvDecision = classifyRpvDecision(preMetricSnapshot.revenue_per_visit, postMetricSnapshot.revenue_per_visit);
+
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "billing-webhook",
+      agentId: null,
+      runId: null,
+      action: "billing.rpv.decision_hint",
+      entityType: "company",
+      entityId: companyId,
+      details: {
+        previousRpv: preMetricSnapshot.revenue_per_visit,
+        currentRpv: postMetricSnapshot.revenue_per_visit,
+        trend: rpvDecision.trend,
+        decision: rpvDecision.decision,
+        source: revenueSource,
       },
     });
 
@@ -1088,12 +1248,20 @@ export function billingRoutes(db: Db) {
       amountCents,
       currency,
       sessionId,
-      source: readString(metadata.source) ?? "billing_webhook",
+      source: revenueSource,
       email: emailForPosthog,
       customerName,
       entry_point: "dodo_webhook",
       $current_url: `${(process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ?? "http://localhost:3100").replace(/\/$/, "")}/api/payments/dodo/webhook`,
       screen: "payment_webhook",
+    });
+
+    await markColdEmailUserPaid(db, {
+      companyId,
+      metadata,
+      amountCents,
+      currency,
+      sessionId,
     });
 
     console.log("[billing.webhook] payment_completed PostHog event fired");
@@ -1534,6 +1702,14 @@ export function billingRoutes(db: Db) {
       sessionId,
       source: readString(metadata.source) ?? "billing_webhook",
       email: readString(metadata.email),
+    });
+
+    await markColdEmailUserPaid(db, {
+      companyId,
+      metadata,
+      amountCents,
+      currency,
+      sessionId,
     });
 
     try {
