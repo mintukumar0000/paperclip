@@ -774,11 +774,12 @@ if (!isWorkerOnly) {
 }
 
 // --- Evolution: Distributed Worker & Queue System ---
-// Initialize BullMQ worker when Redis is configured.
-// In WORKER_ONLY mode, start the worker and skip the HTTP server entirely.
+// Initialize BullMQ workers when Redis is configured.
+// Agent worker is now started in-process as well, so queue consumption is guaranteed
+// even when running only the main server process.
 const redisReachable = await isRedisReachable();
 
-if (aiEnabled && isWorkerOnly && redisReachable) {
+if (aiEnabled && redisReachable) {
   try {
     const { createAgentWorker } = await import("./workers/agentWorker.js");
     const hbSvc = heartbeatService(db as any);
@@ -826,13 +827,16 @@ if (aiEnabled && isWorkerOnly && redisReachable) {
         }),
     });
 
-    logger.info({ redisUrl: getRedisUrl() }, "Distributed agent worker started (BullMQ + Redis)");
+    logger.info(
+      { redisUrl: getRedisUrl(), workerOnly: isWorkerOnly },
+      "Distributed agent worker started (BullMQ + Redis)",
+    );
   } catch (err) {
     logger.warn({ err }, "Distributed worker system not available (Redis may not be configured)");
   }
-} else if (isWorkerOnly && !aiEnabled) {
+} else if (!aiEnabled) {
   logger.warn("Distributed worker system disabled because AI_ENABLED=false");
-} else if (isWorkerOnly) {
+} else {
   logger.warn(
     { redisUrl: getRedisUrl() },
     "Distributed worker system disabled because Redis is not reachable",

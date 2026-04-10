@@ -32,9 +32,8 @@ export function guardAction(action: string): void {
   }
 
   if (APPROVAL_REQUIRED_ACTIONS.has(action)) {
-    logger.info({ action }, "Action flagged as requiring approval");
-    // For now, we log + allow; the approval gate can be wired into the
-    // existing approval service in a follow-up integration.
+    logger.warn({ action }, "Approval-required action blocked by guard");
+    throw new GuardedActionError(action, "approval_required");
   }
 }
 

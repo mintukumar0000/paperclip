@@ -22,6 +22,44 @@ const SEQUENCE_DELAYS: Record<SequenceStep, number> = {
   urgency: 48 * 60 * 60_000,
 };
 
+function wrapEmailLinksWithTracking(html: string, args: {
+  baseUrl: string;
+  email: string;
+  step: SequenceStep;
+  companyId: string | null;
+}): string {
+  const normalizedBase = args.baseUrl.replace(/\/$/, "");
+  const emailParam = encodeURIComponent(args.email);
+  const stepParam = encodeURIComponent(args.step);
+  const companyParam = args.companyId ? `&companyId=${encodeURIComponent(args.companyId)}` : "";
+
+  return html.replace(/href\s*=\s*(["'])([^"']+)\1/gi, (_match, quote: string, href: string) => {
+    const target = href.trim();
+    if (!target) return _match;
+    if (/^(mailto:|tel:|#|javascript:)/i.test(target)) return _match;
+    if (target.includes("/api/email/click")) return _match;
+
+    const tracked = `${normalizedBase}/api/email/click?email=${emailParam}&step=${stepParam}${companyParam}&url=${encodeURIComponent(target)}`;
+    return `href=${quote}${tracked}${quote}`;
+  });
+}
+
+function appendOpenPixel(html: string, args: {
+  baseUrl: string;
+  email: string;
+  step: SequenceStep;
+  companyId: string | null;
+}): string {
+  const normalizedBase = args.baseUrl.replace(/\/$/, "");
+  const pixelUrl = `${normalizedBase}/api/email/open?email=${encodeURIComponent(args.email)}&step=${encodeURIComponent(args.step)}${args.companyId ? `&companyId=${encodeURIComponent(args.companyId)}` : ""}`;
+  const pixelTag = `<img src="${pixelUrl}" width="1" height="1" alt="" style="display:block;opacity:0;pointer-events:none" />`;
+
+  if (/<\/body>/i.test(html)) {
+    return html.replace(/<\/body>/i, `${pixelTag}</body>`);
+  }
+  return `${html}\n${pixelTag}`;
+}
+
 async function generateEmailContent(
   step: SequenceStep,
   recipientName: string,
@@ -176,7 +214,12 @@ async function sendSequenceEmail(
   const tier = "entry";
   const template = await generateEmailContent(step, name || "Founder", tier);
 
-  const html = template.html.replace(/\{payment_link\}/g, paymentLink);
+  const baseUrl = (process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ?? "http://localhost:3100").trim();
+  const htmlWithPaymentLink = template.html.replace(/\{payment_link\}/g, paymentLink);
+  const trackedHtml = appendOpenPixel(
+    wrapEmailLinksWithTracking(htmlWithPaymentLink, { baseUrl, email, step, companyId }),
+    { baseUrl, email, step, companyId },
+  );
 
   const response = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -188,7 +231,7 @@ async function sendSequenceEmail(
       from: fromEmail,
       to: [email],
       subject: template.subject,
-      html,
+      html: trackedHtml,
     }),
   });
 
@@ -207,7 +250,7 @@ async function sendSequenceEmail(
       action: `email.sequence.${step}.sent`,
       entityType: "company",
       entityId: companyId,
-      details: { email, step, subject: template.subject },
+      details: { email, step, subject: template.subject, tracked: true },
     });
   }
 

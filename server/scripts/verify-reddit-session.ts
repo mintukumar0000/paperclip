@@ -2,6 +2,7 @@ import { config as loadDotenv } from "dotenv";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getConfiguredRedditStorageStatePath, resolveRedditStorageStatePath } from "../src/reddit-storage-state.js";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "../..");
@@ -17,26 +18,8 @@ type StorageState = {
   }>;
 };
 
-function resolvePath(value: string): string {
-  if (path.isAbsolute(value)) return value;
-  return path.resolve(repoRoot, value);
-}
-
 function pickStoragePath(): string {
-  const configured = (process.env.REDDIT_STORAGE_STATE_PATH ?? "storage/reddit.json").trim() || "storage/reddit.json";
-  const candidates = [
-    configured,
-    "storage/reddit.json",
-    "data/playwright/reddit-storage-state.json",
-    "server/data/playwright/reddit-storage-state.json",
-  ];
-
-  for (const candidate of candidates) {
-    const resolved = resolvePath(candidate);
-    if (existsSync(resolved)) return resolved;
-  }
-
-  return resolvePath(configured);
+  return resolveRedditStorageStatePath(getConfiguredRedditStorageStatePath());
 }
 
 function main(): void {

@@ -4,6 +4,12 @@ import pino from "pino";
 import { generateWithQualityGate } from "../quality/executionQualityGate.js";
 import { eventBus } from "../../events/eventBus.js";
 import { recordContentPerformance } from "../../memory/embeddingMemory.js";
+import {
+  isRedditStorageStateRequired,
+  parseBooleanEnv,
+  resolveExistingRedditStorageStatePath,
+  resolveRedditStorageStatePath,
+} from "../../reddit-storage-state.js";
 
 const logger = pino({ name: "reddit-reply-agent" });
 
@@ -284,21 +290,29 @@ async function postReplyViaPlaywright(
 
   try {
     const playwright = await import("playwright");
-    const storagePath = (process.env.REDDIT_STORAGE_STATE_PATH ?? "").trim();
-    const allowPasswordLogin = (process.env.REDDIT_ALLOW_PASSWORD_LOGIN ?? "false").toLowerCase() === "true";
+    const existingStoragePath = resolveExistingRedditStorageStatePath();
+    const storagePath = existingStoragePath ?? resolveRedditStorageStatePath();
+    const requireStorageState = isRedditStorageStateRequired(true);
+    const allowPasswordLogin = parseBooleanEnv(process.env.REDDIT_ALLOW_PASSWORD_LOGIN, false);
     const password = (process.env.REDDIT_PASSWORD ?? "").trim();
     const timeoutMs = Math.max(12_000, Number(process.env.PLAYWRIGHT_TIMEOUT_MS ?? 60_000));
+    const headful = parseBooleanEnv(process.env.REDDIT_HEADFUL, false);
+    const headless = headful ? false : parseBooleanEnv(process.env.PLAYWRIGHT_HEADLESS, true);
+
+    if (requireStorageState && !existingStoragePath) {
+      logger.warn({ commentId: comment.id, storagePath }, "Reddit reply skipped: required storage state is missing");
+      return false;
+    }
 
     const launchOpts: Record<string, unknown> = {
-      headless: (process.env.PLAYWRIGHT_HEADLESS ?? "true").toLowerCase() === "true",
+      headless,
     };
 
     const browser = await playwright.chromium.launch(launchOpts);
     const contextOpts: Record<string, unknown> = {};
 
-    const fs = await import("node:fs");
-    const storageUsed = Boolean(storagePath && fs.existsSync(storagePath));
-    if (storagePath && fs.existsSync(storagePath)) {
+    const storageUsed = Boolean(existingStoragePath);
+    if (storageUsed) {
       contextOpts.storageState = storagePath;
     }
 

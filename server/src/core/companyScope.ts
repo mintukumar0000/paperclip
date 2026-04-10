@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { companies } from "@paperclipai/db";
-import { eq } from "@paperclipai/db";
+import { and, eq } from "@paperclipai/db";
 
 export function getActiveCompanyId(): string | null {
   const raw = (process.env.ACTIVE_COMPANY_ID ?? "").trim();
@@ -21,17 +21,24 @@ export async function listScopedCompanyIds(
     const rows = await db
       .select({ id: companies.id })
       .from(companies)
-      .where(eq(companies.id, activeCompanyId))
+      .where(and(eq(companies.id, activeCompanyId), eq(companies.status, "active")))
       .limit(1);
     return rows.map((row) => row.id);
   }
 
   const limit = options?.limit;
   if (typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
-    const rows = await db.select({ id: companies.id }).from(companies).limit(limit);
+    const rows = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.status, "active"))
+      .limit(limit);
     return rows.map((row) => row.id);
   }
 
-  const rows = await db.select({ id: companies.id }).from(companies);
+  const rows = await db
+    .select({ id: companies.id })
+    .from(companies)
+    .where(eq(companies.status, "active"));
   return rows.map((row) => row.id);
 }

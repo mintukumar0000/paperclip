@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { and, desc, eq, gte } from "@paperclipai/db";
+import { and, desc, eq, gte, sql } from "@paperclipai/db";
 import { systemMetrics } from "@paperclipai/db";
 import { eventBus } from "../../events/eventBus.js";
 import pino from "pino";
@@ -130,12 +130,20 @@ export async function getRecentSystemMetricsSnapshot(
   db: Db,
   companyId: string,
   windowMinutes = 180,
+  referenceTime: Date = new Date(),
 ): Promise<SystemMetricSnapshot> {
-  const cutoff = new Date(Date.now() - windowMinutes * 60_000);
+  const end = referenceTime;
+  const cutoff = new Date(end.getTime() - windowMinutes * 60_000);
   const rows = await db
     .select()
     .from(systemMetrics)
-    .where(and(eq(systemMetrics.companyId, companyId), gte(systemMetrics.recordedAt, cutoff)))
+    .where(
+      and(
+        eq(systemMetrics.companyId, companyId),
+        gte(systemMetrics.recordedAt, cutoff),
+        sql`${systemMetrics.recordedAt} <= ${end}`,
+      ),
+    )
     .orderBy(desc(systemMetrics.recordedAt));
 
   if (rows.length === 0) {

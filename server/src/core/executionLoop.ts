@@ -72,6 +72,24 @@ export function executionLoop(db: Db) {
         };
       }
 
+      const companyRow = await db
+        .select({ id: companies.id, status: companies.status })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!companyRow || companyRow.status !== "active") {
+        logger.info({ companyId, status: companyRow?.status ?? "missing" }, "Skipping execution cycle for inactive company");
+        return {
+          companyId,
+          cycleStarted,
+          cycleCompleted: new Date().toISOString(),
+          goalsAnalyzed: 0,
+          tasksDispatched: 0,
+          agentsActivated: 0,
+        };
+      }
+
       const maxExecutionsPerCycle = readPositiveIntEnv(
         "MAX_EXECUTIONS_PER_CYCLE",
         DEFAULT_MAX_EXECUTIONS_PER_CYCLE,
@@ -193,16 +211,42 @@ export function executionLoop(db: Db) {
               continue;
             }
 
-            await dispatchAgentExecution({
-              agentId: agent.id,
-              issueId: issue.id,
-              companyId,
-              context: { source: "execution-loop" },
-              wakeReason: "execution-loop-cycle",
-            });
-            activatedAgentIds.add(agent.id);
-            tasksDispatched++;
-            hourlyBudget.executionsInWindow += 1;
+            try {
+              await dispatchAgentExecution({
+                agentId: agent.id,
+                issueId: issue.id,
+                companyId,
+                context: { source: "execution-loop" },
+                wakeReason: "execution-loop-cycle",
+              });
+              activatedAgentIds.add(agent.id);
+              tasksDispatched++;
+              hourlyBudget.executionsInWindow += 1;
+            } catch (dispatchErr) {
+              // Roll back the claim so the issue can be retried in a later cycle.
+              await db
+                .update(issues)
+                .set({
+                  assigneeAgentId: null,
+                  assigneeUserId: null,
+                  status: "todo",
+                  startedAt: null,
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(issues.id, issue.id),
+                    eq(issues.assigneeAgentId, agent.id),
+                    eq(issues.status, "in_progress"),
+                  ),
+                );
+
+              logger.error(
+                { agentId: agent.id, issueId: issue.id, err: dispatchErr },
+                "Failed to dispatch agent; issue claim rolled back",
+              );
+              continue;
+            }
           } catch (err) {
             logger.error(
               { agentId: agent.id, issueId: issue.id, err },

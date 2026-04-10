@@ -1,9 +1,10 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { waitlistSignups, aiLearningRecords, and, desc, eq, sql } from "@paperclipai/db";
+import { waitlistSignups, aiLearningRecords, activityLog, and, desc, eq, sql } from "@paperclipai/db";
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
 import { assignPriceVariant, recordPricingImpression, getPricingExperimentResults } from "../core/pricingOptimizer.js";
+import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
 
 type SignupPayload = {
   name?: unknown;
@@ -33,6 +34,7 @@ type OfferLearningIntelligence = {
 };
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TRANSPARENT_GIF = Buffer.from("R0lGODlhAQABAIABAP///wAAACwAAAAAAQABAAACAkQBADs=", "base64");
 let offerDispatchInFlight = false;
 let resolvingOfferProductIds: Promise<Record<OfferTier, string | null>> | null = null;
 
@@ -568,60 +570,18 @@ async function resolveCompanyIdForEmail(db: Db, email: string | null): Promise<s
   return row?.companyId ?? null;
 }
 
-function derivePublicBaseUrlFromApiBaseUrl(): string | null {
-  const apiBaseUrl = (process.env.PAPERCLIP_API_BASE_URL ?? "").trim();
-  if (!apiBaseUrl) return null;
-  const trimmed = apiBaseUrl.replace(/\/$/, "");
-  return trimmed.endsWith("/api") ? trimmed.slice(0, -4) : trimmed;
-}
-
 function resolvePublicBaseUrl(args: {
   reqOrigin?: string;
   host?: string;
   forwardedHost?: string;
   forwardedProto?: string;
 }): string | null {
-  const explicit = (
-    process.env.PUBLIC_API_BASE
-    ?? process.env.WAITLIST_PUBLIC_BASE_URL
-    ?? process.env.PAPERCLIP_PUBLIC_BASE_URL
-    ?? process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL
-    ?? ""
-  ).trim();
-  if (explicit) return explicit.replace(/\/$/, "");
-
-  const fromApiBase = derivePublicBaseUrlFromApiBaseUrl();
-  if (fromApiBase) return fromApiBase;
-
-  const vercelUrl = (process.env.VERCEL_URL ?? "").trim();
-  if (vercelUrl) {
-    const normalized = vercelUrl.startsWith("http://") || vercelUrl.startsWith("https://")
-      ? vercelUrl
-      : `https://${vercelUrl}`;
-    return normalized.replace(/\/$/, "");
-  }
-
-  if (args.reqOrigin && args.reqOrigin.trim().length > 0) {
-    return args.reqOrigin.trim().replace(/\/$/, "");
-  }
-
-  const forwardedHost = (args.forwardedHost ?? "").trim();
-  if (forwardedHost) {
-    const forwardedProto = (args.forwardedProto ?? "https").trim() || "https";
-    return `${forwardedProto}://${forwardedHost}`.replace(/\/$/, "");
-  }
-
-  const host = (args.host ?? "").trim();
-  if (host) {
-    return `http://${host}`.replace(/\/$/, "");
-  }
-
-  if ((process.env.NODE_ENV ?? "").trim().toLowerCase() === "production") {
-    return null;
-  }
-
-  const port = (process.env.PORT ?? "3100").trim();
-  return `http://localhost:${port}`;
+  return resolveSharedPublicBaseUrl({
+    requestOrigin: args.reqOrigin,
+    host: args.host,
+    forwardedHost: args.forwardedHost,
+    forwardedProto: args.forwardedProto,
+  });
 }
 
 function hasWaitlistAutomationAccess(req: { header(name: string): string | undefined }): boolean {
@@ -790,6 +750,88 @@ export async function sendOfferEmailsToRecentSignups(
 export function waitlistRoutes(db: Db) {
   const router = Router();
 
+  router.get("/email/open", async (req, res) => {
+    const email = normalizeEmailQueryString(req.query.email);
+    const step = normalizeOptionalString(req.query.step) ?? "unknown";
+    const requestedCompanyId = normalizeOptionalString(req.query.companyId);
+    const companyId = requestedCompanyId ?? await resolveCompanyIdForEmail(db, email);
+
+    if (companyId && email) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "email-tracker",
+        agentId: null,
+        runId: null,
+        action: "email.sequence.opened",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          email,
+          step,
+          source: "tracking_pixel",
+        },
+      }).catch(() => undefined);
+    }
+
+    res
+      .status(200)
+      .set({
+        "Content-Type": "image/gif",
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        Pragma: "no-cache",
+        Expires: "0",
+      })
+      .send(TRANSPARENT_GIF);
+  });
+
+  router.get("/email/click", async (req, res) => {
+    const email = normalizeEmailQueryString(req.query.email);
+    const step = normalizeOptionalString(req.query.step) ?? "unknown";
+    const requestedCompanyId = normalizeOptionalString(req.query.companyId);
+    const companyId = requestedCompanyId ?? await resolveCompanyIdForEmail(db, email);
+    const rawTarget = normalizeOptionalString(req.query.url);
+
+    const fallbackBase = resolvePublicBaseUrl({
+      reqOrigin: req.header("origin"),
+      host: req.header("host"),
+      forwardedHost: req.header("x-forwarded-host"),
+      forwardedProto: req.header("x-forwarded-proto"),
+    }) ?? "http://localhost:3100";
+    let redirectUrl = fallbackBase;
+    if (rawTarget) {
+      try {
+        const parsed = new URL(rawTarget);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          redirectUrl = parsed.toString();
+        }
+      } catch {
+        // Keep safe fallback URL if target is invalid.
+      }
+    }
+
+    if (companyId && email) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "email-tracker",
+        agentId: null,
+        runId: null,
+        action: "email.sequence.clicked",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          email,
+          step,
+          targetUrl: redirectUrl,
+          source: "tracked_link",
+        },
+      }).catch(() => undefined);
+    }
+
+    res.redirect(302, redirectUrl);
+  });
+
   router.options("/waitlist/signup", (req, res) => {
     res.set(corsHeaders(req.header("origin"))).status(204).end();
   });
@@ -912,6 +954,13 @@ export function waitlistRoutes(db: Db) {
 
     const checkoutMode = checkoutFromQuery && checkout === checkoutFromQuery ? "legacy_query_param" : "dynamic_session";
 
+    const publicBaseForOfferClick = resolvePublicBaseUrl({
+      reqOrigin: req.header("origin"),
+      host: req.header("host"),
+      forwardedHost: req.header("x-forwarded-host"),
+      forwardedProto: req.header("x-forwarded-proto"),
+    });
+
     await capturePosthogEvent("payment_started", {
       email: email ?? "unknown",
       source: "waitlist_offer",
@@ -921,7 +970,7 @@ export function waitlistRoutes(db: Db) {
       checkout_mode: checkoutMode,
       entry_point: "email_click",
       url: req.headers.referer || "email",
-      $current_url: req.headers.referer || `${resolvePublicBaseUrl({ reqOrigin: req.header("origin"), host: req.header("host"), forwardedHost: req.header("x-forwarded-host"), forwardedProto: req.header("x-forwarded-proto") }) ?? "http://localhost:3100"}/api/waitlist/offer-click`,
+      $current_url: req.headers.referer || (publicBaseForOfferClick ? `${publicBaseForOfferClick}/api/waitlist/offer-click` : "email"),
       screen: "offer_click_redirect",
       pricing_variant_id: priceVariant?.id ?? null,
       pricing_variant_cents: priceVariant?.priceCents ?? null,

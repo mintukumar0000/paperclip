@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { sql, waitlistSignups } from "@paperclipai/db";
+import { companies, eq, sql, waitlistSignups } from "@paperclipai/db";
 import { getLLMBudgetSnapshot } from "../ai/llmRouter.js";
 import {
   isLoopbackHttpUrl,
@@ -30,6 +30,71 @@ type LayerResult<T extends Record<string, unknown>> = {
   status: LayerStatus;
   details: T;
 };
+
+type DatabaseTarget = {
+  configured: boolean;
+  provider: "embedded" | "supabase" | "render" | "other" | "invalid_url";
+  host: string | null;
+  database: string | null;
+};
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeOptionalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isUuid(value: string | null): boolean {
+  return Boolean(value && UUID_RE.test(value));
+}
+
+function resolveConfiguredTelemetryCompanyId(): string | null {
+  const active = normalizeOptionalString(process.env.ACTIVE_COMPANY_ID);
+  if (isUuid(active)) return active;
+  const fallback = normalizeOptionalString(process.env.BILLING_WEBHOOK_COMPANY_ID);
+  if (isUuid(fallback)) return fallback;
+  return null;
+}
+
+function inspectDatabaseTarget(): DatabaseTarget {
+  const connectionString = (process.env.DATABASE_URL ?? "").trim();
+  if (!connectionString) {
+    return {
+      configured: false,
+      provider: "embedded",
+      host: null,
+      database: null,
+    };
+  }
+
+  try {
+    const parsed = new URL(connectionString);
+    const host = parsed.hostname || null;
+    const database = parsed.pathname ? parsed.pathname.replace(/^\//, "") : null;
+    const loweredHost = (host ?? "").toLowerCase();
+    const provider = loweredHost.includes("supabase.co")
+      ? "supabase"
+      : (loweredHost.includes("render.com") || loweredHost.startsWith("dpg-"))
+        ? "render"
+        : "other";
+
+    return {
+      configured: true,
+      provider,
+      host,
+      database,
+    };
+  } catch {
+    return {
+      configured: true,
+      provider: "invalid_url",
+      host: null,
+      database: null,
+    };
+  }
+}
 
 function extractRequestHints(req: {
   protocol?: string;
@@ -203,6 +268,8 @@ async function inspectBackend(
       : Promise.resolve<HttpProbe | null>(null),
   ]);
 
+  const databaseTarget = inspectDatabaseTarget();
+
   let dbReadable = false;
   let totalSignups = 0;
   let dbError: string | null = null;
@@ -215,20 +282,83 @@ async function inspectBackend(
     dbError = error instanceof Error ? error.message : String(error);
   }
 
+  let waitlistSchemaCompatible = false;
+  let waitlistSchemaError: string | null = null;
+  try {
+    await db
+      .select({
+        id: waitlistSignups.id,
+        companyId: waitlistSignups.companyId,
+        email: waitlistSignups.email,
+        source: waitlistSignups.source,
+        metadata: waitlistSignups.metadata,
+        createdAt: waitlistSignups.createdAt,
+      })
+      .from(waitlistSignups)
+      .limit(1);
+    waitlistSchemaCompatible = true;
+  } catch (error) {
+    waitlistSchemaCompatible = false;
+    waitlistSchemaError = error instanceof Error ? error.message : String(error);
+  }
+
+  const telemetryCompanyId = resolveConfiguredTelemetryCompanyId();
+  let telemetryCompanyExists: boolean | null = null;
+  let telemetryCompanyError: string | null = null;
+  if (telemetryCompanyId) {
+    try {
+      const row = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.id, telemetryCompanyId))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      telemetryCompanyExists = Boolean(row);
+    } catch (error) {
+      telemetryCompanyError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const telemetryCompanyStatus: LayerStatus = telemetryCompanyId
+    ? (telemetryCompanyExists === true ? "ok" : "warn")
+    : "ok";
+
   const status = summarizeStatus([
     localProbe.ok ? "ok" : "fail",
     dbReadable ? "ok" : "fail",
+    waitlistSchemaCompatible ? "ok" : "fail",
     signupEndpoint && !signupEndpointLooksLoopback && publicProbe?.ok
       ? "ok"
       : "fail",
+    telemetryCompanyStatus,
   ]);
+
+  const reason = !dbReadable
+    ? "waitlist_db_unreadable"
+    : !waitlistSchemaCompatible
+      ? "waitlist_schema_incompatible"
+      : telemetryCompanyId && telemetryCompanyExists === false
+        ? "telemetry_company_missing"
+        : !signupEndpoint
+          ? "signup_endpoint_missing"
+          : signupEndpointLooksLoopback
+            ? "signup_endpoint_loopback"
+            : publicProbe?.ok
+              ? "backend_public_reachable"
+              : "backend_public_unreachable";
 
   return {
     status,
     details: {
+      databaseTarget,
       dbReadable,
       dbError,
+      waitlistSchemaCompatible,
+      waitlistSchemaError,
       totalSignups,
+      telemetryCompanyId,
+      telemetryCompanyExists,
+      telemetryCompanyError,
       localSignupEndpoint,
       localSignupProbe: localProbe,
       publicApiBaseUrl,
@@ -238,14 +368,7 @@ async function inspectBackend(
       ignoredExplicitLoopback: signupResolution.ignoredExplicitLoopback,
       signupEndpointLooksLoopback,
       publicSignupProbe: publicProbe,
-      reason:
-        !signupEndpoint
-          ? "signup_endpoint_missing"
-          : signupEndpointLooksLoopback
-            ? "signup_endpoint_loopback"
-            : publicProbe?.ok
-              ? "backend_public_reachable"
-              : "backend_public_unreachable",
+      reason,
     },
   };
 }

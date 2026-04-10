@@ -1,8 +1,9 @@
 import { Router } from "express";
 import type { Db } from "@paperclipai/db";
-import { activityLog, and, desc, eq, sql, waitlistSignups } from "@paperclipai/db";
+import { activityLog, and, companies, desc, eq, sql, waitlistSignups } from "@paperclipai/db";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
 import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
+import { logger } from "../middleware/logger.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -46,6 +47,46 @@ function resolveTelemetryCompanyId(): string | null {
   if (isUuid(active)) return active;
   const fallback = normalizeOptionalString(process.env.BILLING_WEBHOOK_COMPANY_ID);
   if (isUuid(fallback)) return fallback;
+  return null;
+}
+
+async function resolveTelemetryCompanyIdForDb(db: Db): Promise<string | null> {
+  const companyId = resolveTelemetryCompanyId();
+  if (!companyId) return null;
+
+  const company = await db
+    .select({ id: companies.id })
+    .from(companies)
+    .where(eq(companies.id, companyId))
+    .limit(1)
+    .then((rows) => rows[0] ?? null)
+    .catch((error) => {
+      logger.warn({ err: error }, "Failed to validate telemetry company id for cold email route");
+      return null;
+    });
+
+  return company?.id ?? null;
+}
+
+function describeColdEmailGenerateFailure(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error);
+  const lowered = message.toLowerCase();
+
+  if (
+    lowered.includes("waitlist_signups")
+    && (
+      lowered.includes("does not exist")
+      || lowered.includes("column")
+      || lowered.includes("relation")
+    )
+  ) {
+    return "Database schema for waitlist_signups is out of date. Apply DB migrations on the active DATABASE_URL.";
+  }
+
+  if (lowered.includes("waitlist_signups_company_id") && lowered.includes("foreign key")) {
+    return "Configured ACTIVE_COMPANY_ID/BILLING_WEBHOOK_COMPANY_ID is not present in the active database.";
+  }
+
   return null;
 }
 
@@ -506,7 +547,10 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
               statusNode.innerHTML = "Free limit reached. <a href=\"" + data.checkoutUrl + "\" target=\"_blank\" rel=\"noopener\">Upgrade for unlimited access</a>.";
               return;
             }
-            statusNode.textContent = (data && data.error) ? data.error : "Generation failed. Try again.";
+            var hint = (data && data.hint) ? String(data.hint) : "";
+            statusNode.textContent = (data && data.error)
+              ? (hint ? (String(data.error) + " " + hint) : String(data.error))
+              : "Generation failed. Try again.";
             return;
           }
 
@@ -536,7 +580,7 @@ export function coldEmailRoutes(db: Db) {
       forwardedProto: req.header("x-forwarded-proto"),
     });
 
-    const companyId = resolveTelemetryCompanyId();
+    const companyId = await resolveTelemetryCompanyIdForDb(db);
     if (companyId) {
       await db.insert(activityLog).values({
         companyId,
@@ -579,7 +623,7 @@ export function coldEmailRoutes(db: Db) {
       return;
     }
 
-    const companyId = resolveTelemetryCompanyId();
+    const companyId = await resolveTelemetryCompanyIdForDb(db);
     const checkoutUrl = await resolveCheckoutUrl(email, companyId);
     if (!checkoutUrl) {
       res.status(500).json({ success: false, error: "Checkout is not configured" });
@@ -611,6 +655,10 @@ export function coldEmailRoutes(db: Db) {
     res.json({ success: true, checkoutUrl });
   });
 
+  router.get("/cold-email/generate", (_req, res) => {
+    res.redirect(302, "/api/cold-email");
+  });
+
   router.post("/cold-email/generate", async (req, res) => {
     const email = normalizeEmail(req.body?.email);
     const product = normalizeOptionalString(req.body?.product);
@@ -625,50 +673,140 @@ export function coldEmailRoutes(db: Db) {
       return;
     }
 
-    const companyId = resolveTelemetryCompanyId();
-    const source = "cold_email_tool";
-    const now = new Date();
+    try {
+      const companyId = await resolveTelemetryCompanyIdForDb(db);
+      const source = "cold_email_tool";
+      const now = new Date();
 
-    await db
-      .insert(waitlistSignups)
-      .values({
-        email,
-        companyId,
+      await db
+        .insert(waitlistSignups)
+        .values({
+          email,
+          companyId,
+          source,
+          metadata: {
+            coldEmailGenerationCount: 0,
+            coldEmailPaid: false,
+          },
+          createdAt: now,
+        })
+        .onConflictDoNothing({ target: waitlistSignups.email });
+
+      const signup = await db
+        .select()
+        .from(waitlistSignups)
+        .where(eq(waitlistSignups.email, email))
+        .orderBy(desc(waitlistSignups.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!signup) {
+        res.status(500).json({ success: false, error: "Failed to load signup profile" });
+        return;
+      }
+
+      const metadata = asMetadata(signup.metadata);
+      const freeLimit = getFreeLimit();
+      const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
+      const paid = metadata.coldEmailPaid === true;
+
+      if (!paid && generationCount >= freeLimit) {
+        const checkoutUrl = await resolveCheckoutUrl(email, companyId);
+
+        await capturePosthogEvent("cold_email_paywall_hit", {
+          source,
+          email,
+          companyId,
+          generationCount,
+        });
+
+        if (companyId) {
+          await db.insert(activityLog).values({
+            companyId,
+            actorType: "system",
+            actorId: "cold-email-generator",
+            agentId: null,
+            runId: null,
+            action: "cold_email.paywall.hit",
+            entityType: "company",
+            entityId: companyId,
+            details: {
+              email,
+              generationCount,
+              freeLimit,
+              checkoutUrl,
+            },
+          }).catch(() => undefined);
+        }
+
+        res.status(402).json({
+          success: false,
+          paywall: true,
+          error: "Free limit reached",
+          checkoutUrl,
+        });
+        return;
+      }
+
+      const generated = await generateColdEmail({ product, targetAudience, keyBenefit });
+      const updatedGenerationCount = generationCount + 1;
+      const nextMetadata: JsonRecord = {
+        ...metadata,
         source,
-        metadata: {
-          coldEmailGenerationCount: 0,
-          coldEmailPaid: false,
+        coldEmailGenerationCount: updatedGenerationCount,
+        coldEmailLastGeneratedAt: now.toISOString(),
+        coldEmailPaid: paid,
+        coldEmailLastInput: {
+          product,
+          targetAudience,
+          keyBenefit,
         },
-        createdAt: now,
-      })
-      .onConflictDoNothing({ target: waitlistSignups.email });
+        coldEmailLastOutput: generated,
+      };
 
-    const signup = await db
-      .select()
-      .from(waitlistSignups)
-      .where(eq(waitlistSignups.email, email))
-      .orderBy(desc(waitlistSignups.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      await db
+        .update(waitlistSignups)
+        .set({
+          companyId: signup.companyId ?? companyId,
+          source,
+          metadata: nextMetadata,
+        })
+        .where(eq(waitlistSignups.id, signup.id));
 
-    if (!signup) {
-      res.status(500).json({ success: false, error: "Failed to load signup profile" });
-      return;
-    }
-
-    const metadata = asMetadata(signup.metadata);
-    const freeLimit = getFreeLimit();
-    const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
-    const paid = metadata.coldEmailPaid === true;
-
-    if (!paid && generationCount >= freeLimit) {
+      const baseUrl = resolvePublicBaseUrl({
+        reqOrigin: req.header("origin"),
+        host: req.header("host"),
+        forwardedHost: req.header("x-forwarded-host"),
+        forwardedProto: req.header("x-forwarded-proto"),
+      });
       const checkoutUrl = await resolveCheckoutUrl(email, companyId);
+      const upgradeTarget = checkoutUrl ?? `${baseUrl}/api/cold-email`;
 
-      await capturePosthogEvent("cold_email_paywall_hit", {
+      const sentResultEmail = await sendResendEmail({
+        to: email,
+        subject: "Your personalized cold email is ready",
+        html: [
+          "<p>Your personalized cold email:</p>",
+          `<pre style=\"white-space:pre-wrap;border:1px solid #e5e7eb;padding:12px;border-radius:8px;\">${generated.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`,
+          `<p><a href=\"${renderTrackedClick(baseUrl, email, "cold_email_result", companyId, upgradeTarget)}\">${paid ? "Generate another" : "Upgrade to unlimited"}</a></p>`,
+          `<img src=\"${renderTrackedPixel(baseUrl, email, "cold_email_result", companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
+        ].join(""),
+      });
+
+      await scheduleFollowUps({
+        email,
+        companyId,
+        baseUrl,
+        checkoutUrl,
+      });
+
+      await capturePosthogEvent("cold_email_generated", {
         source,
         email,
         companyId,
-        generationCount,
+        generationCount: updatedGenerationCount,
+        paid,
+        resultEmailSent: sentResultEmail,
       });
 
       if (companyId) {
@@ -678,123 +816,51 @@ export function coldEmailRoutes(db: Db) {
           actorId: "cold-email-generator",
           agentId: null,
           runId: null,
-          action: "cold_email.paywall.hit",
+          action: "cold_email.generated",
           entityType: "company",
           entityId: companyId,
           details: {
             email,
-            generationCount,
-            freeLimit,
-            checkoutUrl,
+            product,
+            targetAudience,
+            keyBenefit,
+            paid,
+            generationCount: updatedGenerationCount,
+            resultEmailSent: sentResultEmail,
           },
         }).catch(() => undefined);
       }
 
-      res.status(402).json({
-        success: false,
-        paywall: true,
-        error: "Free limit reached",
+      res.json({
+        success: true,
+        emailCopy: generated,
+        paid,
+        generationCount: updatedGenerationCount,
+        remainingFree: paid ? Number.MAX_SAFE_INTEGER : Math.max(0, freeLimit - updatedGenerationCount),
         checkoutUrl,
+        resultEmailSent: sentResultEmail,
       });
-      return;
-    }
-
-    const generated = await generateColdEmail({ product, targetAudience, keyBenefit });
-    const updatedGenerationCount = generationCount + 1;
-    const nextMetadata: JsonRecord = {
-      ...metadata,
-      source,
-      coldEmailGenerationCount: updatedGenerationCount,
-      coldEmailLastGeneratedAt: now.toISOString(),
-      coldEmailPaid: paid,
-      coldEmailLastInput: {
-        product,
-        targetAudience,
-        keyBenefit,
-      },
-      coldEmailLastOutput: generated,
-    };
-
-    await db
-      .update(waitlistSignups)
-      .set({
-        companyId: signup.companyId ?? companyId,
-        source,
-        metadata: nextMetadata,
-      })
-      .where(eq(waitlistSignups.id, signup.id));
-
-    const baseUrl = resolvePublicBaseUrl({
-      reqOrigin: req.header("origin"),
-      host: req.header("host"),
-      forwardedHost: req.header("x-forwarded-host"),
-      forwardedProto: req.header("x-forwarded-proto"),
-    });
-    const checkoutUrl = await resolveCheckoutUrl(email, companyId);
-    const upgradeTarget = checkoutUrl ?? `${baseUrl}/api/cold-email`;
-
-    const sentResultEmail = await sendResendEmail({
-      to: email,
-      subject: "Your personalized cold email is ready",
-      html: [
-        "<p>Your personalized cold email:</p>",
-        `<pre style=\"white-space:pre-wrap;border:1px solid #e5e7eb;padding:12px;border-radius:8px;\">${generated.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`,
-        `<p><a href=\"${renderTrackedClick(baseUrl, email, "cold_email_result", companyId, upgradeTarget)}\">${paid ? "Generate another" : "Upgrade to unlimited"}</a></p>`,
-        `<img src=\"${renderTrackedPixel(baseUrl, email, "cold_email_result", companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
-      ].join(""),
-    });
-
-    await scheduleFollowUps({
-      email,
-      companyId,
-      baseUrl,
-      checkoutUrl,
-    });
-
-    await capturePosthogEvent("cold_email_generated", {
-      source,
-      email,
-      companyId,
-      generationCount: updatedGenerationCount,
-      paid,
-      resultEmailSent: sentResultEmail,
-    });
-
-    if (companyId) {
-      await db.insert(activityLog).values({
-        companyId,
-        actorType: "system",
-        actorId: "cold-email-generator",
-        agentId: null,
-        runId: null,
-        action: "cold_email.generated",
-        entityType: "company",
-        entityId: companyId,
-        details: {
+    } catch (error) {
+      const hint = describeColdEmailGenerateFailure(error);
+      logger.error(
+        {
+          err: error,
+          route: "POST /api/cold-email/generate",
           email,
-          product,
-          targetAudience,
-          keyBenefit,
-          paid,
-          generationCount: updatedGenerationCount,
-          resultEmailSent: sentResultEmail,
         },
-      }).catch(() => undefined);
-    }
+        "Cold email generation failed",
+      );
 
-    res.json({
-      success: true,
-      emailCopy: generated,
-      paid,
-      generationCount: updatedGenerationCount,
-      remainingFree: paid ? Number.MAX_SAFE_INTEGER : Math.max(0, freeLimit - updatedGenerationCount),
-      checkoutUrl,
-      resultEmailSent: sentResultEmail,
-    });
+      res.status(500).json({
+        success: false,
+        error: "Internal server error",
+        ...(hint ? { hint } : {}),
+      });
+    }
   });
 
   router.get("/cold-email/stats", async (_req, res) => {
-    const companyId = resolveTelemetryCompanyId();
+    const companyId = await resolveTelemetryCompanyIdForDb(db);
     if (!companyId) {
       res.json({
         success: true,
