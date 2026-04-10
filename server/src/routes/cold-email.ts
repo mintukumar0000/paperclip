@@ -488,7 +488,7 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         <label for="benefit">Key Benefit</label>
         <input id="benefit" placeholder="Get qualified replies faster" />
 
-        <button id="generate" type="button" class="btn" onclick="window.handleColdEmailGenerate && window.handleColdEmailGenerate()">Generate your first email free</button>
+        <button id="generate" type="button" class="btn">Generate your first email free</button>
         <div class="hint">By generating, you agree to receive your result and 2 tactical follow-ups.</div>
         <div id="status" class="status"></div>
       </section>
@@ -507,6 +507,26 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
       var outputNode = document.getElementById("output");
       var button = document.getElementById("generate");
 
+      if (!statusNode || !outputNode || !button) {
+        return;
+      }
+
+      function showPaywallStatus(checkoutUrl) {
+        statusNode.textContent = "Free limit reached. ";
+        if (!checkoutUrl) {
+          statusNode.textContent = "Free limit reached. Checkout is not configured yet.";
+          return;
+        }
+
+        var link = document.createElement("a");
+        link.href = String(checkoutUrl);
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = "Upgrade for unlimited access";
+        statusNode.appendChild(link);
+        statusNode.appendChild(document.createTextNode("."));
+      }
+
       function text(id) {
         var node = document.getElementById(id);
         return (node && node.value ? node.value : "").trim();
@@ -518,7 +538,7 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         body: JSON.stringify({ event: "landing_view" }),
       }).catch(function () {});
 
-      window.handleColdEmailGenerate = async function () {
+      async function handleColdEmailGenerate() {
         var payload = {
           email: text("email"),
           product: text("product"),
@@ -543,8 +563,8 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
           var data = await response.json().catch(function () { return {}; });
 
           if (!response.ok || !data.success) {
-            if (data && data.paywall && data.checkoutUrl) {
-              statusNode.innerHTML = "Free limit reached. <a href=\"" + data.checkoutUrl + "\" target=\"_blank\" rel=\"noopener\">Upgrade for unlimited access</a>.";
+            if (data && data.paywall) {
+              showPaywallStatus(data.checkoutUrl);
               return;
             }
             var hint = (data && data.hint) ? String(data.hint) : "";
@@ -562,10 +582,10 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         } finally {
           button.disabled = false;
         }
-      };
+      }
 
       button.addEventListener("click", function () {
-        void window.handleColdEmailGenerate();
+        void handleColdEmailGenerate();
       });
     })();
   </script>
