@@ -488,7 +488,7 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         <label for="benefit">Key Benefit</label>
         <input id="benefit" placeholder="Get qualified replies faster" />
 
-        <button id="generate" class="btn">Generate your first email free</button>
+        <button id="generate" type="button" class="btn" onclick="window.handleColdEmailGenerate && window.handleColdEmailGenerate()">Generate your first email free</button>
         <div class="hint">By generating, you agree to receive your result and 2 tactical follow-ups.</div>
         <div id="status" class="status"></div>
       </section>
@@ -512,13 +512,13 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         return (node && node.value ? node.value : "").trim();
       }
 
-      fetch("${baseUrl}/api/cold-email/track", {
+      fetch("/api/cold-email/track", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ event: "landing_view" }),
       }).catch(function () {});
 
-      button.addEventListener("click", async function () {
+      window.handleColdEmailGenerate = async function () {
         var payload = {
           email: text("email"),
           product: text("product"),
@@ -535,7 +535,7 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         statusNode.textContent = "Generating personalized email...";
 
         try {
-          var response = await fetch("${baseUrl}/api/cold-email/generate", {
+          var response = await fetch("/api/cold-email/generate", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -562,6 +562,10 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         } finally {
           button.disabled = false;
         }
+      };
+
+      button.addEventListener("click", function () {
+        void window.handleColdEmailGenerate();
       });
     })();
   </script>
