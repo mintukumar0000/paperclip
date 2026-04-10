@@ -1825,27 +1825,32 @@ export async function createDodoCheckoutSession(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const hostedCheckoutUrl = pickCredential(ctx, args.hostedCheckoutUrl, ["DODO_PAYMENTS_CHECKOUT_URL"]);
-  const useHostedCheckoutUrl =
-    parseBoolean(args.useHostedCheckoutUrl, false) ||
+  const hasExplicitHostedMode = Object.prototype.hasOwnProperty.call(args, "useHostedCheckoutUrl");
+  const envHostedMode =
     parseBoolean(ctx.integrationEnv.DODO_USE_HOSTED_CHECKOUT_URL, false) ||
     parseBoolean(process.env.DODO_USE_HOSTED_CHECKOUT_URL, false);
+  const useHostedCheckoutUrl = hasExplicitHostedMode
+    ? parseBoolean(args.useHostedCheckoutUrl, false)
+    : envHostedMode;
   const fallbackToHostedCheckoutUrl =
     parseBoolean(args.fallbackToHostedCheckoutUrl, true) &&
     !!hostedCheckoutUrl;
 
   if (useHostedCheckoutUrl) {
     if (!hostedCheckoutUrl) {
-      throw new Error(
-        "Hosted checkout mode requested but DODO_PAYMENTS_CHECKOUT_URL is not configured",
-      );
+      if (hasExplicitHostedMode) {
+        throw new Error(
+          "Hosted checkout mode requested but DODO_PAYMENTS_CHECKOUT_URL is not configured",
+        );
+      }
+    } else {
+      return {
+        mode: "hosted_checkout_url",
+        url: hostedCheckoutUrl,
+        source: "dodo_hosted_checkout",
+        message: "Using configured Dodo hosted checkout URL.",
+      };
     }
-
-    return {
-      mode: "hosted_checkout_url",
-      url: hostedCheckoutUrl,
-      source: "dodo_hosted_checkout",
-      message: "Using configured Dodo hosted checkout URL.",
-    };
   }
 
   const apiKey = pickCredential(ctx, args.apiKey, ["DODO_PAYMENTS_API_KEY", "DODO_API_KEY"]);

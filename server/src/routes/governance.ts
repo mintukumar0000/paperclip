@@ -67,12 +67,23 @@ import {
   organizationalPlaybookService,
   logActivity,
 } from "../services/index.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { GovernedActionType } from "../ai/governance/governanceEngine.js";
 import type { RateLimitDomain } from "../ai/governance/systemRateLimiter.js";
 
 export function governanceRoutes(db: Db) {
   const r = Router();
+
+  // Global governance surfaces are board-only. Company-scoped governance APIs
+  // continue to use assertCompanyAccess per-route.
+  r.use("/governance", (req, res, next) => {
+    try {
+      assertBoard(req);
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
 
   // =========================================================================
   // Central Governance Engine
@@ -355,6 +366,7 @@ export function governanceRoutes(db: Db) {
   r.get("/companies/:companyId/governance/goal-containment", async (req, res, next) => {
     try {
       const { companyId } = req.params;
+      assertCompanyAccess(req, companyId);
       const stats = await getGoalContainmentStats(db, companyId);
       res.json(stats);
     } catch (err) {

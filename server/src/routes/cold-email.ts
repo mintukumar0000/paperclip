@@ -8,6 +8,8 @@ import { logger } from "../middleware/logger.js";
 type JsonRecord = Record<string, unknown>;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TEMPLATE_PLACEHOLDER_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/g;
+const TEMPLATE_PLACEHOLDER_TEST_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/;
 const scheduledFollowUps = new Set<string>();
 
 function normalizeOptionalString(value: unknown): string | null {
@@ -202,18 +204,57 @@ function llmConfig(): {
 
 function fallbackColdEmail(args: { product: string; targetAudience: string; keyBenefit: string }): string {
   return [
-    `Subject: Quick idea for ${args.targetAudience}`,
+    `Subject: Helping ${args.targetAudience} with ${args.keyBenefit}`,
     "",
-    `Hi {{first_name}},`,
+    "Hi there,",
     "",
-    `Noticed you're focused on ${args.targetAudience.toLowerCase()}. I built ${args.product} to help teams get ${args.keyBenefit.toLowerCase()} without adding extra tools to the stack.`,
+    `I work on ${args.product}, and it helps ${args.targetAudience.toLowerCase()} get ${args.keyBenefit.toLowerCase()} without adding process overhead.`,
     "",
-    "If useful, I can send a 2-minute walkthrough with examples from similar teams.",
+    "If this is relevant, I can share a short walkthrough with examples from similar teams.",
     "",
-    "Would that be helpful?",
+    "Would a quick 10-minute walkthrough be useful this week?",
     "",
-    "- {{your_name}}",
+    "- Alex from Paperclip",
   ].join("\n");
+}
+
+function containsTemplatePlaceholders(content: string): boolean {
+  if (!content) return false;
+  return TEMPLATE_PLACEHOLDER_TEST_RE.test(content);
+}
+
+function stripTemplatePlaceholders(content: string): string {
+  if (!content) return content;
+  return content
+    .replace(TEMPLATE_PLACEHOLDER_RE, "there")
+    .replace(/there\s+there/g, "there")
+    .trim();
+}
+
+async function generateChatCompletion(
+  cfg: { baseUrl: string; model: string; headers: Record<string, string> },
+  messages: Array<{ role: "system" | "user"; content: string }>,
+): Promise<string | null> {
+  const response = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: cfg.headers,
+    body: JSON.stringify({
+      model: cfg.model,
+      temperature: 0.7,
+      max_tokens: 500,
+      messages,
+    }),
+  }).catch(() => null);
+
+  if (!response?.ok) return null;
+
+  const body = await response.json().catch(() => ({})) as JsonRecord;
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const first = choices[0] && typeof choices[0] === "object" ? (choices[0] as JsonRecord) : null;
+  const message = first && typeof first.message === "object" ? (first.message as JsonRecord) : null;
+  const content = typeof message?.content === "string" ? message.content.trim() : "";
+
+  return content.length > 0 ? content : null;
 }
 
 async function generateColdEmail(args: {
@@ -225,52 +266,65 @@ async function generateColdEmail(args: {
   if (!cfg) return fallbackColdEmail(args);
 
   const systemPrompt = [
-    "You write concise, high-response B2B cold emails.",
+    "You write concise, high-conversion B2B cold emails.",
     "Return plain text only.",
-    "Use this structure:",
-    "1) Subject line",
-    "2) Personalized opener",
-    "3) Value prop",
-    "4) Low-friction CTA",
+    "Never output placeholders like [Name], [Company], {{first_name}}, or <name>.",
+    "Generate realistic, ready-to-send copy with concrete language.",
+    "Use this structure: Subject line, opener, value proposition, low-friction CTA.",
     "Avoid hype and generic AI buzzwords.",
   ].join("\n");
 
   const userPrompt = [
+    "Write a highly personalized cold email.",
     `Product: ${args.product}`,
     `Target audience: ${args.targetAudience}`,
     `Key benefit: ${args.keyBenefit}`,
-    "Tone: direct, human, useful.",
-    "Goal: maximize reply/conversion probability.",
+    "Rules:",
+    "- DO NOT use placeholders like [Name], [Company], {{first_name}}, or <name>",
+    "- Generate realistic personalization using a believable sender persona",
+    "- Output must be ready-to-send",
+    "Return only the email.",
   ].join("\n");
 
-  const response = await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: cfg.headers,
-    body: JSON.stringify({
-      model: cfg.model,
-      temperature: 0.7,
-      max_tokens: 500,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    }),
-  }).catch(() => null);
+  const content = await generateChatCompletion(cfg, [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ]);
 
-  if (!response?.ok) return fallbackColdEmail(args);
+  if (!content) return fallbackColdEmail(args);
+  if (!containsTemplatePlaceholders(content)) {
+    const cleaned = stripTemplatePlaceholders(content);
+    return containsTemplatePlaceholders(cleaned) ? fallbackColdEmail(args) : cleaned;
+  }
 
-  const body = await response.json().catch(() => ({})) as JsonRecord;
-  const choices = Array.isArray(body.choices) ? body.choices : [];
-  const first = choices[0] && typeof choices[0] === "object" ? (choices[0] as JsonRecord) : null;
-  const message = first && typeof first.message === "object" ? (first.message as JsonRecord) : null;
-  const content = typeof message?.content === "string" ? message.content.trim() : "";
+  const rewritePrompt = [
+    "Rewrite this cold email so it is ready-to-send and has zero template placeholders.",
+    "Replace any bracket/brace placeholders with natural language.",
+    "Return plain text only.",
+    "Original email:",
+    content,
+  ].join("\n");
 
-  return content.length > 0 ? content : fallbackColdEmail(args);
+  const rewritten = await generateChatCompletion(cfg, [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: rewritePrompt },
+  ]);
+
+  if (rewritten && !containsTemplatePlaceholders(rewritten)) {
+    const cleaned = stripTemplatePlaceholders(rewritten);
+    return containsTemplatePlaceholders(cleaned) ? fallbackColdEmail(args) : cleaned;
+  }
+
+  const sanitized = stripTemplatePlaceholders(rewritten ?? content);
+  if (sanitized && !containsTemplatePlaceholders(sanitized)) return sanitized;
+
+  return fallbackColdEmail(args);
 }
 
 async function resolveCheckoutUrl(email: string, companyId: string | null): Promise<string | null> {
   const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
+  const hostedConfigured = hosted.length > 0;
 
   if (!productId && !hosted) return null;
 
@@ -289,8 +343,9 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
           product_id: productId || undefined,
           metadata,
         },
+        useHostedCheckoutUrl: hostedConfigured,
         hostedCheckoutUrl: hosted || undefined,
-        fallbackToHostedCheckoutUrl: true,
+        fallbackToHostedCheckoutUrl: hostedConfigured,
       },
     ) as JsonRecord;
 
