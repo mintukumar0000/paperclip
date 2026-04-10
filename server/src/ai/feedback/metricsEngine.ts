@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { and, desc, eq, gte, sql } from "@paperclipai/db";
+import { and, desc, eq, gte, lte } from "@paperclipai/db";
 import { systemMetrics } from "@paperclipai/db";
 import { eventBus } from "../../events/eventBus.js";
 import pino from "pino";
@@ -141,7 +141,7 @@ export async function getRecentSystemMetricsSnapshot(
       and(
         eq(systemMetrics.companyId, companyId),
         gte(systemMetrics.recordedAt, cutoff),
-        sql`${systemMetrics.recordedAt} <= ${end}`,
+        lte(systemMetrics.recordedAt, end),
       ),
     )
     .orderBy(desc(systemMetrics.recordedAt));

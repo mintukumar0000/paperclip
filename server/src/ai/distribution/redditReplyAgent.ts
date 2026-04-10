@@ -1,5 +1,6 @@
 import type { Db } from "@paperclipai/db";
 import { activityLog } from "@paperclipai/db";
+import { existsSync } from "node:fs";
 import pino from "pino";
 import { generateWithQualityGate } from "../quality/executionQualityGate.js";
 import { eventBus } from "../../events/eventBus.js";
@@ -34,6 +35,18 @@ interface ReplyResult {
 const repliedComments = new Set<string>();
 const REPLY_COOLDOWN_MS = 15 * 60_000;
 let lastReplyTime = 0;
+let playwrightUnavailableReason: string | null = null;
+
+function markPlaywrightUnavailable(reason: string): void {
+  if (playwrightUnavailableReason) return;
+  playwrightUnavailableReason = reason;
+  logger.warn({ reason }, "Reddit reply agent disabled Playwright automation until restart");
+}
+
+function isMissingPlaywrightExecutableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("Executable doesn't exist") || message.includes("playwright install");
+}
 
 const PRODUCT_CONTEXT = `
 Product: AI-powered cold email template system for founders
@@ -235,6 +248,7 @@ async function postReplyViaPlaywright(
 ): Promise<boolean> {
   const username = (process.env.REDDIT_USERNAME ?? "").trim();
   if (!username) return false;
+  if (playwrightUnavailableReason) return false;
 
   async function resolveWelcomeBack(page: {
     locator: (selector: string) => {
@@ -290,6 +304,14 @@ async function postReplyViaPlaywright(
 
   try {
     const playwright = await import("playwright");
+    const executablePath = playwright.chromium.executablePath();
+    if (!existsSync(executablePath)) {
+      markPlaywrightUnavailable(
+        `Playwright browser executable not found at ${executablePath}. Install browsers in the runtime image or disable REDDIT_REPLY_AGENT_ENABLED.`,
+      );
+      return false;
+    }
+
     const existingStoragePath = resolveExistingRedditStorageStatePath();
     const storagePath = existingStoragePath ?? resolveRedditStorageStatePath();
     const requireStorageState = isRedditStorageStateRequired(true);
@@ -414,6 +436,11 @@ async function postReplyViaPlaywright(
       await browser.close();
     }
   } catch (err) {
+    if (isMissingPlaywrightExecutableError(err)) {
+      const message = err instanceof Error ? err.message : String(err);
+      markPlaywrightUnavailable(`${message}. Disable REDDIT_REPLY_AGENT_ENABLED or install Playwright browsers.`);
+      return false;
+    }
     logger.warn({ err, commentId: comment.id }, "Playwright reply failed");
     return false;
   }
@@ -423,6 +450,10 @@ async function processComment(
   db: Db,
   comment: RedditComment,
 ): Promise<ReplyResult> {
+  if (playwrightUnavailableReason) {
+    return { commentId: comment.id, replied: false, error: playwrightUnavailableReason };
+  }
+
   const replyText = await generateReply(comment);
   if (!replyText) {
     return { commentId: comment.id, replied: false, error: "LLM generation failed" };
@@ -470,6 +501,10 @@ let replyAgentRunning = false;
 async function runReplyCycle(db: Db): Promise<void> {
   if (replyAgentRunning) return;
   if (Date.now() - lastReplyTime < REPLY_COOLDOWN_MS) return;
+  if (playwrightUnavailableReason) {
+    logger.info({ reason: playwrightUnavailableReason }, "Skipping Reddit reply cycle because Playwright is unavailable");
+    return;
+  }
 
   replyAgentRunning = true;
   try {
