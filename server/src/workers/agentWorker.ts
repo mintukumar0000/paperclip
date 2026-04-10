@@ -8,6 +8,15 @@ import pino from "pino";
 
 const logger = pino({ name: "agent-worker" });
 
+function isMissingAgentError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  const status =
+    typeof err === "object" && err !== null && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : null;
+  return status === 404 && /agent not found/i.test(message);
+}
+
 export interface WorkerDeps {
   /** The existing heartbeat service invoke/wakeup function */
   invokeHeartbeat: (params: {
@@ -116,6 +125,8 @@ export function createAgentWorker(deps: WorkerDeps): Worker<AgentJobPayload> {
 
         return result;
       } catch (err) {
+        const nonRetryableMissingAgent = isMissingAgentError(err);
+
         if (issueId && deps.markIssueFailed) {
           try {
             await deps.markIssueFailed({
@@ -129,6 +140,29 @@ export function createAgentWorker(deps: WorkerDeps): Worker<AgentJobPayload> {
               "Failed to mark issue after run failure",
             );
           }
+        }
+
+        if (nonRetryableMissingAgent) {
+          logger.warn(
+            { jobId: job.id, agentId, issueId, err },
+            "Dropping stale agent job because agent no longer exists",
+          );
+
+          await eventPublisher.publish("agent.failed", {
+            agentId,
+            issueId,
+            companyId,
+            error: err instanceof Error ? err.message : String(err),
+            jobId: job.id!,
+            attempt: job.attemptsMade + 1,
+            nonRetryable: true,
+          });
+
+          agentJobsActive.dec();
+          agentJobDuration.observe({ agent_id: agentId, status: "dropped" }, (performance.now() - jobStartTime) / 1000);
+          agentJobsTotal.inc({ status: "dropped" });
+
+          return { runId: "dropped_agent_missing" };
         }
 
         logger.error(

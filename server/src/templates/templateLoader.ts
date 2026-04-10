@@ -63,7 +63,7 @@ export function loadTemplates(): CompanyTemplate[] {
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".json"));
   } catch {
-    logger.warn({ dir }, "Template definitions directory not found");
+    logger.info({ dir }, "Template definitions directory not found; continuing with zero templates");
     return [];
   }
 
