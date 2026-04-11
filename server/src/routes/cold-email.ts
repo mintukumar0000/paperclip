@@ -729,6 +729,11 @@ function renderLandingPage(
         statusNode.appendChild(document.createTextNode("."));
       }
 
+      function showCheckoutError(message) {
+        var msg = (message && String(message).trim()) || "Checkout is not configured yet.";
+        statusNode.textContent = "Free limit reached. " + msg;
+      }
+
       async function requestCheckoutUrl(emailValue) {
         var response = await fetch("/api/cold-email/checkout", {
           method: "POST",
@@ -737,8 +742,9 @@ function renderLandingPage(
         });
         var data = await response.json().catch(function () { return {}; });
         if (!response.ok || !data || !data.checkoutUrl) {
+          var err = (data && data.error) ? String(data.error) : "checkout_failed";
           var hint = (data && data.hint) ? String(data.hint) : "";
-          throw new Error(hint || "Checkout route failed");
+          throw new Error(hint ? (err + ": " + hint) : err);
         }
         return String(data.checkoutUrl);
       }
@@ -840,6 +846,10 @@ function renderLandingPage(
                 window.location.href = checkoutFromBackend;
                 return;
               } catch (_checkoutErr) {
+                if (_checkoutErr && _checkoutErr.message) {
+                  showCheckoutError(_checkoutErr.message);
+                  return;
+                }
                 showPaywallStatus(data.checkoutUrl);
               }
               return;
