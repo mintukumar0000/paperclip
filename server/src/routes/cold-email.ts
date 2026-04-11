@@ -112,6 +112,15 @@ function asMetadata(value: unknown): JsonRecord {
   return value as JsonRecord;
 }
 
+function resolveDodoProductCheckoutFallbackUrl(productId: string | null): string | null {
+  if (!productId) return null;
+  const env = (process.env.DODO_PAYMENTS_ENVIRONMENT ?? "").trim().toLowerCase();
+  const host = env === "test_mode"
+    ? "https://test.checkout.dodopayments.com"
+    : "https://checkout.dodopayments.com";
+  return `${host}/buy/${encodeURIComponent(productId)}`;
+}
+
 function renderTrackedPixel(baseUrl: string, email: string, step: string, companyId: string | null): string {
   const companyPart = companyId ? `&companyId=${encodeURIComponent(companyId)}` : "";
   return `${baseUrl}/api/email/open?email=${encodeURIComponent(email)}&step=${encodeURIComponent(step)}${companyPart}`;
@@ -325,6 +334,7 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
   const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
   const hostedConfigured = hosted.length > 0;
+  const productFallbackUrl = resolveDodoProductCheckoutFallbackUrl(productId || null);
 
   if (!productId && !hosted) {
     logger.warn("Cold-email checkout unavailable: DODO_PRODUCT_ID and DODO_PAYMENTS_CHECKOUT_URL are both missing");
@@ -362,6 +372,7 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
       {
         hasProductId: !!productId,
         hasHostedCheckoutUrl: hostedConfigured,
+        hasProductFallbackUrl: !!productFallbackUrl,
         resultKeys: Object.keys(result),
       },
       "Dodo checkout response missing checkout URL",
@@ -372,13 +383,14 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
         err: error,
         hasProductId: !!productId,
         hasHostedCheckoutUrl: hostedConfigured,
+        hasProductFallbackUrl: !!productFallbackUrl,
       },
       "Failed to resolve Dodo checkout URL",
     );
-    return hosted || null;
+    return hosted || productFallbackUrl || null;
   }
 
-  return hosted || null;
+  return hosted || productFallbackUrl || null;
 }
 
 async function scheduleFollowUps(args: {

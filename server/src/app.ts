@@ -93,6 +93,23 @@ export async function createApp(
 ) {
   const app = express();
 
+  const trustProxyOverride = (process.env.PAPERCLIP_TRUST_PROXY ?? process.env.TRUST_PROXY ?? "").trim();
+  if (trustProxyOverride.length > 0) {
+    const normalized = trustProxyOverride.toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) {
+      app.set("trust proxy", true);
+    } else if (["0", "false", "no", "off"].includes(normalized)) {
+      app.set("trust proxy", false);
+    } else {
+      const asNumber = Number(trustProxyOverride);
+      app.set("trust proxy", Number.isFinite(asNumber) ? asNumber : trustProxyOverride);
+    }
+  } else if (opts.deploymentExposure === "public") {
+    // Public deployments typically sit behind a reverse proxy (Render/Cloudflare),
+    // and express-rate-limit expects trust proxy to be configured.
+    app.set("trust proxy", 1);
+  }
+
   app.use(
     express.json({
       verify: (req, _res, buf) => {
