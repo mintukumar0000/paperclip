@@ -1825,9 +1825,14 @@ export async function createDodoCheckoutSession(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const hostedCheckoutUrl = pickCredential(ctx, args.hostedCheckoutUrl, ["DODO_PAYMENTS_CHECKOUT_URL"]);
+  const publishableKey = pickCredential(ctx, args.publishableKey, ["DODO_PAYMENTS_PUBLISHABLE_KEY"]);
+  const payload = asObject(args.payload);
+  const payloadProductId = typeof payload.product_id === "string" ? payload.product_id : null;
   const hasExplicitHostedMode = Object.prototype.hasOwnProperty.call(args, "useHostedCheckoutUrl");
   const envHostedMode =
     parseBoolean(ctx.integrationEnv.DODO_USE_HOSTED_CHECKOUT_URL, false) ||
+    parseBoolean(ctx.integrationEnv.DODO_WEBHOOK_HOSTED_CHECKOUT_URL, false) ||
+    parseBoolean(process.env.DODO_WEBHOOK_HOSTED_CHECKOUT_URL, false) ||
     parseBoolean(process.env.DODO_USE_HOSTED_CHECKOUT_URL, false);
   const useHostedCheckoutUrl = hasExplicitHostedMode
     ? parseBoolean(args.useHostedCheckoutUrl, false)
@@ -1844,6 +1849,12 @@ export async function createDodoCheckoutSession(
         );
       }
     } else {
+      console.info("[dodo.checkout] using hosted checkout URL", {
+        mode: "hosted",
+        hasHostedCheckoutUrl: true,
+        hasPublishableKey: !!publishableKey,
+        hasProductId: !!payloadProductId,
+      });
       return {
         mode: "hosted_checkout_url",
         url: hostedCheckoutUrl,
@@ -1854,6 +1865,13 @@ export async function createDodoCheckoutSession(
   }
 
   const apiKey = pickCredential(ctx, args.apiKey, ["DODO_PAYMENTS_API_KEY", "DODO_API_KEY"]);
+  console.info("[dodo.checkout] input", {
+    mode: useHostedCheckoutUrl ? "hosted_or_fallback" : "api_checkout",
+    hasApiKey: !!apiKey,
+    hasPublishableKey: !!publishableKey,
+    hasHostedCheckoutUrl: !!hostedCheckoutUrl,
+    hasProductId: !!payloadProductId,
+  });
   if (!apiKey) {
     if (fallbackToHostedCheckoutUrl) {
       return {
@@ -1880,21 +1898,63 @@ export async function createDodoCheckoutSession(
       ? args.endpointPath.trim()
       : "/checkouts";
 
-  const payload = asObject(args.payload);
   if (Object.keys(payload).length === 0) {
     throw new Error("payload is required for Dodo checkout session creation");
   }
 
-  const res = await fetch(`${baseUrl}${endpointPath}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const timeoutRaw = Number(args.requestTimeoutMs ?? process.env.DODO_CHECKOUT_TIMEOUT_MS ?? 15_000);
+  const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0
+    ? Math.round(timeoutRaw)
+    : 15_000;
 
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(`${baseUrl}${endpointPath}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    clearTimeout(timeoutHandle);
+    const message = error instanceof Error ? error.message : String(error);
+    const timedOut = /abort|timed out/i.test(message);
+    if (fallbackToHostedCheckoutUrl) {
+      return {
+        mode: "hosted_checkout_url",
+        url: hostedCheckoutUrl,
+        source: "dodo_hosted_checkout_fallback",
+        warning: timedOut
+          ? "Dodo checkout request timed out; using hosted checkout URL fallback."
+          : "Dodo checkout request failed; using hosted checkout URL fallback.",
+      };
+    }
+    throw new Error(
+      timedOut
+        ? `Dodo checkout request timed out after ${timeoutMs}ms`
+        : `Dodo checkout request failed: ${message}`,
+    );
+  }
+
+  clearTimeout(timeoutHandle);
   const body = await res.json().catch(() => ({}));
+  const bodyObj = asObject(body);
+  const hasUrl = ["url", "checkout_url", "checkoutUrl"].some((key) => {
+    const value = bodyObj[key];
+    return typeof value === "string" && value.trim().length > 0;
+  });
+  console.info("[dodo.checkout] response", {
+    status: res.status,
+    ok: res.ok,
+    hasUrl,
+    mode: typeof bodyObj.mode === "string" ? bodyObj.mode : undefined,
+  });
   if (!res.ok) {
     if (fallbackToHostedCheckoutUrl) {
       return {
