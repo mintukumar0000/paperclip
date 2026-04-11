@@ -121,6 +121,15 @@ function resolveDodoProductCheckoutFallbackUrl(productId: string | null): string
   return `${host}/buy/${encodeURIComponent(productId)}`;
 }
 
+function buildColdEmailReturnUrl(
+  baseUrl: string,
+  email: string,
+  paymentState: "success" | "cancel",
+): string {
+  const params = new URLSearchParams({ email, payment: paymentState });
+  return `${baseUrl}/api/cold-email?${params.toString()}`;
+}
+
 function renderTrackedPixel(baseUrl: string, email: string, step: string, companyId: string | null): string {
   const companyPart = companyId ? `&companyId=${encodeURIComponent(companyId)}` : "";
   return `${baseUrl}/api/email/open?email=${encodeURIComponent(email)}&step=${encodeURIComponent(step)}${companyPart}`;
@@ -330,7 +339,11 @@ async function generateColdEmail(args: {
   return fallbackColdEmail(args);
 }
 
-async function resolveCheckoutUrl(email: string, companyId: string | null): Promise<string | null> {
+async function resolveCheckoutUrl(
+  email: string,
+  companyId: string | null,
+  baseUrl?: string,
+): Promise<string | null> {
   const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
   const hostedConfigured = hosted.length > 0;
@@ -348,6 +361,9 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
   };
   if (companyId) metadata.companyId = companyId;
 
+  const successUrl = baseUrl ? buildColdEmailReturnUrl(baseUrl, email, "success") : null;
+  const cancelUrl = baseUrl ? buildColdEmailReturnUrl(baseUrl, email, "cancel") : null;
+
   try {
     const result = await createDodoCheckoutSession(
       { integrationEnv: {} },
@@ -355,10 +371,11 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
         payload: {
           product_id: productId || undefined,
           metadata,
+          ...(successUrl ? { success_url: successUrl, successUrl } : {}),
+          ...(cancelUrl ? { cancel_url: cancelUrl, cancelUrl } : {}),
         },
-        useHostedCheckoutUrl: hostedConfigured,
         hostedCheckoutUrl: hosted || undefined,
-        fallbackToHostedCheckoutUrl: hostedConfigured,
+        fallbackToHostedCheckoutUrl: true,
       },
     ) as JsonRecord;
 
@@ -440,7 +457,14 @@ async function scheduleFollowUps(args: {
   }
 }
 
-function renderLandingPage(baseUrl: string, freeLimit: number): string {
+function renderLandingPage(
+  baseUrl: string,
+  freeLimit: number,
+  opts?: {
+    initialEmail?: string | null;
+    paymentState?: "success" | "cancel" | null;
+  },
+): string {
   const demoOutput = [
     "Subject: quick win for SDR teams this week",
     "",
@@ -559,7 +583,7 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
   <div class="wrap">
     <div class="hero">
       <section class="card">
-        <span class="urgency">Limited free usage: ${freeLimit} generations</span>
+        <span id="usage-pill" class="urgency">Limited free usage: ${freeLimit} generations</span>
         <h1>Turn your offer into reply-ready cold emails that convert</h1>
         <p class="sub">Input your product, audience, and key benefit. Get a personalized outreach email instantly.</p>
 
@@ -593,8 +617,12 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
       var statusNode = document.getElementById("status");
       var outputNode = document.getElementById("output");
       var button = document.getElementById("generate");
+      var emailNode = document.getElementById("email");
+      var usagePill = document.getElementById("usage-pill");
+      var initialEmail = ${JSON.stringify(opts?.initialEmail ?? "")};
+      var paymentState = ${JSON.stringify(opts?.paymentState ?? "")};
 
-      if (!statusNode || !outputNode || !button) {
+      if (!statusNode || !outputNode || !button || !emailNode) {
         return;
       }
 
@@ -614,9 +642,54 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         statusNode.appendChild(document.createTextNode("."));
       }
 
+      async function requestCheckoutUrl(emailValue) {
+        var response = await fetch("/api/cold-email/checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: emailValue }),
+        });
+        var data = await response.json().catch(function () { return {}; });
+        if (!response.ok || !data || !data.checkoutUrl) {
+          var hint = (data && data.hint) ? String(data.hint) : "";
+          throw new Error(hint || "Checkout route failed");
+        }
+        return String(data.checkoutUrl);
+      }
+
       function text(id) {
         var node = document.getElementById(id);
         return (node && node.value ? node.value : "").trim();
+      }
+
+      function setPaidStatusUi() {
+        if (usagePill) {
+          usagePill.textContent = "Paid monthly: unlimited generations";
+        }
+      }
+
+      function setFreeStatusUi(limit) {
+        if (usagePill && typeof limit === "number" && Number.isFinite(limit) && limit > 0) {
+          usagePill.textContent = "Limited free usage: " + String(limit) + " generations";
+        }
+      }
+
+      async function refreshAccessStatus(emailValue) {
+        if (!emailValue) return;
+        try {
+          var response = await fetch("/api/cold-email/access?email=" + encodeURIComponent(emailValue));
+          var data = await response.json().catch(function () { return {}; });
+          if (!response.ok || !data || !data.success) {
+            return;
+          }
+          if (data.paid) {
+            setPaidStatusUi();
+            statusNode.textContent = "Paid monthly active. Unlimited generations enabled.";
+          } else {
+            setFreeStatusUi(data.freeLimit);
+          }
+        } catch (_err) {
+          // Ignore background status refresh errors.
+        }
       }
 
       fetch("/api/cold-email/track", {
@@ -624,6 +697,22 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ event: "landing_view" }),
       }).catch(function () {});
+
+      if (initialEmail) {
+        emailNode.value = String(initialEmail);
+        void refreshAccessStatus(String(initialEmail));
+      }
+
+      if (paymentState === "success") {
+        statusNode.textContent = "Payment confirmed. Verifying paid access...";
+        if (initialEmail) {
+          setTimeout(function () {
+            void refreshAccessStatus(String(initialEmail));
+          }, 500);
+        }
+      } else if (paymentState === "cancel") {
+        statusNode.textContent = "Checkout canceled. Free access is still available.";
+      }
 
       async function handleColdEmailGenerate() {
         var payload = {
@@ -651,7 +740,14 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
 
           if (!response.ok || !data.success) {
             if (data && data.paywall) {
-              showPaywallStatus(data.checkoutUrl);
+              statusNode.textContent = "Free limit reached. Preparing checkout...";
+              try {
+                var checkoutFromBackend = await requestCheckoutUrl(payload.email);
+                window.location.href = checkoutFromBackend;
+                return;
+              } catch (_checkoutErr) {
+                showPaywallStatus(data.checkoutUrl);
+              }
               return;
             }
             var hint = (data && data.hint) ? String(data.hint) : "";
@@ -662,6 +758,11 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
           }
 
           outputNode.textContent = data.emailCopy || "No output returned.";
+          if (data.paid) {
+            setPaidStatusUi();
+            statusNode.textContent = "Generated and emailed. Paid monthly active with unlimited access.";
+            return;
+          }
           var remaining = typeof data.remainingFree === "number" ? data.remainingFree : 0;
           statusNode.textContent = "Generated and emailed. Free generations left: " + remaining;
         } catch (_err) {
@@ -671,6 +772,12 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
         }
       }
 
+      emailNode.addEventListener("blur", function () {
+        var emailValue = text("email");
+        if (!emailValue) return;
+        void refreshAccessStatus(emailValue);
+      });
+
       button.addEventListener("click", function () {
         void handleColdEmailGenerate();
       });
@@ -678,6 +785,16 @@ function renderLandingPage(baseUrl: string, freeLimit: number): string {
   </script>
 </body>
 </html>`;
+}
+
+async function createCheckoutForEmail(args: {
+  db: Db;
+  email: string;
+  baseUrl: string;
+}): Promise<{ checkoutUrl: string | null; companyId: string | null }> {
+  const companyId = await resolveTelemetryCompanyIdForDb(args.db);
+  const checkoutUrl = await resolveCheckoutUrl(args.email, companyId, args.baseUrl);
+  return { checkoutUrl, companyId };
 }
 
 export function coldEmailRoutes(db: Db) {
@@ -715,7 +832,51 @@ export function coldEmailRoutes(db: Db) {
       distinctId: req.ip,
     });
 
-    res.status(200).set({ "Content-Type": "text/html; charset=utf-8" }).send(renderLandingPage(baseUrl, getFreeLimit()));
+    const initialEmail = normalizeEmail(req.query.email);
+    const paymentStateRaw = normalizeOptionalString(req.query.payment);
+    const paymentState = paymentStateRaw === "success" || paymentStateRaw === "cancel"
+      ? paymentStateRaw
+      : null;
+
+    res
+      .status(200)
+      .set({ "Content-Type": "text/html; charset=utf-8" })
+      .send(renderLandingPage(baseUrl, getFreeLimit(), { initialEmail, paymentState }));
+  });
+
+  router.get("/cold-email/access", async (req, res) => {
+    const email = normalizeEmail(req.query.email);
+    if (!email) {
+      res.status(422).json({ success: false, error: "Valid email is required" });
+      return;
+    }
+
+    const signup = await db
+      .select({
+        metadata: waitlistSignups.metadata,
+        createdAt: waitlistSignups.createdAt,
+      })
+      .from(waitlistSignups)
+      .where(eq(waitlistSignups.email, email))
+      .orderBy(desc(waitlistSignups.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    const metadata = asMetadata(signup?.metadata);
+    const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
+    const paid = metadata.coldEmailPaid === true;
+    const freeLimit = getFreeLimit();
+
+    res.json({
+      success: true,
+      email,
+      paid,
+      generationCount,
+      freeLimit,
+      remainingFree: paid ? Number.MAX_SAFE_INTEGER : Math.max(0, freeLimit - generationCount),
+      plan: paid ? "paid_monthly" : "free",
+      createdAt: signup?.createdAt?.toISOString() ?? null,
+    });
   });
 
   router.post("/cold-email/track", async (req, res) => {
@@ -734,12 +895,22 @@ export function coldEmailRoutes(db: Db) {
       return;
     }
 
-    const companyId = await resolveTelemetryCompanyIdForDb(db);
-    const checkoutUrl = await resolveCheckoutUrl(email, companyId);
+    const baseUrl = resolvePublicBaseUrl({
+      reqOrigin: req.header("origin"),
+      host: req.header("host"),
+      forwardedHost: req.header("x-forwarded-host"),
+      forwardedProto: req.header("x-forwarded-proto"),
+    });
+
+    const { checkoutUrl, companyId } = await createCheckoutForEmail({
+      db,
+      email,
+      baseUrl,
+    });
     if (!checkoutUrl) {
       res.status(500).json({
         success: false,
-        error: "Checkout is not configured",
+        error: "checkout_failed",
         hint: "Verify DODO_PRODUCT_ID, DODO_PAYMENTS_API_KEY, DODO_PAYMENTS_BASE_URL, and DODO checkout API reachability.",
       });
       return;
@@ -770,6 +941,38 @@ export function coldEmailRoutes(db: Db) {
     res.json({ success: true, checkoutUrl });
   });
 
+  router.get("/cold-email/checkout", async (req, res) => {
+    const email = normalizeEmail(req.query.email);
+    if (!email) {
+      res.status(422).json({ success: false, error: "Valid email is required" });
+      return;
+    }
+
+    const baseUrl = resolvePublicBaseUrl({
+      reqOrigin: req.header("origin"),
+      host: req.header("host"),
+      forwardedHost: req.header("x-forwarded-host"),
+      forwardedProto: req.header("x-forwarded-proto"),
+    });
+
+    const { checkoutUrl } = await createCheckoutForEmail({
+      db,
+      email,
+      baseUrl,
+    });
+
+    if (!checkoutUrl) {
+      res.status(500).json({
+        success: false,
+        error: "checkout_failed",
+        hint: "Check DODO config",
+      });
+      return;
+    }
+
+    res.json({ checkoutUrl });
+  });
+
   router.get("/cold-email/generate", (_req, res) => {
     res.redirect(302, "/api/cold-email");
   });
@@ -789,6 +992,12 @@ export function coldEmailRoutes(db: Db) {
     }
 
     try {
+      const baseUrl = resolvePublicBaseUrl({
+        reqOrigin: req.header("origin"),
+        host: req.header("host"),
+        forwardedHost: req.header("x-forwarded-host"),
+        forwardedProto: req.header("x-forwarded-proto"),
+      });
       const companyId = await resolveTelemetryCompanyIdForDb(db);
       const source = "cold_email_tool";
       const now = new Date();
@@ -826,7 +1035,7 @@ export function coldEmailRoutes(db: Db) {
       const paid = metadata.coldEmailPaid === true;
 
       if (!paid && generationCount >= freeLimit) {
-        const checkoutUrl = await resolveCheckoutUrl(email, companyId);
+        const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl);
 
         await capturePosthogEvent("cold_email_paywall_hit", {
           source,
@@ -891,13 +1100,7 @@ export function coldEmailRoutes(db: Db) {
         })
         .where(eq(waitlistSignups.id, signup.id));
 
-      const baseUrl = resolvePublicBaseUrl({
-        reqOrigin: req.header("origin"),
-        host: req.header("host"),
-        forwardedHost: req.header("x-forwarded-host"),
-        forwardedProto: req.header("x-forwarded-proto"),
-      });
-      const checkoutUrl = await resolveCheckoutUrl(email, companyId);
+      const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl);
       const upgradeTarget = checkoutUrl ?? `${baseUrl}/api/cold-email`;
 
       const sentResultEmail = await sendResendEmail({

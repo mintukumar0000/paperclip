@@ -212,15 +212,40 @@ async function markColdEmailUserPaid(
   args: {
     companyId: string;
     metadata: JsonRecord;
+    payload: JsonRecord;
     amountCents: number;
     currency: string;
     sessionId: string | null;
   },
 ): Promise<void> {
   const source = readString(args.metadata.source)?.toLowerCase();
-  if (source !== "cold_email_tool") return;
+  const feature = readString(args.metadata.feature)?.toLowerCase();
+  const expectedProductId = readString(process.env.DODO_PRODUCT_ID);
+  const productId = firstString(args.payload, [
+    "data.product_id",
+    "data.object.product_id",
+    "data.object.product.id",
+    "product_id",
+    "product.id",
+  ]);
+  const isColdEmailPayment = source === "cold_email_tool"
+    || feature === "cold_email_unlimited"
+    || (expectedProductId != null && productId != null && expectedProductId === productId);
+  if (!isColdEmailPayment) return;
 
-  const email = readString(args.metadata.email)?.toLowerCase();
+  const email = (
+    readString(args.metadata.email)
+    ?? firstString(args.payload, [
+      "data.customer.email",
+      "data.object.customer_email",
+      "data.object.customer.email",
+      "data.email",
+      "customer.email",
+      "customer_email",
+      "email",
+      "billing_email",
+    ])
+  )?.toLowerCase();
   if (!email) return;
 
   const row = await db
@@ -244,10 +269,13 @@ async function markColdEmailUserPaid(
         ...currentMetadata,
         source: "cold_email_tool",
         coldEmailPaid: true,
+        coldEmailPlan: "paid_monthly",
+        coldEmailUnlimited: true,
         coldEmailPaidAt: new Date().toISOString(),
         coldEmailLastPaymentCents: args.amountCents,
         coldEmailLastPaymentCurrency: args.currency,
         coldEmailLastPaymentSessionId: args.sessionId,
+        coldEmailLastPaymentProductId: productId,
       },
     })
     .where(eq(waitlistSignups.id, row.id));
@@ -266,6 +294,9 @@ async function markColdEmailUserPaid(
       amountCents: args.amountCents,
       currency: args.currency,
       sessionId: args.sessionId,
+      productId,
+      source,
+      feature,
     },
   });
 }
@@ -1259,6 +1290,7 @@ export function billingRoutes(db: Db) {
     await markColdEmailUserPaid(db, {
       companyId,
       metadata,
+      payload,
       amountCents,
       currency,
       sessionId,
@@ -1707,6 +1739,7 @@ export function billingRoutes(db: Db) {
     await markColdEmailUserPaid(db, {
       companyId,
       metadata,
+      payload,
       amountCents,
       currency,
       sessionId,
