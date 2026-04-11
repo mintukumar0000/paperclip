@@ -112,22 +112,17 @@ function asMetadata(value: unknown): JsonRecord {
   return value as JsonRecord;
 }
 
-function resolveDodoProductCheckoutFallbackUrl(productId: string | null): string | null {
-  if (!productId) return null;
-  const env = (process.env.DODO_PAYMENTS_ENVIRONMENT ?? "").trim().toLowerCase();
-  const host = env === "test_mode"
-    ? "https://test.checkout.dodopayments.com"
-    : "https://checkout.dodopayments.com";
-  return `${host}/buy/${encodeURIComponent(productId)}`;
-}
-
-function buildColdEmailReturnUrl(
+function buildColdEmailCancelUrl(
   baseUrl: string,
   email: string,
-  paymentState: "success" | "cancel",
 ): string {
-  const params = new URLSearchParams({ email, payment: paymentState });
+  const params = new URLSearchParams({ email, payment: "cancel" });
   return `${baseUrl}/api/cold-email?${params.toString()}`;
+}
+
+function buildColdEmailSuccessUrl(baseUrl: string, email: string): string {
+  const params = new URLSearchParams({ email });
+  return `${baseUrl}/api/cold-email/success?${params.toString()}`;
 }
 
 function renderTrackedPixel(baseUrl: string, email: string, step: string, companyId: string | null): string {
@@ -347,7 +342,6 @@ async function resolveCheckoutUrl(
   const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
   const hostedConfigured = hosted.length > 0;
-  const productFallbackUrl = resolveDodoProductCheckoutFallbackUrl(productId || null);
 
   if (!productId && !hosted) {
     logger.warn("Cold-email checkout unavailable: DODO_PRODUCT_ID and DODO_PAYMENTS_CHECKOUT_URL are both missing");
@@ -361,8 +355,8 @@ async function resolveCheckoutUrl(
   };
   if (companyId) metadata.companyId = companyId;
 
-  const successUrl = baseUrl ? buildColdEmailReturnUrl(baseUrl, email, "success") : null;
-  const cancelUrl = baseUrl ? buildColdEmailReturnUrl(baseUrl, email, "cancel") : null;
+  const successUrl = baseUrl ? buildColdEmailSuccessUrl(baseUrl, email) : null;
+  const cancelUrl = baseUrl ? buildColdEmailCancelUrl(baseUrl, email) : null;
 
   try {
     const result = await createDodoCheckoutSession(
@@ -389,25 +383,118 @@ async function resolveCheckoutUrl(
       {
         hasProductId: !!productId,
         hasHostedCheckoutUrl: hostedConfigured,
-        hasProductFallbackUrl: !!productFallbackUrl,
         resultKeys: Object.keys(result),
       },
       "Dodo checkout response missing checkout URL",
     );
+    return hostedConfigured ? hosted : null;
   } catch (error) {
     logger.warn(
       {
         err: error,
         hasProductId: !!productId,
         hasHostedCheckoutUrl: hostedConfigured,
-        hasProductFallbackUrl: !!productFallbackUrl,
       },
       "Failed to resolve Dodo checkout URL",
     );
-    return hosted || productFallbackUrl || null;
+    return hostedConfigured ? hosted : null;
   }
+}
 
-  return hosted || productFallbackUrl || null;
+function renderSuccessPage(email: string): string {
+  const escapedEmail = email.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Payment Confirmation</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #f7f4ef 0%, #ebe5d8 100%);
+      color: #1f1b17;
+      padding: 16px;
+    }
+    .card {
+      width: min(620px, 100%);
+      border-radius: 18px;
+      background: #fffdf8;
+      border: 1px solid #d8cfc0;
+      box-shadow: 0 10px 26px rgba(24, 19, 13, 0.08);
+      padding: 22px;
+    }
+    h1 { margin: 0 0 10px; font-size: 1.5rem; }
+    p { margin: 0 0 10px; line-height: 1.45; }
+    .muted { color: #6d6257; }
+    .ok { color: #0f766e; font-weight: 700; }
+    .warn { color: #9a5800; font-weight: 700; }
+    .btn {
+      display: inline-block;
+      margin-top: 12px;
+      border-radius: 10px;
+      background: #0f766e;
+      color: #fff;
+      text-decoration: none;
+      padding: 10px 14px;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Payment received</h1>
+    <p class="muted">Email: ${escapedEmail}</p>
+    <p id="status" class="warn">Payment processing. Confirming access...</p>
+    <a id="cta" class="btn" href="/api/cold-email?email=${encodeURIComponent(email)}" style="display:none;">Continue to generator</a>
+  </main>
+  <script>
+    (function () {
+      var email = ${JSON.stringify(email)};
+      var attempts = 0;
+      var maxAttempts = 20;
+      var statusNode = document.getElementById("status");
+      var ctaNode = document.getElementById("cta");
+
+      async function pollAccess() {
+        attempts += 1;
+        try {
+          var response = await fetch("/api/cold-email/access?email=" + encodeURIComponent(email));
+          var data = await response.json().catch(function () { return {}; });
+          if (response.ok && data && data.success && data.paid) {
+            if (statusNode) {
+              statusNode.className = "ok";
+              statusNode.textContent = "Payment successful. Unlimited access is now active.";
+            }
+            if (ctaNode) ctaNode.style.display = "inline-block";
+            return;
+          }
+        } catch (_err) {
+          // Ignore transient polling failures.
+        }
+
+        if (attempts >= maxAttempts) {
+          if (statusNode) {
+            statusNode.className = "warn";
+            statusNode.textContent = "Payment processing is taking longer than expected. Please continue and retry in a few seconds.";
+          }
+          if (ctaNode) ctaNode.style.display = "inline-block";
+          return;
+        }
+
+        setTimeout(pollAccess, 3000);
+      }
+
+      pollAccess();
+    })();
+  </script>
+</body>
+</html>`;
 }
 
 async function scheduleFollowUps(args: {
@@ -706,9 +793,16 @@ function renderLandingPage(
       if (paymentState === "success") {
         statusNode.textContent = "Payment confirmed. Verifying paid access...";
         if (initialEmail) {
-          setTimeout(function () {
+          var attempts = 0;
+          var maxAttempts = 20;
+          var pollAfterSuccess = function () {
+            attempts += 1;
             void refreshAccessStatus(String(initialEmail));
-          }, 500);
+            if (attempts < maxAttempts) {
+              setTimeout(pollAfterSuccess, 3000);
+            }
+          };
+          setTimeout(pollAfterSuccess, 500);
         }
       } else if (paymentState === "cancel") {
         statusNode.textContent = "Checkout canceled. Free access is still available.";
@@ -877,6 +971,19 @@ export function coldEmailRoutes(db: Db) {
       plan: paid ? "paid_monthly" : "free",
       createdAt: signup?.createdAt?.toISOString() ?? null,
     });
+  });
+
+  router.get("/cold-email/success", async (req, res) => {
+    const email = normalizeEmail(req.query.email);
+    if (!email) {
+      res.status(422).send("Valid email is required");
+      return;
+    }
+
+    res
+      .status(200)
+      .set({ "Content-Type": "text/html; charset=utf-8" })
+      .send(renderSuccessPage(email));
   });
 
   router.post("/cold-email/track", async (req, res) => {

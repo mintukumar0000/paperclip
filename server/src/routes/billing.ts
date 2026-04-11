@@ -107,7 +107,13 @@ function getPath(root: unknown, path: string): unknown {
   const segments = path.split(".");
   let current: unknown = root;
   for (const segment of segments) {
-    if (!current || typeof current !== "object" || Array.isArray(current)) {
+    if (Array.isArray(current)) {
+      const index = Number(segment);
+      if (!Number.isInteger(index) || index < 0 || index >= current.length) return null;
+      current = current[index];
+      continue;
+    }
+    if (!current || typeof current !== "object") {
       return null;
     }
     current = (current as JsonRecord)[segment];
@@ -236,6 +242,9 @@ async function markColdEmailUserPaid(
   const email = (
     readString(args.metadata.email)
     ?? firstString(args.payload, [
+      "metadata.email",
+      "data.metadata.email",
+      "data.object.metadata.email",
       "data.customer.email",
       "data.object.customer_email",
       "data.object.customer.email",
@@ -255,30 +264,71 @@ async function markColdEmailUserPaid(
     .limit(1)
     .then((rows) => rows[0] ?? null);
 
-  if (!row) return;
+  if (!row) {
+    await db
+      .insert(waitlistSignups)
+      .values({
+        email,
+        companyId: args.companyId,
+        source: "cold_email_tool",
+        metadata: {
+          source: "cold_email_tool",
+          coldEmailGenerationCount: 0,
+          coldEmailPaid: true,
+          coldEmailPlan: "paid_monthly",
+          coldEmailUnlimited: true,
+          coldEmailPaidAt: new Date().toISOString(),
+          coldEmailLastPaymentCents: args.amountCents,
+          coldEmailLastPaymentCurrency: args.currency,
+          coldEmailLastPaymentSessionId: args.sessionId,
+          coldEmailLastPaymentProductId: productId,
+        },
+      })
+      .onConflictDoUpdate({
+        target: waitlistSignups.email,
+        set: {
+          companyId: args.companyId,
+          source: "cold_email_tool",
+          metadata: {
+            source: "cold_email_tool",
+            coldEmailGenerationCount: 0,
+            coldEmailPaid: true,
+            coldEmailPlan: "paid_monthly",
+            coldEmailUnlimited: true,
+            coldEmailPaidAt: new Date().toISOString(),
+            coldEmailLastPaymentCents: args.amountCents,
+            coldEmailLastPaymentCurrency: args.currency,
+            coldEmailLastPaymentSessionId: args.sessionId,
+            coldEmailLastPaymentProductId: productId,
+          },
+        },
+      });
+  }
 
-  const currentMetadata = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+  const currentMetadata = row?.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
     ? row.metadata as JsonRecord
     : {};
 
-  await db
-    .update(waitlistSignups)
-    .set({
-      companyId: args.companyId,
-      metadata: {
-        ...currentMetadata,
-        source: "cold_email_tool",
-        coldEmailPaid: true,
-        coldEmailPlan: "paid_monthly",
-        coldEmailUnlimited: true,
-        coldEmailPaidAt: new Date().toISOString(),
-        coldEmailLastPaymentCents: args.amountCents,
-        coldEmailLastPaymentCurrency: args.currency,
-        coldEmailLastPaymentSessionId: args.sessionId,
-        coldEmailLastPaymentProductId: productId,
-      },
-    })
-    .where(eq(waitlistSignups.id, row.id));
+  if (row) {
+    await db
+      .update(waitlistSignups)
+      .set({
+        companyId: args.companyId,
+        metadata: {
+          ...currentMetadata,
+          source: "cold_email_tool",
+          coldEmailPaid: true,
+          coldEmailPlan: "paid_monthly",
+          coldEmailUnlimited: true,
+          coldEmailPaidAt: new Date().toISOString(),
+          coldEmailLastPaymentCents: args.amountCents,
+          coldEmailLastPaymentCurrency: args.currency,
+          coldEmailLastPaymentSessionId: args.sessionId,
+          coldEmailLastPaymentProductId: productId,
+        },
+      })
+      .where(eq(waitlistSignups.id, row.id));
+  }
 
   await logActivity(db, {
     companyId: args.companyId,
