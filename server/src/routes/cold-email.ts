@@ -326,7 +326,10 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
   const hostedConfigured = hosted.length > 0;
 
-  if (!productId && !hosted) return null;
+  if (!productId && !hosted) {
+    logger.warn("Cold-email checkout unavailable: DODO_PRODUCT_ID and DODO_PAYMENTS_CHECKOUT_URL are both missing");
+    return null;
+  }
 
   const metadata: JsonRecord = {
     source: "cold_email_tool",
@@ -354,7 +357,24 @@ async function resolveCheckoutUrl(email: string, companyId: string | null): Prom
       const value = result[key];
       if (typeof value === "string" && value.trim().length > 0) return value.trim();
     }
-  } catch {
+
+    logger.warn(
+      {
+        hasProductId: !!productId,
+        hasHostedCheckoutUrl: hostedConfigured,
+        resultKeys: Object.keys(result),
+      },
+      "Dodo checkout response missing checkout URL",
+    );
+  } catch (error) {
+    logger.warn(
+      {
+        err: error,
+        hasProductId: !!productId,
+        hasHostedCheckoutUrl: hostedConfigured,
+      },
+      "Failed to resolve Dodo checkout URL",
+    );
     return hosted || null;
   }
 
@@ -705,7 +725,11 @@ export function coldEmailRoutes(db: Db) {
     const companyId = await resolveTelemetryCompanyIdForDb(db);
     const checkoutUrl = await resolveCheckoutUrl(email, companyId);
     if (!checkoutUrl) {
-      res.status(500).json({ success: false, error: "Checkout is not configured" });
+      res.status(500).json({
+        success: false,
+        error: "Checkout is not configured",
+        hint: "Verify DODO_PRODUCT_ID, DODO_PAYMENTS_API_KEY, DODO_PAYMENTS_BASE_URL, and DODO checkout API reachability.",
+      });
       return;
     }
 
@@ -823,6 +847,9 @@ export function coldEmailRoutes(db: Db) {
           paywall: true,
           error: "Free limit reached",
           checkoutUrl,
+          checkoutHint: checkoutUrl
+            ? null
+            : "Checkout URL unavailable. Verify Dodo checkout configuration and API connectivity.",
         });
         return;
       }
