@@ -1738,6 +1738,46 @@ interface CheckoutLineItem {
   currency?: string;
 }
 
+function normalizeDodoCheckoutPayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...payload };
+
+  const hasProductCart = Array.isArray(normalized.product_cart) && normalized.product_cart.length > 0;
+  if (hasProductCart) return normalized;
+
+  const productId = typeof normalized.product_id === "string" ? normalized.product_id.trim() : "";
+  if (productId.length > 0) {
+    const quantityRaw = Number(normalized.quantity ?? 1);
+    const quantity = Number.isFinite(quantityRaw) && quantityRaw > 0 ? Math.round(quantityRaw) : 1;
+    normalized.product_cart = [{ product_id: productId, quantity }];
+    return normalized;
+  }
+
+  if (Array.isArray(normalized.items)) {
+    const cart = normalized.items
+      .map((entry) => {
+        const row = asObject(entry);
+        const itemProductId =
+          typeof row.product_id === "string"
+            ? row.product_id.trim()
+            : typeof row.productId === "string"
+              ? row.productId.trim()
+              : "";
+        if (!itemProductId) return null;
+
+        const quantityRaw = Number(row.quantity ?? 1);
+        const quantity = Number.isFinite(quantityRaw) && quantityRaw > 0 ? Math.round(quantityRaw) : 1;
+        return { product_id: itemProductId, quantity };
+      })
+      .filter((value): value is { product_id: string; quantity: number } => value != null);
+
+    if (cart.length > 0) {
+      normalized.product_cart = cart;
+    }
+  }
+
+  return normalized;
+}
+
 function parseLineItems(raw: unknown, defaultCurrency: string): CheckoutLineItem[] {
   if (!Array.isArray(raw) || raw.length === 0) {
     throw new Error("lineItems[] is required");
@@ -1826,8 +1866,14 @@ export async function createDodoCheckoutSession(
 ): Promise<unknown> {
   const hostedCheckoutUrl = pickCredential(ctx, args.hostedCheckoutUrl, ["DODO_PAYMENTS_CHECKOUT_URL"]);
   const publishableKey = pickCredential(ctx, args.publishableKey, ["DODO_PAYMENTS_PUBLISHABLE_KEY"]);
-  const payload = asObject(args.payload);
-  const payloadProductId = typeof payload.product_id === "string" ? payload.product_id : null;
+  const payload = normalizeDodoCheckoutPayload(asObject(args.payload));
+  const productCartFirstItem = Array.isArray(payload.product_cart) ? asObject(payload.product_cart[0]) : {};
+  const payloadProductId =
+    typeof payload.product_id === "string"
+      ? payload.product_id
+      : typeof productCartFirstItem.product_id === "string"
+        ? productCartFirstItem.product_id
+        : null;
   const hasExplicitHostedMode = Object.prototype.hasOwnProperty.call(args, "useHostedCheckoutUrl");
   const envHostedMode =
     parseBoolean(ctx.integrationEnv.DODO_USE_HOSTED_CHECKOUT_URL, false) ||
@@ -1854,6 +1900,7 @@ export async function createDodoCheckoutSession(
         hasHostedCheckoutUrl: true,
         hasPublishableKey: !!publishableKey,
         hasProductId: !!payloadProductId,
+        hasProductCart: Array.isArray(payload.product_cart),
       });
       return {
         mode: "hosted_checkout_url",
@@ -1871,6 +1918,7 @@ export async function createDodoCheckoutSession(
     hasPublishableKey: !!publishableKey,
     hasHostedCheckoutUrl: !!hostedCheckoutUrl,
     hasProductId: !!payloadProductId,
+    hasProductCart: Array.isArray(payload.product_cart),
   });
   if (!apiKey) {
     if (fallbackToHostedCheckoutUrl) {
