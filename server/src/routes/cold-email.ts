@@ -128,16 +128,11 @@ function asMetadata(value: unknown): JsonRecord {
 }
 
 function isColdEmailPaid(metadata: JsonRecord): boolean {
-  return metadata.coldEmailPaid === true || hasEntitlement(metadata, COLD_EMAIL_FEATURE_KEY);
+  return hasEntitlement(metadata, COLD_EMAIL_FEATURE_KEY);
 }
 
 function withColdEmailEntitlement(metadata: JsonRecord, paid: boolean): JsonRecord {
-  const withEntitlement = setEntitlement(metadata, COLD_EMAIL_FEATURE_KEY, paid);
-  return {
-    ...withEntitlement,
-    coldEmailPaid: paid,
-    coldEmailUnlimited: paid,
-  };
+  return setEntitlement(metadata, COLD_EMAIL_FEATURE_KEY, paid);
 }
 
 function buildColdEmailCancelUrl(
@@ -1389,10 +1384,7 @@ export function coldEmailRoutes(db: Db) {
       .where(
         and(
           eq(waitlistSignups.companyId, companyId),
-          sql`(
-            coalesce((${waitlistSignups.metadata} ->> 'coldEmailPaid')::boolean, false) = true
-            OR coalesce(((${waitlistSignups.metadata} -> 'entitlements' ->> 'cold_email')::boolean), false) = true
-          )`,
+          sql`coalesce(((${waitlistSignups.metadata} -> 'entitlements' ->> 'cold_email')::boolean), false) = true`,
         ),
       );
 

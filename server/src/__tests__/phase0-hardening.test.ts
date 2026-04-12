@@ -123,6 +123,41 @@ describe("Phase 0.2 and 0.3 success URL hardening", () => {
     expect(after.status).toBe(200);
     expect(after.body.paid).toBe(false);
   });
+
+  it("treats legacy coldEmailPaid flag without entitlement as unpaid", async () => {
+    const accessRows: Array<{ metadata: Record<string, unknown>; createdAt: Date }> = [
+      {
+        metadata: { coldEmailPaid: true, coldEmailUnlimited: true },
+        createdAt: new Date("2026-04-10T00:00:00.000Z"),
+      },
+    ];
+
+    const coldEmailDb = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            orderBy: () => ({
+              limit: () => ({
+                then: (resolve: (rows: Array<{ metadata: Record<string, unknown>; createdAt: Date }>) => unknown) =>
+                  Promise.resolve(resolve(accessRows)),
+              }),
+            }),
+          }),
+        }),
+      }),
+    } as any;
+
+    const app = express();
+    app.use("/api", coldEmailRoutes(coldEmailDb));
+
+    const response = await request(app)
+      .get("/api/cold-email/access")
+      .query({ email: "legacy-flag@example.com" });
+
+    expect(response.status).toBe(200);
+    expect(response.body.paid).toBe(false);
+    expect(response.body.plan).toBe("free");
+  });
 });
 
 describe("Phase 0.4 active company scheduler behavior", () => {
