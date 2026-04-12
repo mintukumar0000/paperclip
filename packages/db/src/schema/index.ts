@@ -31,6 +31,7 @@ export { activityLog } from "./activity_log.js";
 export { companySecrets } from "./company_secrets.js";
 export { companySecretVersions } from "./company_secret_versions.js";
 export { companyFinance } from "./company_finance.js";
+export { paymentEvents } from "./payment_events.js";
 export { memories } from "./memories.js";
 export { workflows, workflowRuns } from "./workflows.js";
 export { agentMessages } from "./agent_messages.js";

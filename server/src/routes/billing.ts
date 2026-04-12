@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { Router, type Request, type Response } from "express";
-import { activityLog, aiLearningRecords, and, companies, eq, sql, type Db, waitlistSignups } from "@paperclipai/db";
+import { activityLog, aiLearningRecords, and, companies, eq, paymentEvents, sql, type Db, waitlistSignups } from "@paperclipai/db";
 import {
   createDodoCheckoutSession,
   createStripeCheckoutSession,
@@ -15,6 +15,11 @@ import {
   getCompanyFinanceSnapshot,
   logActivity,
 } from "../services/index.js";
+import {
+  COLD_EMAIL_FEATURE_KEY,
+  normalizeFeatureKey,
+  setEntitlement,
+} from "../lib/entitlements.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -100,6 +105,36 @@ async function persistPaymentLearningRecord(
       : "Replicate acquisition and offer path that produced this conversion.",
     applied: true,
     appliedAt: new Date(),
+  });
+}
+
+async function recordPaymentEvent(
+  db: Db,
+  args: {
+    companyId: string;
+    provider: BillingProvider;
+    externalEventId: string;
+    sessionId: string | null;
+    amountCents: number;
+    currency: string;
+    source: string | null;
+    email: string | null;
+    metadata: JsonRecord;
+  },
+): Promise<void> {
+  if (args.amountCents <= 0) return;
+
+  await db.insert(paymentEvents).values({
+    companyId: args.companyId,
+    provider: args.provider,
+    status: "completed",
+    externalEventId: args.externalEventId,
+    sessionId: args.sessionId,
+    amountCents: args.amountCents,
+    currency: args.currency,
+    source: args.source,
+    email: args.email,
+    metadata: args.metadata,
   });
 }
 
@@ -213,7 +248,7 @@ function secureCompare(a: string, b: string): boolean {
   return timingSafeEqual(aBuf, bBuf);
 }
 
-async function markColdEmailUserPaid(
+async function markUserEntitlementPaid(
   db: Db,
   args: {
     companyId: string;
@@ -252,7 +287,9 @@ async function markColdEmailUserPaid(
     .then((rows) => rows[0] ?? null);
 
   const source = readString(args.metadata.source)?.toLowerCase();
-  const feature = readString(args.metadata.feature)?.toLowerCase();
+  const featureFromMetadata =
+    normalizeFeatureKey(readString(args.metadata.featureKey))
+    ?? normalizeFeatureKey(readString(args.metadata.feature));
   const expectedProductId = readString(process.env.DODO_PRODUCT_ID);
   const productId = firstString(args.payload, [
     "data.product_id",
@@ -272,11 +309,52 @@ async function markColdEmailUserPaid(
     : null;
 
   const isColdEmailPayment = source === "cold_email_tool"
-    || feature === "cold_email_unlimited"
+    || featureFromMetadata === COLD_EMAIL_FEATURE_KEY
     || (expectedProductId != null && productId != null && expectedProductId === productId)
     || existingSource === "cold_email_tool";
 
-  if (!isColdEmailPayment) return;
+  const featureKey = featureFromMetadata ?? (isColdEmailPayment ? COLD_EMAIL_FEATURE_KEY : null);
+
+  if (!featureKey) return;
+
+  const nowIso = new Date().toISOString();
+
+  const withEntitlement = (value: unknown): JsonRecord => {
+    const base = asRecord(value);
+    const entitled = setEntitlement(base, featureKey, true);
+    const withPayment = {
+      ...entitled,
+      paymentLastProvider: "dodo",
+      paymentLastStatus: "completed",
+      paymentLastFeatureKey: featureKey,
+      paymentLastAt: nowIso,
+      paymentLastAmountCents: args.amountCents,
+      paymentLastCurrency: args.currency,
+      paymentLastSessionId: args.sessionId,
+      paymentLastProductId: productId,
+    } as JsonRecord;
+
+    if (!isColdEmailPayment) {
+      return withPayment;
+    }
+
+    return {
+      ...withPayment,
+      source: "cold_email_tool",
+      coldEmailGenerationCount: Math.max(0, Number(base.coldEmailGenerationCount ?? 0)),
+      coldEmailPaid: true,
+      coldEmailPlan: "paid_monthly",
+      coldEmailUnlimited: true,
+      coldEmailPaidAt: nowIso,
+      coldEmailLastPaymentCents: args.amountCents,
+      coldEmailLastPaymentCurrency: args.currency,
+      coldEmailLastPaymentSessionId: args.sessionId,
+      coldEmailLastPaymentProductId: productId,
+    };
+  };
+
+  const metadataForUpsert = withEntitlement(row?.metadata);
+  const sourceForUpsert = isColdEmailPayment ? "cold_email_tool" : (source ?? null);
 
   if (!row) {
     await db
@@ -284,65 +362,28 @@ async function markColdEmailUserPaid(
       .values({
         email,
         companyId: args.companyId,
-        source: "cold_email_tool",
-        metadata: {
-          source: "cold_email_tool",
-          coldEmailGenerationCount: 0,
-          coldEmailPaid: true,
-          coldEmailPlan: "paid_monthly",
-          coldEmailUnlimited: true,
-          coldEmailPaidAt: new Date().toISOString(),
-          coldEmailLastPaymentCents: args.amountCents,
-          coldEmailLastPaymentCurrency: args.currency,
-          coldEmailLastPaymentSessionId: args.sessionId,
-          coldEmailLastPaymentProductId: productId,
-        },
+        source: sourceForUpsert,
+        metadata: metadataForUpsert,
       })
       .onConflictDoUpdate({
         target: waitlistSignups.email,
         set: {
           companyId: args.companyId,
-          source: "cold_email_tool",
-          metadata: {
-            source: "cold_email_tool",
-            coldEmailGenerationCount: 0,
-            coldEmailPaid: true,
-            coldEmailPlan: "paid_monthly",
-            coldEmailUnlimited: true,
-            coldEmailPaidAt: new Date().toISOString(),
-            coldEmailLastPaymentCents: args.amountCents,
-            coldEmailLastPaymentCurrency: args.currency,
-            coldEmailLastPaymentSessionId: args.sessionId,
-            coldEmailLastPaymentProductId: productId,
-          },
+          source: sourceForUpsert,
+          metadata: metadataForUpsert,
         },
       });
+    return;
   }
 
-  const currentMetadata = row?.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
-    ? row.metadata as JsonRecord
-    : {};
-
-  if (row) {
-    await db
-      .update(waitlistSignups)
-      .set({
-        companyId: args.companyId,
-        metadata: {
-          ...currentMetadata,
-          source: "cold_email_tool",
-          coldEmailPaid: true,
-          coldEmailPlan: "paid_monthly",
-          coldEmailUnlimited: true,
-          coldEmailPaidAt: new Date().toISOString(),
-          coldEmailLastPaymentCents: args.amountCents,
-          coldEmailLastPaymentCurrency: args.currency,
-          coldEmailLastPaymentSessionId: args.sessionId,
-          coldEmailLastPaymentProductId: productId,
-        },
-      })
-      .where(eq(waitlistSignups.id, row.id));
-  }
+  await db
+    .update(waitlistSignups)
+    .set({
+      companyId: args.companyId,
+      source: sourceForUpsert,
+      metadata: metadataForUpsert,
+    })
+    .where(eq(waitlistSignups.id, row.id));
 
   await logActivity(db, {
     companyId: args.companyId,
@@ -350,7 +391,7 @@ async function markColdEmailUserPaid(
     actorId: "billing-webhook",
     agentId: null,
     runId: null,
-    action: "cold_email.payment.unlimited_unlocked",
+    action: isColdEmailPayment ? "cold_email.payment.unlimited_unlocked" : "billing.entitlement.unlocked",
     entityType: "company",
     entityId: args.companyId,
     details: {
@@ -359,8 +400,9 @@ async function markColdEmailUserPaid(
       currency: args.currency,
       sessionId: args.sessionId,
       productId,
+      featureKey,
       source,
-      feature,
+      feature: featureFromMetadata,
     },
   });
 }
@@ -933,8 +975,6 @@ export function billingRoutes(db: Db) {
       readString(process.env.DODO_PAYMENTS_WEBHOOK_SECRET) ??
       readString(process.env.DODO_PAYMENTS_SIGNING_SECRET);
 
-    const debugMode = /^(1|true|yes)$/i.test((process.env.BILLING_WEBHOOK_DEBUG ?? "").trim());
-
     if (!dodoSecret) {
       console.warn("[billing.webhook] No DODO_WEBHOOK_SECRET configured — rejecting");
       res.status(401).json({ error: "Missing configured dodo webhook secret" });
@@ -957,13 +997,9 @@ export function billingRoutes(db: Db) {
       : false;
 
     if (!signatureValid) {
-      if (debugMode) {
-        console.warn("[billing.webhook] Signature INVALID but debug mode enabled — proceeding anyway");
-      } else {
-        console.error("[billing.webhook] Signature verification FAILED — rejecting webhook");
-        res.status(401).json({ error: "Invalid Dodo webhook signature" });
-        return;
-      }
+      console.error("[billing.webhook] Signature verification FAILED — rejecting webhook");
+      res.status(401).json({ error: "Invalid Dodo webhook signature" });
+      return;
     } else {
       console.log("[billing.webhook] Signature verification PASSED");
     }
@@ -1230,7 +1266,7 @@ export function billingRoutes(db: Db) {
       companyId,
       sourceType: "tool_action",
       sourceId: transactionKey,
-      traffic: 1,
+      traffic: 0,
       conversions: 1,
       revenueCents: amountCents,
       metadata: {
@@ -1330,6 +1366,18 @@ export function billingRoutes(db: Db) {
       "customer_name",
     ]);
 
+    await recordPaymentEvent(db, {
+      companyId,
+      provider: "dodo",
+      externalEventId,
+      sessionId,
+      amountCents,
+      currency,
+      source: readString(metadata.source),
+      email: emailForPosthog,
+      metadata,
+    });
+
     console.log("[billing.webhook] Firing PostHog payment_completed event:", {
       email: emailForPosthog,
       customerName,
@@ -1351,7 +1399,7 @@ export function billingRoutes(db: Db) {
       screen: "payment_webhook",
     });
 
-    await markColdEmailUserPaid(db, {
+    await markUserEntitlementPaid(db, {
       companyId,
       metadata,
       payload,
@@ -1752,7 +1800,7 @@ export function billingRoutes(db: Db) {
       companyId,
       sourceType: "tool_action",
       sourceId: transactionKey,
-      traffic: 1,
+      traffic: 0,
       conversions: 1,
       revenueCents: amountCents,
       metadata: {
@@ -1766,6 +1814,18 @@ export function billingRoutes(db: Db) {
         checkoutMetadata: metadata,
         signatureVerified,
       },
+    });
+
+    await recordPaymentEvent(db, {
+      companyId,
+      provider: normalizedProvider,
+      externalEventId,
+      sessionId,
+      amountCents,
+      currency,
+      source: readString(metadata.source),
+      email: readString(metadata.email),
+      metadata,
     });
 
     await logActivity(db, {
@@ -1800,7 +1860,7 @@ export function billingRoutes(db: Db) {
       email: readString(metadata.email),
     });
 
-    await markColdEmailUserPaid(db, {
+    await markUserEntitlementPaid(db, {
       companyId,
       metadata,
       payload,

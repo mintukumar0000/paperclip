@@ -246,6 +246,41 @@ function mapFeedbackToDecisionActions(
     });
   }
 
+  // Explicit RPV thresholds for deterministic improve/scale routing.
+  if (metrics.sample_count >= 3 && metrics.traffic >= 10) {
+    const visitors = Math.max(1, metrics.traffic);
+    const revenuePerVisitCents = metrics.revenue / visitors;
+    const revenuePerVisitDollars = revenuePerVisitCents / 100;
+
+    if (revenuePerVisitDollars < 0.01) {
+      actions.push({
+        type: "create_issue",
+        key: "improve_landing_page",
+        reason: `RPV is below threshold ($${revenuePerVisitDollars.toFixed(4)}). Improve conversion before scaling traffic.`,
+        payload: {
+          title: "Improve conversion when RPV is below $0.01",
+          description:
+            `Revenue per visitor is $${revenuePerVisitDollars.toFixed(4)} with traffic=${metrics.traffic}. Focus on conversion and checkout friction before scaling channels.`,
+          priority: "high",
+        },
+      });
+    }
+
+    if (revenuePerVisitDollars > 0.05) {
+      actions.push({
+        type: "create_issue",
+        key: "auto_scale_distribution",
+        reason: `RPV is above threshold ($${revenuePerVisitDollars.toFixed(4)}). Scale winning traffic channels.`,
+        payload: {
+          title: "Scale traffic when RPV is above $0.05",
+          description:
+            `Revenue per visitor is $${revenuePerVisitDollars.toFixed(4)}. Increase distribution cadence on proven channels while monitoring CAC drift.`,
+          priority: "high",
+        },
+      });
+    }
+  }
+
   // --- RPV-first prioritization: rank all actions by what increases Revenue Per Visitor most ---
   const rpv = metrics.traffic > 0 ? metrics.revenue / metrics.traffic : 0;
   if (metrics.sample_count >= 5 && metrics.traffic >= 20 && rpv < 50) {

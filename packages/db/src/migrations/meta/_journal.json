@@ -239,6 +239,13 @@
       "when": 1774966575331,
       "tag": "0033_cool_blonde_phantom",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1776019837501,
+      "tag": "0034_loose_vulcan",
+      "breakpoints": true
     }
   ]
 }

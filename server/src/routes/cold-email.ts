@@ -2,8 +2,14 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { activityLog, and, companies, desc, eq, sql, waitlistSignups } from "@paperclipai/db";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
+import { recordSystemMetric } from "../ai/feedback/metricsEngine.js";
 import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
 import { logger } from "../middleware/logger.js";
+import {
+  COLD_EMAIL_FEATURE_KEY,
+  hasEntitlement,
+  setEntitlement,
+} from "../lib/entitlements.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -119,6 +125,19 @@ function resolvePublicBaseUrl(args: {
 function asMetadata(value: unknown): JsonRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return value as JsonRecord;
+}
+
+function isColdEmailPaid(metadata: JsonRecord): boolean {
+  return metadata.coldEmailPaid === true || hasEntitlement(metadata, COLD_EMAIL_FEATURE_KEY);
+}
+
+function withColdEmailEntitlement(metadata: JsonRecord, paid: boolean): JsonRecord {
+  const withEntitlement = setEntitlement(metadata, COLD_EMAIL_FEATURE_KEY, paid);
+  return {
+    ...withEntitlement,
+    coldEmailPaid: paid,
+    coldEmailUnlimited: paid,
+  };
 }
 
 function buildColdEmailCancelUrl(
@@ -360,6 +379,7 @@ async function resolveCheckoutUrl(
   const metadata: JsonRecord = {
     source: "cold_email_tool",
     email,
+    featureKey: COLD_EMAIL_FEATURE_KEY,
     feature: "cold_email_unlimited",
   };
   if (companyId) metadata.companyId = companyId;
@@ -911,82 +931,6 @@ async function createCheckoutForEmail(args: {
   return { checkoutUrl, companyId };
 }
 
-async function reconcilePaidAccessFromSuccessRedirect(args: {
-  db: Db;
-  email: string;
-  companyId: string | null;
-  paymentStatus: string | null;
-  subscriptionId: string | null;
-}): Promise<void> {
-  const env = (process.env.DODO_PAYMENTS_ENVIRONMENT ?? "").trim().toLowerCase();
-  if (env !== "test_mode") return;
-  if (!args.paymentStatus || !["active", "paid", "succeeded", "success"].includes(args.paymentStatus)) return;
-
-  const existing = await args.db
-    .select({
-      id: waitlistSignups.id,
-      metadata: waitlistSignups.metadata,
-      companyId: waitlistSignups.companyId,
-    })
-    .from(waitlistSignups)
-    .where(eq(waitlistSignups.email, args.email))
-    .orderBy(desc(waitlistSignups.createdAt))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-
-  const currentMetadata = asMetadata(existing?.metadata);
-  const nextMetadata: JsonRecord = {
-    ...currentMetadata,
-    source: "cold_email_tool",
-    coldEmailPaid: true,
-    coldEmailPlan: "paid_monthly",
-    coldEmailUnlimited: true,
-    coldEmailPaidAt: new Date().toISOString(),
-    coldEmailLastPaymentSource: "success_redirect_reconcile",
-    coldEmailLastPaymentStatus: args.paymentStatus,
-    coldEmailLastPaymentSubscriptionId: args.subscriptionId,
-  };
-
-  if (existing) {
-    await args.db
-      .update(waitlistSignups)
-      .set({
-        companyId: existing.companyId ?? args.companyId,
-        source: "cold_email_tool",
-        metadata: nextMetadata,
-      })
-      .where(eq(waitlistSignups.id, existing.id));
-  } else {
-    await args.db.insert(waitlistSignups).values({
-      email: args.email,
-      companyId: args.companyId,
-      source: "cold_email_tool",
-      metadata: {
-        coldEmailGenerationCount: 0,
-        ...nextMetadata,
-      },
-    });
-  }
-
-  if (args.companyId) {
-    await args.db.insert(activityLog).values({
-      companyId: args.companyId,
-      actorType: "system",
-      actorId: "cold-email-success",
-      agentId: null,
-      runId: null,
-      action: "cold_email.success.reconciled",
-      entityType: "company",
-      entityId: args.companyId,
-      details: {
-        email: args.email,
-        paymentStatus: args.paymentStatus,
-        subscriptionId: args.subscriptionId,
-      },
-    }).catch(() => undefined);
-  }
-}
-
 export function coldEmailRoutes(db: Db) {
   const router = Router();
 
@@ -1022,6 +966,21 @@ export function coldEmailRoutes(db: Db) {
       distinctId: req.ip,
     });
 
+    if (companyId) {
+      await recordSystemMetric(db, {
+        companyId,
+        sourceType: "tool_action",
+        sourceId: `cold_email:landing:${Date.now()}`,
+        traffic: 1,
+        conversions: 0,
+        revenueCents: 0,
+        metadata: {
+          source: "cold_email_landing",
+          host: req.header("host") ?? null,
+        },
+      }).catch(() => undefined);
+    }
+
     const initialEmail = normalizeEmail(req.query.email);
     const paymentStateRaw = normalizeOptionalString(req.query.payment);
     const paymentState = paymentStateRaw === "success" || paymentStateRaw === "cancel"
@@ -1054,7 +1013,7 @@ export function coldEmailRoutes(db: Db) {
 
     const metadata = asMetadata(signup?.metadata);
     const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
-    const paid = metadata.coldEmailPaid === true;
+    const paid = isColdEmailPaid(metadata);
     const freeLimit = getFreeLimit();
 
     res.json({
@@ -1075,20 +1034,6 @@ export function coldEmailRoutes(db: Db) {
       res.status(422).send("Valid email is required");
       return;
     }
-
-    const paymentStatus = normalizeOptionalString(req.query.status)?.toLowerCase() ?? null;
-    const subscriptionId =
-      normalizeOptionalString(req.query.subscription_id)
-      ?? normalizeOptionalString(req.query.subscriptionId);
-    const companyId = await resolveTelemetryCompanyIdForDb(db);
-
-    await reconcilePaidAccessFromSuccessRedirect({
-      db,
-      email,
-      companyId,
-      paymentStatus,
-      subscriptionId,
-    });
 
     res
       .status(200)
@@ -1227,7 +1172,7 @@ export function coldEmailRoutes(db: Db) {
           source,
           metadata: {
             coldEmailGenerationCount: 0,
-            coldEmailPaid: false,
+            ...withColdEmailEntitlement({}, false),
           },
           createdAt: now,
         })
@@ -1249,7 +1194,7 @@ export function coldEmailRoutes(db: Db) {
       const metadata = asMetadata(signup.metadata);
       const freeLimit = getFreeLimit();
       const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
-      const paid = metadata.coldEmailPaid === true;
+      const paid = isColdEmailPaid(metadata);
 
       if (!paid && generationCount >= freeLimit) {
         const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl);
@@ -1295,11 +1240,10 @@ export function coldEmailRoutes(db: Db) {
       const generated = await generateColdEmail({ product, targetAudience, keyBenefit });
       const updatedGenerationCount = generationCount + 1;
       const nextMetadata: JsonRecord = {
-        ...metadata,
+        ...withColdEmailEntitlement(metadata, paid),
         source,
         coldEmailGenerationCount: updatedGenerationCount,
         coldEmailLastGeneratedAt: now.toISOString(),
-        coldEmailPaid: paid,
         coldEmailLastInput: {
           product,
           targetAudience,
@@ -1367,6 +1311,23 @@ export function coldEmailRoutes(db: Db) {
             resultEmailSent: sentResultEmail,
           },
         }).catch(() => undefined);
+
+        const conversionIncrement = generationCount === 0 ? 1 : 0;
+        if (conversionIncrement > 0) {
+          await recordSystemMetric(db, {
+            companyId,
+            sourceType: "tool_action",
+            sourceId: `cold_email:first_generation:${email}`,
+            traffic: 0,
+            conversions: conversionIncrement,
+            revenueCents: 0,
+            metadata: {
+              source: "cold_email_generation",
+              email,
+              paid,
+            },
+          }).catch(() => undefined);
+        }
       }
 
       res.json({
@@ -1428,7 +1389,10 @@ export function coldEmailRoutes(db: Db) {
       .where(
         and(
           eq(waitlistSignups.companyId, companyId),
-          sql`coalesce((${waitlistSignups.metadata} ->> 'coldEmailPaid')::boolean, false) = true`,
+          sql`(
+            coalesce((${waitlistSignups.metadata} ->> 'coldEmailPaid')::boolean, false) = true
+            OR coalesce(((${waitlistSignups.metadata} -> 'entitlements' ->> 'cold_email')::boolean), false) = true
+          )`,
         ),
       );
 

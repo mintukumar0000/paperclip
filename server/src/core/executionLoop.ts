@@ -7,7 +7,7 @@ import { strategyEngine } from "../strategy/strategyEngine.js";
 import { dispatchAgentExecution } from "../services/agentDispatchService.js";
 import { recordSystemMetric, getRecentSystemMetricsSnapshot } from "../ai/feedback/metricsEngine.js";
 import { runAutonomousDecisionCycle } from "../ai/governance/decisionEngine.js";
-import { getActiveCompanyId, isCompanyInScope, listScopedCompanyIds } from "./companyScope.js";
+import { getActiveCompanyId } from "./companyScope.js";
 
 const logger = pino({ name: "execution-loop" });
 
@@ -60,18 +60,6 @@ export function executionLoop(db: Db) {
     /** Run one cycle of the execution loop for a company */
     async runCycle(companyId: string): Promise<LoopCycleResult> {
       const cycleStarted = new Date().toISOString();
-      if (!isCompanyInScope(companyId)) {
-        logger.warn({ companyId }, "Skipping execution cycle for out-of-scope company");
-        return {
-          companyId,
-          cycleStarted,
-          cycleCompleted: new Date().toISOString(),
-          goalsAnalyzed: 0,
-          tasksDispatched: 0,
-          agentsActivated: 0,
-        };
-      }
-
       const companyRow = await db
         .select({ id: companies.id, status: companies.status })
         .from(companies)
@@ -307,11 +295,16 @@ export function executionLoop(db: Db) {
     /** Run execution loop for all companies */
     async runAll(): Promise<LoopCycleResult[]> {
       const activeCompanyId = getActiveCompanyId();
-      const companyIds = await listScopedCompanyIds(db);
-      if (activeCompanyId && companyIds.length === 0) {
+      const companyIds = await db
+        .select({ id: companies.id })
+        .from(companies)
+        .where(eq(companies.status, "active"))
+        .then((rows) => rows.map((row) => row.id));
+
+      if (activeCompanyId) {
         logger.warn(
-          { activeCompanyId },
-          "ACTIVE_COMPANY_ID configured but company was not found; execution loop run skipped",
+          { activeCompanyId, totalActiveCompanies: companyIds.length },
+          "ACTIVE_COMPANY_ID is configured but execution loop now runs all active companies",
         );
       }
 
