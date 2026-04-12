@@ -367,6 +367,7 @@ async function resolveCheckoutUrl(
           metadata,
           ...(successUrl ? { success_url: successUrl, successUrl } : {}),
           ...(cancelUrl ? { cancel_url: cancelUrl, cancelUrl } : {}),
+          ...(successUrl ? { return_url: successUrl, returnUrl: successUrl } : {}),
         },
         hostedCheckoutUrl: hosted || undefined,
         fallbackToHostedCheckoutUrl: true,

@@ -224,27 +224,14 @@ async function markColdEmailUserPaid(
     sessionId: string | null;
   },
 ): Promise<void> {
-  const source = readString(args.metadata.source)?.toLowerCase();
-  const feature = readString(args.metadata.feature)?.toLowerCase();
-  const expectedProductId = readString(process.env.DODO_PRODUCT_ID);
-  const productId = firstString(args.payload, [
-    "data.product_id",
-    "data.object.product_id",
-    "data.object.product.id",
-    "product_id",
-    "product.id",
-  ]);
-  const isColdEmailPayment = source === "cold_email_tool"
-    || feature === "cold_email_unlimited"
-    || (expectedProductId != null && productId != null && expectedProductId === productId);
-  if (!isColdEmailPayment) return;
-
   const email = (
     readString(args.metadata.email)
     ?? firstString(args.payload, [
       "metadata.email",
       "data.metadata.email",
       "data.object.metadata.email",
+      "data.customer_details.email",
+      "data.object.customer_details.email",
       "data.customer.email",
       "data.object.customer_email",
       "data.object.customer.email",
@@ -263,6 +250,33 @@ async function markColdEmailUserPaid(
     .where(eq(waitlistSignups.email, email))
     .limit(1)
     .then((rows) => rows[0] ?? null);
+
+  const source = readString(args.metadata.source)?.toLowerCase();
+  const feature = readString(args.metadata.feature)?.toLowerCase();
+  const expectedProductId = readString(process.env.DODO_PRODUCT_ID);
+  const productId = firstString(args.payload, [
+    "data.product_id",
+    "data.object.product_id",
+    "data.object.product.id",
+    "data.product_cart.0.product_id",
+    "data.object.product_cart.0.product_id",
+    "product_cart.0.product_id",
+    "line_items.0.product_id",
+    "data.line_items.0.product_id",
+    "product_id",
+    "product.id",
+  ]);
+
+  const existingSource = row
+    ? readString(asRecord(row.metadata).source)?.toLowerCase()
+    : null;
+
+  const isColdEmailPayment = source === "cold_email_tool"
+    || feature === "cold_email_unlimited"
+    || (expectedProductId != null && productId != null && expectedProductId === productId)
+    || existingSource === "cold_email_tool";
+
+  if (!isColdEmailPayment) return;
 
   if (!row) {
     await db
