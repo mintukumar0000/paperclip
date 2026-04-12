@@ -13,6 +13,15 @@ const TEMPLATE_PLACEHOLDER_TEST_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^
 const scheduledFollowUps = new Set<string>();
 
 function normalizeOptionalString(value: unknown): string | null {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (typeof entry !== "string") continue;
+      const trimmedEntry = entry.trim();
+      if (trimmedEntry.length > 0) return trimmedEntry;
+    }
+    return null;
+  }
+
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
@@ -902,6 +911,82 @@ async function createCheckoutForEmail(args: {
   return { checkoutUrl, companyId };
 }
 
+async function reconcilePaidAccessFromSuccessRedirect(args: {
+  db: Db;
+  email: string;
+  companyId: string | null;
+  paymentStatus: string | null;
+  subscriptionId: string | null;
+}): Promise<void> {
+  const env = (process.env.DODO_PAYMENTS_ENVIRONMENT ?? "").trim().toLowerCase();
+  if (env !== "test_mode") return;
+  if (!args.paymentStatus || !["active", "paid", "succeeded", "success"].includes(args.paymentStatus)) return;
+
+  const existing = await args.db
+    .select({
+      id: waitlistSignups.id,
+      metadata: waitlistSignups.metadata,
+      companyId: waitlistSignups.companyId,
+    })
+    .from(waitlistSignups)
+    .where(eq(waitlistSignups.email, args.email))
+    .orderBy(desc(waitlistSignups.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+
+  const currentMetadata = asMetadata(existing?.metadata);
+  const nextMetadata: JsonRecord = {
+    ...currentMetadata,
+    source: "cold_email_tool",
+    coldEmailPaid: true,
+    coldEmailPlan: "paid_monthly",
+    coldEmailUnlimited: true,
+    coldEmailPaidAt: new Date().toISOString(),
+    coldEmailLastPaymentSource: "success_redirect_reconcile",
+    coldEmailLastPaymentStatus: args.paymentStatus,
+    coldEmailLastPaymentSubscriptionId: args.subscriptionId,
+  };
+
+  if (existing) {
+    await args.db
+      .update(waitlistSignups)
+      .set({
+        companyId: existing.companyId ?? args.companyId,
+        source: "cold_email_tool",
+        metadata: nextMetadata,
+      })
+      .where(eq(waitlistSignups.id, existing.id));
+  } else {
+    await args.db.insert(waitlistSignups).values({
+      email: args.email,
+      companyId: args.companyId,
+      source: "cold_email_tool",
+      metadata: {
+        coldEmailGenerationCount: 0,
+        ...nextMetadata,
+      },
+    });
+  }
+
+  if (args.companyId) {
+    await args.db.insert(activityLog).values({
+      companyId: args.companyId,
+      actorType: "system",
+      actorId: "cold-email-success",
+      agentId: null,
+      runId: null,
+      action: "cold_email.success.reconciled",
+      entityType: "company",
+      entityId: args.companyId,
+      details: {
+        email: args.email,
+        paymentStatus: args.paymentStatus,
+        subscriptionId: args.subscriptionId,
+      },
+    }).catch(() => undefined);
+  }
+}
+
 export function coldEmailRoutes(db: Db) {
   const router = Router();
 
@@ -990,6 +1075,20 @@ export function coldEmailRoutes(db: Db) {
       res.status(422).send("Valid email is required");
       return;
     }
+
+    const paymentStatus = normalizeOptionalString(req.query.status)?.toLowerCase() ?? null;
+    const subscriptionId =
+      normalizeOptionalString(req.query.subscription_id)
+      ?? normalizeOptionalString(req.query.subscriptionId);
+    const companyId = await resolveTelemetryCompanyIdForDb(db);
+
+    await reconcilePaidAccessFromSuccessRedirect({
+      db,
+      email,
+      companyId,
+      paymentStatus,
+      subscriptionId,
+    });
 
     res
       .status(200)
