@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { activityLog, and, companies, desc, eq, sql, waitlistSignups } from "@paperclipai/db";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
@@ -12,11 +12,33 @@ import {
 } from "../lib/entitlements.js";
 
 type JsonRecord = Record<string, unknown>;
+type AttributionContext = {
+  utmSource: string | null;
+  utmCampaign: string | null;
+  referrer: string | null;
+  sessionId: string | null;
+};
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TEMPLATE_PLACEHOLDER_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/g;
 const TEMPLATE_PLACEHOLDER_TEST_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/;
 const scheduledFollowUps = new Set<string>();
+
+const EMPTY_ATTRIBUTION: AttributionContext = {
+  utmSource: null,
+  utmCampaign: null,
+  referrer: null,
+  sessionId: null,
+};
+
+function compactJsonRecord(record: JsonRecord): JsonRecord {
+  const next: JsonRecord = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (value == null) continue;
+    next[key] = value;
+  }
+  return next;
+}
 
 function normalizeOptionalString(value: unknown): string | null {
   if (Array.isArray(value)) {
@@ -31,6 +53,58 @@ function normalizeOptionalString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeAttributionValue(value: unknown, maxLength: number): string | null {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) return null;
+  const cleaned = normalized.slice(0, maxLength);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function readAttributionFromUnknown(input: unknown): AttributionContext {
+  const record = asMetadata(input);
+  return {
+    utmSource: normalizeAttributionValue(record.utm_source ?? record.utmSource, 80),
+    utmCampaign: normalizeAttributionValue(record.utm_campaign ?? record.utmCampaign, 120),
+    referrer: normalizeAttributionValue(record.referrer ?? record.referer, 1000),
+    sessionId: normalizeAttributionValue(record.session_id ?? record.sessionId, 120),
+  };
+}
+
+function attributionToMetadata(attribution: AttributionContext): JsonRecord {
+  return compactJsonRecord({
+    utm_source: attribution.utmSource,
+    utm_campaign: attribution.utmCampaign,
+    referrer: attribution.referrer,
+    session_id: attribution.sessionId,
+  });
+}
+
+function mergeAttribution(primary: AttributionContext, fallback: AttributionContext): AttributionContext {
+  return {
+    utmSource: primary.utmSource ?? fallback.utmSource,
+    utmCampaign: primary.utmCampaign ?? fallback.utmCampaign,
+    referrer: primary.referrer ?? fallback.referrer,
+    sessionId: primary.sessionId ?? fallback.sessionId,
+  };
+}
+
+function readAttributionFromRequest(req: Request): AttributionContext {
+  const fromBody = readAttributionFromUnknown(req.body);
+  const fromQuery = readAttributionFromUnknown(req.query);
+  const headerReferrer = normalizeAttributionValue(req.header("referer"), 1000);
+  const headerSessionId = normalizeAttributionValue(req.header("x-paperclip-session-id"), 120);
+
+  return mergeAttribution(
+    {
+      utmSource: fromBody.utmSource ?? fromQuery.utmSource,
+      utmCampaign: fromBody.utmCampaign ?? fromQuery.utmCampaign,
+      referrer: fromBody.referrer ?? fromQuery.referrer ?? headerReferrer,
+      sessionId: fromBody.sessionId ?? fromQuery.sessionId ?? headerSessionId,
+    },
+    EMPTY_ATTRIBUTION,
+  );
 }
 
 function normalizeEmail(value: unknown): string | null {
@@ -361,6 +435,7 @@ async function resolveCheckoutUrl(
   email: string,
   companyId: string | null,
   baseUrl?: string,
+  attribution: AttributionContext = EMPTY_ATTRIBUTION,
 ): Promise<string | null> {
   const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
@@ -376,6 +451,7 @@ async function resolveCheckoutUrl(
     email,
     featureKey: COLD_EMAIL_FEATURE_KEY,
     feature: "cold_email_unlimited",
+    ...attributionToMetadata(attribution),
   };
   if (companyId) metadata.companyId = companyId;
 
@@ -733,6 +809,7 @@ function renderLandingPage(
       var usagePill = document.getElementById("usage-pill");
       var initialEmail = ${JSON.stringify(opts?.initialEmail ?? "")};
       var paymentState = ${JSON.stringify(opts?.paymentState ?? "")};
+      var SESSION_STORAGE_KEY = "paperclip_cold_email_session_id";
 
       if (!statusNode || !outputNode || !button || !emailNode) {
         return;
@@ -759,11 +836,54 @@ function renderLandingPage(
         statusNode.textContent = "Free limit reached. " + msg;
       }
 
+      function normalizeAttribution(value, maxLength) {
+        if (typeof value !== "string") return null;
+        var trimmed = value.trim();
+        if (!trimmed) return null;
+        return trimmed.slice(0, maxLength);
+      }
+
+      function getOrCreateSessionId() {
+        var fromWindow = normalizeAttribution(window.name, 120);
+        if (fromWindow) return fromWindow;
+        try {
+          var existing = normalizeAttribution(localStorage.getItem(SESSION_STORAGE_KEY), 120);
+          if (existing) {
+            window.name = existing;
+            return existing;
+          }
+          var created = "ce_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+          localStorage.setItem(SESSION_STORAGE_KEY, created);
+          window.name = created;
+          return created;
+        } catch (_err) {
+          return "ce_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+        }
+      }
+
+      function readAttribution() {
+        var params = new URLSearchParams(window.location.search || "");
+        return {
+          utm_source: normalizeAttribution(params.get("utm_source") || params.get("utmSource"), 80),
+          utm_campaign: normalizeAttribution(params.get("utm_campaign") || params.get("utmCampaign"), 120),
+          referrer: normalizeAttribution(document.referrer, 1000),
+          session_id: getOrCreateSessionId(),
+        };
+      }
+
+      var attribution = readAttribution();
+
       async function requestCheckoutUrl(emailValue) {
         var response = await fetch("/api/cold-email/checkout", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: emailValue }),
+          body: JSON.stringify({
+            email: emailValue,
+            utm_source: attribution.utm_source,
+            utm_campaign: attribution.utm_campaign,
+            referrer: attribution.referrer,
+            session_id: attribution.session_id,
+          }),
         });
         var data = await response.json().catch(function () { return {}; });
         if (!response.ok || !data || !data.checkoutUrl) {
@@ -813,7 +933,13 @@ function renderLandingPage(
       fetch("/api/cold-email/track", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ event: "landing_view" }),
+        body: JSON.stringify({
+          event: "landing_view",
+          utm_source: attribution.utm_source,
+          utm_campaign: attribution.utm_campaign,
+          referrer: attribution.referrer,
+          session_id: attribution.session_id,
+        }),
       }).catch(function () {});
 
       if (initialEmail) {
@@ -845,6 +971,10 @@ function renderLandingPage(
           product: text("product"),
           targetAudience: text("audience"),
           keyBenefit: text("benefit"),
+          utm_source: attribution.utm_source,
+          utm_campaign: attribution.utm_campaign,
+          referrer: attribution.referrer,
+          session_id: attribution.session_id,
         };
 
         if (!payload.email || !payload.product || !payload.targetAudience || !payload.keyBenefit) {
@@ -920,9 +1050,43 @@ async function createCheckoutForEmail(args: {
   db: Db;
   email: string;
   baseUrl: string;
+  attribution?: AttributionContext;
 }): Promise<{ checkoutUrl: string | null; companyId: string | null }> {
-  const companyId = await resolveTelemetryCompanyIdForDb(args.db);
-  const checkoutUrl = await resolveCheckoutUrl(args.email, companyId, args.baseUrl);
+  const telemetryCompanyId = await resolveTelemetryCompanyIdForDb(args.db);
+  const signup = await args.db
+    .select({
+      id: waitlistSignups.id,
+      companyId: waitlistSignups.companyId,
+      metadata: waitlistSignups.metadata,
+    })
+    .from(waitlistSignups)
+    .where(eq(waitlistSignups.email, args.email))
+    .orderBy(desc(waitlistSignups.createdAt))
+    .limit(1)
+    .then((rows) => rows[0] ?? null)
+    .catch(() => null);
+
+  const mergedAttribution = mergeAttribution(
+    args.attribution ?? EMPTY_ATTRIBUTION,
+    readAttributionFromUnknown(signup?.metadata),
+  );
+
+  if (signup) {
+    const nextMetadata = {
+      ...asMetadata(signup.metadata),
+      ...attributionToMetadata(mergedAttribution),
+    };
+
+    await args.db
+      .update(waitlistSignups)
+      .set({ metadata: nextMetadata })
+      .where(eq(waitlistSignups.id, signup.id))
+      .catch(() => undefined);
+  }
+
+  const companyId = telemetryCompanyId ?? signup?.companyId ?? null;
+
+  const checkoutUrl = await resolveCheckoutUrl(args.email, companyId, args.baseUrl, mergedAttribution);
   return { checkoutUrl, companyId };
 }
 
@@ -938,6 +1102,7 @@ export function coldEmailRoutes(db: Db) {
     });
 
     const companyId = await resolveTelemetryCompanyIdForDb(db);
+    const attribution = readAttributionFromRequest(req);
     if (companyId) {
       await db.insert(activityLog).values({
         companyId,
@@ -948,10 +1113,11 @@ export function coldEmailRoutes(db: Db) {
         action: "cold_email.landing.viewed",
         entityType: "company",
         entityId: companyId,
-        details: {
+        details: compactJsonRecord({
           source: "public_landing",
           host: req.header("host") ?? null,
-        },
+          ...attributionToMetadata(attribution),
+        }),
       }).catch(() => undefined);
     }
 
@@ -959,6 +1125,7 @@ export function coldEmailRoutes(db: Db) {
       source: "public_landing",
       host: req.header("host") ?? null,
       distinctId: req.ip,
+      ...attributionToMetadata(attribution),
     });
 
     if (companyId) {
@@ -972,6 +1139,7 @@ export function coldEmailRoutes(db: Db) {
         metadata: {
           source: "cold_email_landing",
           host: req.header("host") ?? null,
+          ...attributionToMetadata(attribution),
         },
       }).catch(() => undefined);
     }
@@ -1038,9 +1206,31 @@ export function coldEmailRoutes(db: Db) {
 
   router.post("/cold-email/track", async (req, res) => {
     const event = normalizeOptionalString(req.body?.event) ?? "unknown";
+    const attribution = readAttributionFromRequest(req);
+    const companyId = await resolveTelemetryCompanyIdForDb(db);
+
+    if (companyId) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "cold-email-track",
+        agentId: null,
+        runId: null,
+        action: "cold_email.landing.tracked",
+        entityType: "company",
+        entityId: companyId,
+        details: compactJsonRecord({
+          source: "landing_client",
+          event,
+          ...attributionToMetadata(attribution),
+        }),
+      }).catch(() => undefined);
+    }
+
     await capturePosthogEvent(`cold_email_${event}`, {
       source: "landing_client",
       distinctId: req.ip,
+      ...attributionToMetadata(attribution),
     });
     res.json({ success: true });
   });
@@ -1058,11 +1248,13 @@ export function coldEmailRoutes(db: Db) {
       forwardedHost: req.header("x-forwarded-host"),
       forwardedProto: req.header("x-forwarded-proto"),
     });
+    const attribution = readAttributionFromRequest(req);
 
     const { checkoutUrl, companyId } = await createCheckoutForEmail({
       db,
       email,
       baseUrl,
+      attribution,
     });
     if (!checkoutUrl) {
       res.status(500).json({
@@ -1079,6 +1271,7 @@ export function coldEmailRoutes(db: Db) {
       companyId,
       checkout: checkoutUrl,
       entry_point: "cold_email_checkout",
+      ...attributionToMetadata(attribution),
     });
 
     if (companyId) {
@@ -1091,7 +1284,11 @@ export function coldEmailRoutes(db: Db) {
         action: "cold_email.checkout.started",
         entityType: "company",
         entityId: companyId,
-        details: { email, checkoutUrl },
+        details: compactJsonRecord({
+          email,
+          checkoutUrl,
+          ...attributionToMetadata(attribution),
+        }),
       }).catch(() => undefined);
     }
 
@@ -1111,11 +1308,13 @@ export function coldEmailRoutes(db: Db) {
       forwardedHost: req.header("x-forwarded-host"),
       forwardedProto: req.header("x-forwarded-proto"),
     });
+    const attribution = readAttributionFromRequest(req);
 
     const { checkoutUrl } = await createCheckoutForEmail({
       db,
       email,
       baseUrl,
+      attribution,
     });
 
     if (!checkoutUrl) {
@@ -1158,6 +1357,7 @@ export function coldEmailRoutes(db: Db) {
       const companyId = await resolveTelemetryCompanyIdForDb(db);
       const source = "cold_email_tool";
       const now = new Date();
+      const requestAttribution = readAttributionFromRequest(req);
 
       await db
         .insert(waitlistSignups)
@@ -1165,10 +1365,11 @@ export function coldEmailRoutes(db: Db) {
           email,
           companyId,
           source,
-          metadata: {
+          metadata: compactJsonRecord({
             coldEmailGenerationCount: 0,
+            ...attributionToMetadata(requestAttribution),
             ...withColdEmailEntitlement({}, false),
-          },
+          }),
           createdAt: now,
         })
         .onConflictDoNothing({ target: waitlistSignups.email });
@@ -1187,18 +1388,20 @@ export function coldEmailRoutes(db: Db) {
       }
 
       const metadata = asMetadata(signup.metadata);
+      const attribution = mergeAttribution(requestAttribution, readAttributionFromUnknown(metadata));
       const freeLimit = getFreeLimit();
       const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
       const paid = isColdEmailPaid(metadata);
 
       if (!paid && generationCount >= freeLimit) {
-        const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl);
+        const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl, attribution);
 
         await capturePosthogEvent("cold_email_paywall_hit", {
           source,
           email,
           companyId,
           generationCount,
+          ...attributionToMetadata(attribution),
         });
 
         if (companyId) {
@@ -1216,6 +1419,7 @@ export function coldEmailRoutes(db: Db) {
               generationCount,
               freeLimit,
               checkoutUrl,
+              ...attributionToMetadata(attribution),
             },
           }).catch(() => undefined);
         }
@@ -1237,6 +1441,7 @@ export function coldEmailRoutes(db: Db) {
       const nextMetadata: JsonRecord = {
         ...withColdEmailEntitlement(metadata, paid),
         source,
+        ...attributionToMetadata(attribution),
         coldEmailGenerationCount: updatedGenerationCount,
         coldEmailLastGeneratedAt: now.toISOString(),
         coldEmailLastInput: {
@@ -1256,7 +1461,7 @@ export function coldEmailRoutes(db: Db) {
         })
         .where(eq(waitlistSignups.id, signup.id));
 
-      const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl);
+      const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl, attribution);
       const upgradeTarget = checkoutUrl ?? `${baseUrl}/api/cold-email`;
 
       const sentResultEmail = await sendResendEmail({
@@ -1284,6 +1489,7 @@ export function coldEmailRoutes(db: Db) {
         generationCount: updatedGenerationCount,
         paid,
         resultEmailSent: sentResultEmail,
+        ...attributionToMetadata(attribution),
       });
 
       if (companyId) {
@@ -1304,6 +1510,7 @@ export function coldEmailRoutes(db: Db) {
             paid,
             generationCount: updatedGenerationCount,
             resultEmailSent: sentResultEmail,
+            ...attributionToMetadata(attribution),
           },
         }).catch(() => undefined);
 
@@ -1320,6 +1527,7 @@ export function coldEmailRoutes(db: Db) {
               source: "cold_email_generation",
               email,
               paid,
+              ...attributionToMetadata(attribution),
             },
           }).catch(() => undefined);
         }
