@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
-import { companies, waitlistSignups, activityLog } from "@paperclipai/db";
-import { eq, sql, desc } from "@paperclipai/db";
+import { companies, waitlistSignups, activityLog, aiLearningRecords } from "@paperclipai/db";
+import { and, eq, sql, desc } from "@paperclipai/db";
 import pino from "pino";
 import { eventBus } from "../events/eventBus.js";
 import { recordSystemMetric } from "../ai/feedback/metricsEngine.js";
@@ -19,10 +19,12 @@ function usesCompletionTokens(model: string): boolean {
 }
 
 type Channel = "reddit" | "twitter";
+type RedditFormat = "story" | "tool" | "question";
 
 const SUBREDDITS = [
-  "SideProject",
   "startups",
+  "SideProject",
+  "Entrepreneur",
   "EntrepreneurRideAlong",
   "indiehackers",
   "microsaas",
@@ -136,6 +138,25 @@ interface PostResult {
   retries: number;
   upvotes?: number;
   comments?: number;
+}
+
+interface RedditVariantCandidate {
+  format: RedditFormat;
+  title: string;
+  body: string;
+  hook: string;
+  score: number;
+  scoreReason: string;
+}
+
+interface RedditPostContent {
+  title: string;
+  body: string;
+  subreddit: string;
+  format: RedditFormat;
+  hook: string;
+  selectionReason: string;
+  variantScores: Array<{ format: RedditFormat; score: number; reason: string }>;
 }
 
 interface TrafficCycleSummary {
@@ -327,23 +348,248 @@ async function generatePostContent(
   db: Db,
   subreddit: string,
   baseUrl: string,
-): Promise<{ title: string; body: string; subreddit: string }> {
+): Promise<RedditPostContent> {
   const stats = await getSystemStats(db);
-  const template = POST_TEMPLATES[Math.floor(Math.random() * POST_TEMPLATES.length)]!;
   const trackingLink = `${baseUrl.replace(/\/$/, "")}/api/cold-email?utm_source=reddit&utm_campaign=auto_loop`;
 
-  const body = template.bodyTemplate
-    .replace(/\{signups\}/g, String(stats.signups))
-    .replace(/\{revenue\}/g, stats.revenue)
-    .replace(/\{conversion_rate\}/g, stats.conversionRate)
-    .replace(/\{payment_conv_rate\}/g, stats.paymentConvRate)
-    .replace(/\{issue_count\}/g, String(stats.issueCount))
-    .replace(/\{tracking_link\}/g, trackingLink)
-    .replace(/\{name\}/g, "Founder");
+  const companyId = getTelemetryCompanyId();
+  const historicalFormatScores = await getRedditHistoricalFormatScores(db, companyId);
+  const candidates = await buildRedditVariants(db, subreddit, trackingLink, stats);
+  const llmScores = await scoreRedditVariantsWithLLM(subreddit, candidates);
 
-  const llmTitle = await generateLLMTitle(body, "reddit", subreddit, db);
+  let best = candidates[0]!;
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i]!;
+    const historical = historicalFormatScores[candidate.format] ?? 0;
+    const llmScore = llmScores?.[i]?.score ?? 50;
+    const merged = historical * 0.6 + llmScore * 0.4;
+    candidate.score = merged;
+    candidate.scoreReason = `historical=${historical.toFixed(1)}, llm=${llmScore.toFixed(1)}${llmScores?.[i]?.reason ? `, llmReason=${llmScores[i]!.reason}` : ""}`;
+    if (merged > best.score) {
+      best = candidate;
+    }
+  }
 
-  return { title: llmTitle ?? template.titleTemplate, body, subreddit };
+  return {
+    title: best.title,
+    body: best.body,
+    subreddit,
+    format: best.format,
+    hook: best.hook,
+    selectionReason: best.scoreReason,
+    variantScores: candidates.map((candidate) => ({
+      format: candidate.format,
+      score: Number(candidate.score.toFixed(2)),
+      reason: candidate.scoreReason,
+    })),
+  };
+}
+
+function getRedditBodyByFormat(
+  format: RedditFormat,
+  trackingLink: string,
+  stats: {
+    signups: number;
+    revenue: string;
+    conversionRate: string;
+    paymentConvRate: string;
+    issueCount: number;
+  },
+): string {
+  if (format === "story") {
+    return `I spent the last few weeks trying to automate growth loops for a tiny startup and finally got a version that does real work without daily babysitting.
+
+Current snapshot:
+- ${stats.signups} signups
+- ${stats.revenue} revenue
+- ${stats.conversionRate}% conversion
+
+Big lesson: autonomous systems only work when attribution and payment loops are wired first.
+
+If anyone is building similar systems, what bottleneck hurt you most: traffic, conversion, or monetization?
+
+${trackingLink}`;
+  }
+
+  if (format === "tool") {
+    return `Built a cold-email generation workflow that writes outbound drafts from product + ICP + benefit in seconds.
+
+What it currently includes:
+- Soft paywall before hard lock
+- Attribution on every traffic link
+- Follow-up sequence automation
+- Decision feedback from revenue metrics
+
+Live metrics so far: ${stats.signups} signups, ${stats.revenue} revenue, payment conversion ${stats.paymentConvRate}%.
+
+If you want to test the flow, here it is: ${trackingLink}`;
+  }
+
+  return `Question for founders shipping outbound systems:
+
+If you had to choose one growth priority for the next 7 days, which would you pick and why?
+1) More traffic
+2) Higher signup conversion
+3) Better payment conversion
+
+We track this with an autonomous decision loop and right now it generated ${stats.issueCount} improvement tasks based on real metrics.
+
+Context: ${stats.signups} signups, ${stats.revenue} revenue.
+
+${trackingLink}`;
+}
+
+function extractHookFromBody(body: string): string {
+  const firstLine = body
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0) ?? "";
+  return firstLine.slice(0, 140);
+}
+
+async function buildRedditVariants(
+  db: Db,
+  subreddit: string,
+  trackingLink: string,
+  stats: {
+    signups: number;
+    revenue: string;
+    conversionRate: string;
+    paymentConvRate: string;
+    issueCount: number;
+  },
+): Promise<RedditVariantCandidate[]> {
+  const variants: RedditVariantCandidate[] = [];
+
+  for (const format of ["story", "tool", "question"] as const) {
+    const body = getRedditBodyByFormat(format, trackingLink, stats);
+    const llmTitle = await generateLLMTitle(body, "reddit", subreddit, db);
+    const fallbackTitle =
+      format === "story"
+        ? "I finally got an autonomous startup loop working - what I learned"
+        : format === "tool"
+        ? "Built a cold-email workflow that now drives signups automatically"
+        : "Founders: traffic vs conversion vs monetization - what should win this week?";
+
+    variants.push({
+      format,
+      title: llmTitle ?? fallbackTitle,
+      body,
+      hook: extractHookFromBody(body),
+      score: 0,
+      scoreReason: "unscored",
+    });
+  }
+
+  return variants;
+}
+
+async function scoreRedditVariantsWithLLM(
+  subreddit: string,
+  candidates: RedditVariantCandidate[],
+): Promise<Array<{ score: number; reason: string }> | null> {
+  const apiKey = (process.env.OPENAI_API_KEY ?? "").trim();
+  if (!apiKey) return null;
+
+  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
+  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+
+  const prompt = candidates.map((candidate, index) => (
+    `${index}. format=${candidate.format}\nTITLE: ${candidate.title}\nBODY: ${candidate.body.slice(0, 600)}`
+  )).join("\n\n---\n\n");
+
+  try {
+    const requestBody: Record<string, unknown> = {
+      model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: `You are an expert Reddit growth editor for r/${subreddit}. Score each candidate for authentic engagement and conversion intent. Return strict JSON: {"scores":[{"index":0,"score":0-100,"reason":"..."}]}`,
+        },
+        { role: "user", content: prompt },
+      ],
+      response_format: { type: "json_object" },
+    };
+
+    if (usesCompletionTokens(model)) {
+      requestBody.max_completion_tokens = 300;
+    } else {
+      requestBody.max_tokens = 300;
+    }
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: getLLMHeaders(),
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as Record<string, unknown>;
+    const choices = payload.choices as Array<{ message?: { content?: string } }> | undefined;
+    const content = choices?.[0]?.message?.content?.trim();
+    if (!content) return null;
+
+    const parsed = JSON.parse(content) as { scores?: Array<{ index?: number; score?: number; reason?: string }> };
+    if (!Array.isArray(parsed.scores)) return null;
+
+    const byIndex = new Map<number, { score: number; reason: string }>();
+    for (const row of parsed.scores) {
+      if (typeof row.index !== "number") continue;
+      const score = Number(row.score ?? 50);
+      byIndex.set(row.index, {
+        score: Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : 50,
+        reason: String(row.reason ?? "LLM score"),
+      });
+    }
+
+    return candidates.map((_, index) => byIndex.get(index) ?? { score: 50, reason: "LLM fallback score" });
+  } catch {
+    return null;
+  }
+}
+
+async function getRedditHistoricalFormatScores(
+  db: Db,
+  companyId: string | null,
+): Promise<Record<RedditFormat, number>> {
+  const scores: Record<RedditFormat, number> = {
+    story: 40,
+    tool: 40,
+    question: 40,
+  };
+  if (!companyId) return scores;
+
+  const rows = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "distribution.reddit.posted")))
+    .orderBy(desc(activityLog.createdAt))
+    .limit(60)
+    .catch(() => []);
+
+  const aggregate = new Map<RedditFormat, { total: number; count: number }>();
+
+  for (const row of rows) {
+    const details = (row.details ?? {}) as Record<string, unknown>;
+    const formatRaw = String(details.format ?? "story").toLowerCase();
+    const format: RedditFormat = formatRaw === "tool" || formatRaw === "question" ? formatRaw : "story";
+    const upvotes = Number(details.upvotes ?? 0);
+    const comments = Number(details.comments ?? 0);
+    const conversion = Number(details.conversion ?? details.conversions ?? 0);
+    const score = Math.max(0, upvotes * 0.7 + comments * 1.0 + conversion * 8);
+    const current = aggregate.get(format) ?? { total: 0, count: 0 };
+    aggregate.set(format, { total: current.total + score, count: current.count + 1 });
+  }
+
+  for (const format of ["story", "tool", "question"] as const) {
+    const current = aggregate.get(format);
+    if (!current || current.count === 0) continue;
+    scores[format] = Math.min(100, Math.max(10, current.total / current.count));
+  }
+
+  return scores;
 }
 
 async function generateTweetContent(
@@ -391,7 +637,7 @@ async function withRetry<T>(
 
 async function postToReddit(
   ctx: TrafficLoopContext,
-  content: { title: string; body: string; subreddit: string },
+  content: RedditPostContent,
 ): Promise<PostResult> {
   const username = (process.env.REDDIT_USERNAME ?? "").trim();
   const existingStoragePath = resolveExistingRedditStorageStatePath();
@@ -467,9 +713,12 @@ async function postToReddit(
             channel: "reddit",
             subreddit: content.subreddit,
             title: content.title,
+            hook: content.hook,
+            format: content.format,
             postUrl: result.postUrl ?? null,
             upvotes: result.upvotes ?? 0,
             comments: result.comments ?? 0,
+            conversion: 0,
           },
         });
         await ctx.db.insert(activityLog).values({
@@ -484,17 +733,47 @@ async function postToReddit(
           details: {
             subreddit: content.subreddit,
             title: content.title,
+            hook: content.hook,
+            format: content.format,
+            selectionReason: content.selectionReason,
+            variantScores: content.variantScores,
             postUrl: result.postUrl ?? null,
             method: "playwright",
             retries: result.retries,
             upvotes: result.upvotes ?? 0,
             comments: result.comments ?? 0,
+            conversion: 0,
           },
         });
+
+        await ctx.db.insert(aiLearningRecords).values({
+          companyId,
+          recordType: "insight",
+          category: "performance",
+          summary: `Reddit ${content.format} post performance: ${content.title.slice(0, 120)}`,
+          details: {
+            channel: "reddit",
+            subreddit: content.subreddit,
+            title: content.title,
+            hook: content.hook,
+            format: content.format,
+            upvotes: result.upvotes ?? 0,
+            comments: result.comments ?? 0,
+            conversion: 0,
+            postUrl: result.postUrl ?? null,
+          },
+          scores: {
+            engagement: Number((((result.upvotes ?? 0) * 0.7) + ((result.comments ?? 0) * 1.0)).toFixed(2)),
+          },
+        }).catch(() => undefined);
+
         await recordContentPerformance(ctx.db, companyId, "reddit", content.title, true, {
           subreddit: content.subreddit,
+          format: content.format,
+          hook: content.hook,
           upvotes: result.upvotes ?? 0,
           comments: result.comments ?? 0,
+          conversion: 0,
         });
       }
     } else {
@@ -516,7 +795,12 @@ async function postToReddit(
 
     const companyId = getTelemetryCompanyId();
     if (companyId) {
-      await recordContentPerformance(ctx.db, companyId, "reddit", content.title, false, { error: message });
+      await recordContentPerformance(ctx.db, companyId, "reddit", content.title, false, {
+        error: message,
+        format: content.format,
+        hook: content.hook,
+        conversion: 0,
+      });
     }
 
     return { posted: false, channel: "reddit", method: "playwright", error: message, retries: 2 };

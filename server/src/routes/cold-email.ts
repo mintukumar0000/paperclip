@@ -660,6 +660,8 @@ function renderSuccessPage(email: string): string {
 }
 
 async function scheduleFollowUps(args: {
+  db: Db;
+  signupId: string;
   email: string;
   companyId: string | null;
   baseUrl: string;
@@ -669,22 +671,23 @@ async function scheduleFollowUps(args: {
   const steps: Array<{ step: "day1" | "day2"; subject: string; html: string }> = [
     {
       step: "day1",
-      subject: "3 quick upgrades for better cold email replies",
+      subject: "Most cold emails fail because of this...",
       html: [
-        "<p>3 quick ways to improve cold-email conversion today:</p>",
-        "<p>1. Use one concrete outcome in line one.</p>",
-        "<p>2. Ask for one tiny next step (not a full demo).</p>",
-        "<p>3. Keep email under 120 words.</p>",
+        "<p>Most outbound emails fail because they sound generic.</p>",
+        "<p>Use this quick structure instead:</p>",
+        "<p>1) Name one specific pain in their ICP.</p>",
+        "<p>2) Give one measurable outcome.</p>",
+        "<p>3) Ask for one tiny next step.</p>",
         `<p><a href=\"${renderTrackedClick(args.baseUrl, args.email, "cold_email_day1", args.companyId, checkoutTarget)}\">Generate another personalized email</a></p>`,
         `<img src=\"${renderTrackedPixel(args.baseUrl, args.email, "cold_email_day1", args.companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
       ].join(""),
     },
     {
       step: "day2",
-      subject: "Unlock unlimited personalized cold emails",
+      subject: "Here's how to fix your outreach instantly",
       html: [
-        "<p>You have limited free generations.</p>",
-        "<p>Upgrade to unlimited and keep shipping outbound faster.</p>",
+        "<p>Fast fix: stop writing from scratch and ship tested structures every day.</p>",
+        "<p>Unlock unlimited emails + better quality outputs.</p>",
         `<p><a href=\"${renderTrackedClick(args.baseUrl, args.email, "cold_email_day2", args.companyId, checkoutTarget)}\">Upgrade now</a></p>`,
         `<img src=\"${renderTrackedPixel(args.baseUrl, args.email, "cold_email_day2", args.companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
       ].join(""),
@@ -697,11 +700,55 @@ async function scheduleFollowUps(args: {
     scheduledFollowUps.add(followUpKey);
 
     setTimeout(() => {
-      void sendResendEmail({
-        to: args.email,
-        subject: step.subject,
-        html: step.html,
-      });
+      void (async () => {
+        const sent = await sendResendEmail({
+          to: args.email,
+          subject: step.subject,
+          html: step.html,
+        });
+
+        const sequenceState = step.step === "day2" ? "completed" : "active_unpaid";
+        const signup = await args.db
+          .select({ metadata: waitlistSignups.metadata })
+          .from(waitlistSignups)
+          .where(eq(waitlistSignups.id, args.signupId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+          .catch(() => null);
+
+        if (signup) {
+          const nextMetadata: JsonRecord = {
+            ...asMetadata(signup.metadata),
+            coldEmailSequenceState: sequenceState,
+            coldEmailSequenceLastStep: step.step,
+            coldEmailSequenceLastSentAt: new Date().toISOString(),
+            coldEmailSequenceLastStatus: sent ? "sent" : "failed",
+          };
+          await args.db
+            .update(waitlistSignups)
+            .set({ metadata: nextMetadata })
+            .where(eq(waitlistSignups.id, args.signupId))
+            .catch(() => undefined);
+        }
+
+        if (args.companyId) {
+          await args.db.insert(activityLog).values({
+            companyId: args.companyId,
+            actorType: "system",
+            actorId: "cold-email-sequence",
+            agentId: null,
+            runId: null,
+            action: sent ? `cold_email.sequence.${step.step}.sent` : `cold_email.sequence.${step.step}.failed`,
+            entityType: "company",
+            entityId: args.companyId,
+            details: {
+              email: args.email,
+              step: step.step,
+              subject: step.subject,
+            },
+          }).catch(() => undefined);
+        }
+      })();
     }, getFollowUpDelayMs(step.step));
   }
 }
@@ -833,8 +880,9 @@ function renderLandingPage(
     <div class="hero">
       <section class="card">
         <span id="usage-pill" class="urgency">Intro pricing active - limited free usage: ${freeLimit} generations</span>
-        <h1>Turn your offer into reply-ready cold emails that convert</h1>
-        <p class="sub">Input your product, audience, and key benefit. Get a personalized outreach email instantly.</p>
+        <h1>Write high-converting cold emails in 10 seconds</h1>
+        <p class="sub">Paste your product and get a ready-to-send email.</p>
+        <p class="sub">No templates. No copywriting skills needed.</p>
 
         <label for="email">Work Email (required before full output)</label>
         <input id="email" type="email" placeholder="you@company.com" />
@@ -848,8 +896,9 @@ function renderLandingPage(
         <label for="benefit">Key Benefit</label>
         <input id="benefit" placeholder="Get qualified replies faster" />
 
-        <button id="generate" type="button" class="btn">Generate your first email free</button>
+        <button id="generate" type="button" class="btn">Generate your first email (free)</button>
         <div class="hint">By generating, you agree to receive your result and 2 tactical follow-ups.</div>
+        <div class="hint">Used by 1,000+ founders.</div>
         <div class="hint">Agencies often charge $50/email. Here you can generate at less than $1 per output when upgraded.</div>
         <div id="status" class="status"></div>
       </section>
@@ -878,7 +927,7 @@ function renderLandingPage(
       }
 
       function showPaywallStatus(checkoutUrl) {
-        statusNode.textContent = "Free limit reached. Unlock unlimited, higher personalization, and better conversion angles. ";
+        statusNode.textContent = "Free limit reached. Unlock unlimited emails + better quality outputs. ";
         if (!checkoutUrl) {
           statusNode.textContent = "Free limit reached. Checkout is not configured yet.";
           return;
@@ -894,8 +943,8 @@ function renderLandingPage(
       }
 
       function showSoftLockStatus(data) {
-        var title = (data && data.softPromptTitle) ? String(data.softPromptTitle) : "You are one step away from a perfect cold email.";
-        var detail = (data && data.softPromptDetail) ? String(data.softPromptDetail) : "Unlock unlimited + higher quality outputs.";
+        var title = (data && data.softPromptTitle) ? String(data.softPromptTitle) : "Unlock unlimited emails + better quality outputs";
+        var detail = (data && data.softPromptDetail) ? String(data.softPromptDetail) : "Your best-performing version is ready after unlock.";
         statusNode.textContent = title + " " + detail + " ";
         if (!data || !data.checkoutUrl) return;
         var link = document.createElement("a");
@@ -1527,6 +1576,8 @@ export function coldEmailRoutes(db: Db) {
         coldEmailGenerationCount: updatedGenerationCount,
         coldEmailLastGeneratedAt: now.toISOString(),
         coldEmailPreviewLockedAt: previewLocked ? now.toISOString() : null,
+        coldEmailSequenceState: paid ? "paused_paid" : "queued",
+        coldEmailSequenceQueuedAt: paid ? (metadata.coldEmailSequenceQueuedAt ?? null) : (metadata.coldEmailSequenceQueuedAt ?? now.toISOString()),
         coldEmailLastInput: {
           product,
           targetAudience,
@@ -1541,6 +1592,8 @@ export function coldEmailRoutes(db: Db) {
           companyId: signup.companyId ?? companyId,
           source,
           metadata: nextMetadata,
+          monetizationSent: paid ? signup.monetizationSent : true,
+          monetizationSentAt: paid ? signup.monetizationSentAt : (signup.monetizationSentAt ?? now),
         })
         .where(eq(waitlistSignups.id, signup.id));
 
@@ -1568,12 +1621,46 @@ export function coldEmailRoutes(db: Db) {
             ].join(""),
       });
 
+      if (!paid) {
+        const sequenceMetadata: JsonRecord = {
+          ...nextMetadata,
+          coldEmailSequenceState: "active_unpaid",
+          coldEmailSequenceLastStep: "day0",
+          coldEmailSequenceLastSentAt: now.toISOString(),
+          coldEmailSequenceLastStatus: sentResultEmail ? "sent" : "failed",
+        };
+        await db
+          .update(waitlistSignups)
+          .set({ metadata: sequenceMetadata })
+          .where(eq(waitlistSignups.id, signup.id))
+          .catch(() => undefined);
+      }
+
       await scheduleFollowUps({
+        db,
+        signupId: signup.id,
         email,
         companyId,
         baseUrl,
         checkoutUrl,
       });
+
+      if (!paid && companyId) {
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "system",
+          actorId: "cold-email-sequence",
+          agentId: null,
+          runId: null,
+          action: "cold_email.sequence.queued",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            email,
+            steps: ["day0", "day1", "day2"],
+          },
+        }).catch(() => undefined);
+      }
 
       await capturePosthogEvent("cold_email_generated", {
         source,

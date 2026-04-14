@@ -246,6 +246,55 @@ function mapFeedbackToDecisionActions(
     });
   }
 
+  const trafficScaleThreshold = Number(process.env.DECISION_TRAFFIC_SCALE_THRESHOLD ?? 120);
+  if (metrics.sample_count >= 3 && metrics.traffic < (Number.isFinite(trafficScaleThreshold) ? trafficScaleThreshold : 120)) {
+    actions.push({
+      type: "create_issue",
+      key: "reddit_autopost_boost",
+      reason: `Traffic ${metrics.traffic} is below threshold ${Number.isFinite(trafficScaleThreshold) ? trafficScaleThreshold : 120}; increase autonomous Reddit distribution.`,
+      payload: {
+        title: "Boost autonomous Reddit posting on low traffic",
+        description:
+          `Traffic is ${metrics.traffic}. Generate multiple Reddit post variants, select the best-performing angle, and publish to core founder subreddits to recover top-of-funnel volume.`,
+        priority: "high",
+      },
+    });
+  }
+
+  // Full-autonomy thresholds in cents: aggressively scale only when RPV is strong,
+  // otherwise force conversion improvements first.
+  if (metrics.sample_count >= 3 && metrics.traffic >= 20) {
+    const rpvCents = metrics.revenue_per_visit;
+
+    if (rpvCents > 50) {
+      actions.push({
+        type: "create_issue",
+        key: "auto_scale_distribution_aggressive",
+        reason: `RPV is healthy (${rpvCents.toFixed(2)} cents). Scale traffic volume now.`,
+        payload: {
+          title: "Aggressively scale distribution on high-RPV funnel",
+          description:
+            `Revenue per visit is ${rpvCents.toFixed(2)} cents (>50). Increase Reddit/Twitter cadence and expand winning content formats while monitoring reliability and CAC drift.`,
+          priority: "urgent",
+        },
+      });
+    }
+
+    if (rpvCents < 10) {
+      actions.push({
+        type: "create_issue",
+        key: "rpv_conversion_focus",
+        reason: `RPV is weak (${rpvCents.toFixed(2)} cents). Improve conversion before adding traffic.`,
+        payload: {
+          title: "Focus conversion optimization before traffic scaling",
+          description:
+            `Revenue per visit is ${rpvCents.toFixed(2)} cents (<10). Prioritize landing copy, soft-paywall framing, and email sequence optimization before increasing distribution volume.`,
+          priority: "urgent",
+        },
+      });
+    }
+  }
+
   // Explicit RPV thresholds for deterministic improve/scale routing.
   if (metrics.sample_count >= 3 && metrics.traffic >= 10) {
     const visitors = Math.max(1, metrics.traffic);
@@ -580,26 +629,74 @@ async function executeDirectAction(
 ): Promise<{ attempted: boolean; success: boolean; details?: Record<string, unknown> }> {
   const key = action.key;
 
-  if (key === "increase_content_output" || key === "auto_scale_distribution") {
+  if (key === "increase_content_output" || key === "auto_scale_distribution" || key === "auto_scale_distribution_aggressive" || key === "reddit_autopost_boost") {
     try {
       const { _runTrafficCycleForTest } = await import("../../core/trafficLoop.js");
       const baseUrl = (
         process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ??
         "http://localhost:3100"
       ).trim();
+      const cycles = key === "auto_scale_distribution_aggressive" ? 2 : 1;
       logger.info({ companyId, key }, "Decision → Action: triggering traffic loop cycle");
-      const summary = await _runTrafficCycleForTest({ db, baseUrl });
+      let successCount = 0;
+      let failCount = 0;
+      let lastError: string | null = null;
+
+      for (let index = 0; index < cycles; index++) {
+        const summary = await _runTrafficCycleForTest({ db, baseUrl });
+        successCount += summary.successCount;
+        failCount += summary.failCount;
+        if (summary.error) {
+          lastError = summary.error;
+        }
+      }
+
       return {
         attempted: true,
-        success: summary.successCount > 0,
+        success: successCount > 0,
         details: {
-          successCount: summary.successCount,
-          failCount: summary.failCount,
-          error: summary.error ?? null,
+          successCount,
+          failCount,
+          cycles,
+          error: lastError,
         },
       };
     } catch (err) {
       logger.warn({ err, key }, "Direct action execution failed for traffic trigger");
+      return {
+        attempted: true,
+        success: false,
+        details: {
+          error: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
+  }
+
+  if (key === "rpv_conversion_focus") {
+    try {
+      const { generateLandingVariants } = await import("../distribution/landingVariants.js");
+      const { runEmailSequenceCycle } = await import("../distribution/emailSequence.js");
+
+      const variants = await generateLandingVariants(db, companyId);
+      await runEmailSequenceCycle(db);
+
+      eventBus.publish("decision.direct_action", {
+        companyId,
+        actionKey: key,
+        actionType: "conversion_focus",
+        timestamp: new Date().toISOString(),
+      });
+
+      return {
+        attempted: true,
+        success: variants.length > 0,
+        details: {
+          variantCount: variants.length,
+          emailSequenceTriggered: true,
+        },
+      };
+    } catch (err) {
       return {
         attempted: true,
         success: false,
