@@ -446,6 +446,36 @@ async function postReplyViaPlaywright(
   }
 }
 
+async function postReplyViaApi(
+  comment: RedditComment,
+  replyText: string,
+): Promise<boolean> {
+  const token = (process.env.REDDIT_ACCESS_TOKEN ?? "").trim();
+  if (!token) return false;
+
+  try {
+    const response = await fetch("https://oauth.reddit.com/api/comment", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "paperclip-agent/1.0",
+      },
+      body: new URLSearchParams({
+        api_type: "json",
+        thing_id: `t1_${comment.id}`,
+        text: replyText,
+      }).toString(),
+    });
+
+    const payload = await response.json().catch(() => ({} as Record<string, unknown>));
+    const errors = ((payload as { json?: { errors?: unknown[] } }).json?.errors ?? []) as unknown[];
+    return response.ok && errors.length === 0;
+  } catch {
+    return false;
+  }
+}
+
 async function processComment(
   db: Db,
   comment: RedditComment,
@@ -459,7 +489,15 @@ async function processComment(
     return { commentId: comment.id, replied: false, error: "LLM generation failed" };
   }
 
-  const posted = await postReplyViaPlaywright(comment, replyText);
+  let postMethod: "playwright" | "oauth_api" | "none" = "none";
+  let posted = await postReplyViaPlaywright(comment, replyText);
+  if (posted) {
+    postMethod = "playwright";
+  }
+  if (!posted) {
+    posted = await postReplyViaApi(comment, replyText);
+    if (posted) postMethod = "oauth_api";
+  }
 
   repliedComments.add(comment.id);
   lastReplyTime = Date.now();
@@ -483,6 +521,7 @@ async function processComment(
         postTitle: comment.postTitle.slice(0, 100),
         replyText: replyText.slice(0, 300),
         posted,
+        postMethod,
       },
     });
 

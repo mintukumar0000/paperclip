@@ -326,10 +326,11 @@ async function generateLLMTitle(context: string, channel: Channel, subreddit?: s
 async function generatePostContent(
   db: Db,
   subreddit: string,
+  baseUrl: string,
 ): Promise<{ title: string; body: string; subreddit: string }> {
   const stats = await getSystemStats(db);
   const template = POST_TEMPLATES[Math.floor(Math.random() * POST_TEMPLATES.length)]!;
-  const trackingLink = `https://writenaturallyai.com?source=reddit_${subreddit.toLowerCase()}_${Date.now()}`;
+  const trackingLink = `${baseUrl.replace(/\/$/, "")}/api/cold-email?utm_source=reddit&utm_campaign=auto_loop`;
 
   const body = template.bodyTemplate
     .replace(/\{signups\}/g, String(stats.signups))
@@ -347,10 +348,11 @@ async function generatePostContent(
 
 async function generateTweetContent(
   db: Db,
+  baseUrl: string,
 ): Promise<{ text: string }> {
   const stats = await getSystemStats(db);
   const template = TWITTER_TEMPLATES[Math.floor(Math.random() * TWITTER_TEMPLATES.length)]!;
-  const trackingLink = `https://writenaturallyai.com?source=twitter_${Date.now()}`;
+  const trackingLink = `${baseUrl.replace(/\/$/, "")}/api/cold-email?utm_source=twitter&utm_campaign=auto_loop`;
 
   let text = template.template
     .replace(/\{signups\}/g, String(stats.signups))
@@ -624,7 +626,7 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
     if (channels.includes("reddit")) {
       const subreddit = SUBREDDITS[postIndex % SUBREDDITS.length]!;
       logger.info({ subreddit, postIndex }, "Traffic loop: generating Reddit content");
-      const content = await generatePostContent(ctx.db, subreddit);
+      const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
       logger.info({ subreddit, title: content.title.slice(0, 60) }, "Traffic loop: posting to Reddit");
       results.push(await postToReddit(ctx, content));
     }
@@ -633,7 +635,7 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
     if (channels.includes("twitter")) {
       await new Promise((resolve) => setTimeout(resolve, 2 * 60_000));
       logger.info({}, "Traffic loop: generating Twitter content");
-      const tweet = await generateTweetContent(ctx.db);
+      const tweet = await generateTweetContent(ctx.db, ctx.baseUrl);
       logger.info({ textPreview: tweet.text.slice(0, 60) }, "Traffic loop: posting to Twitter");
       results.push(await postToTwitter(ctx, tweet));
     }

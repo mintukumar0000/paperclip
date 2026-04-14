@@ -23,6 +23,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TEMPLATE_PLACEHOLDER_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/g;
 const TEMPLATE_PLACEHOLDER_TEST_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/;
 const scheduledFollowUps = new Set<string>();
+const LOCKED_PREVIEW_LINES = 4;
 
 const EMPTY_ATTRIBUTION: AttributionContext = {
   utmSource: null,
@@ -123,6 +124,66 @@ function getFreeLimit(): number {
   const raw = Number(process.env.COLD_EMAIL_FREE_LIMIT ?? "3");
   if (!Number.isFinite(raw)) return 3;
   return Math.max(1, Math.round(raw));
+}
+
+function getSoftTriggerGenerationCount(freeLimit: number): number {
+  const fallback = Math.max(1, freeLimit - 1);
+  const raw = Number(process.env.COLD_EMAIL_SOFT_TRIGGER_GENERATION_COUNT ?? fallback);
+  if (!Number.isFinite(raw)) return fallback;
+  const normalized = Math.max(1, Math.round(raw));
+  return Math.min(freeLimit, normalized);
+}
+
+function shouldLockOutputPreview(generationCount: number, freeLimit: number): boolean {
+  const triggerAt = getSoftTriggerGenerationCount(freeLimit);
+  return generationCount >= triggerAt && generationCount < freeLimit;
+}
+
+function buildLockedPreview(emailCopy: string): string {
+  const lines = emailCopy
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) {
+    return [
+      "Subject: [Visible after generation]",
+      "",
+      "Body:",
+      "[Unlock unlimited to reveal the full personalized email output.]",
+    ].join("\n");
+  }
+
+  const subjectLine = lines.find((line) => /^subject\s*:/i.test(line)) ?? `Subject: ${lines[0]}`;
+  const bodyLines = lines.filter((line) => line !== subjectLine);
+  const visibleBody = bodyLines.slice(0, LOCKED_PREVIEW_LINES).join("\n");
+
+  return [
+    subjectLine,
+    "",
+    "Body preview:",
+    visibleBody,
+    "",
+    "[...locked... unlock unlimited to reveal the full email and higher-quality personalization.]",
+  ].join("\n");
+}
+
+function softUpsellMessage(): {
+  title: string;
+  detail: string;
+  valueStack: string[];
+} {
+  return {
+    title: "You are one step away from a perfect cold email.",
+    detail: "Unlock unlimited generations and higher-quality personalization.",
+    valueStack: [
+      "Unlimited cold emails",
+      "Higher personalization depth",
+      "Stronger conversion angles",
+      "Priority model quality",
+      "Intro pricing expires soon",
+      "Agencies charge about $50/email - you pay less than $1",
+    ],
+  };
 }
 
 function getFollowUpDelayMs(step: "day1" | "day2"): number {
@@ -771,7 +832,7 @@ function renderLandingPage(
   <div class="wrap">
     <div class="hero">
       <section class="card">
-        <span id="usage-pill" class="urgency">Limited free usage: ${freeLimit} generations</span>
+        <span id="usage-pill" class="urgency">Intro pricing active - limited free usage: ${freeLimit} generations</span>
         <h1>Turn your offer into reply-ready cold emails that convert</h1>
         <p class="sub">Input your product, audience, and key benefit. Get a personalized outreach email instantly.</p>
 
@@ -789,6 +850,7 @@ function renderLandingPage(
 
         <button id="generate" type="button" class="btn">Generate your first email free</button>
         <div class="hint">By generating, you agree to receive your result and 2 tactical follow-ups.</div>
+        <div class="hint">Agencies often charge $50/email. Here you can generate at less than $1 per output when upgraded.</div>
         <div id="status" class="status"></div>
       </section>
 
@@ -816,7 +878,7 @@ function renderLandingPage(
       }
 
       function showPaywallStatus(checkoutUrl) {
-        statusNode.textContent = "Free limit reached. ";
+        statusNode.textContent = "Free limit reached. Unlock unlimited, higher personalization, and better conversion angles. ";
         if (!checkoutUrl) {
           statusNode.textContent = "Free limit reached. Checkout is not configured yet.";
           return;
@@ -827,6 +889,20 @@ function renderLandingPage(
         link.target = "_blank";
         link.rel = "noopener";
         link.textContent = "Upgrade for unlimited access";
+        statusNode.appendChild(link);
+        statusNode.appendChild(document.createTextNode("."));
+      }
+
+      function showSoftLockStatus(data) {
+        var title = (data && data.softPromptTitle) ? String(data.softPromptTitle) : "You are one step away from a perfect cold email.";
+        var detail = (data && data.softPromptDetail) ? String(data.softPromptDetail) : "Unlock unlimited + higher quality outputs.";
+        statusNode.textContent = title + " " + detail + " ";
+        if (!data || !data.checkoutUrl) return;
+        var link = document.createElement("a");
+        link.href = String(data.checkoutUrl);
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = "Unlock full output";
         statusNode.appendChild(link);
         statusNode.appendChild(document.createTextNode("."));
       }
@@ -1017,6 +1093,11 @@ function renderLandingPage(
           }
 
           outputNode.textContent = data.emailCopy || "No output returned.";
+          if (data.previewLocked) {
+            outputNode.textContent = data.emailPreview || outputNode.textContent;
+            showSoftLockStatus(data);
+            return;
+          }
           if (data.paid) {
             setPaidStatusUi();
             statusNode.textContent = "Generated and emailed. Paid monthly active with unlimited access.";
@@ -1438,12 +1519,14 @@ export function coldEmailRoutes(db: Db) {
 
       const generated = await generateColdEmail({ product, targetAudience, keyBenefit });
       const updatedGenerationCount = generationCount + 1;
+      const previewLocked = !paid && shouldLockOutputPreview(updatedGenerationCount, freeLimit);
       const nextMetadata: JsonRecord = {
         ...withColdEmailEntitlement(metadata, paid),
         source,
         ...attributionToMetadata(attribution),
         coldEmailGenerationCount: updatedGenerationCount,
         coldEmailLastGeneratedAt: now.toISOString(),
+        coldEmailPreviewLockedAt: previewLocked ? now.toISOString() : null,
         coldEmailLastInput: {
           product,
           targetAudience,
@@ -1463,16 +1546,26 @@ export function coldEmailRoutes(db: Db) {
 
       const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl, attribution);
       const upgradeTarget = checkoutUrl ?? `${baseUrl}/api/cold-email`;
+      const upsell = softUpsellMessage();
+      const lockedPreview = previewLocked ? buildLockedPreview(generated) : null;
 
       const sentResultEmail = await sendResendEmail({
         to: email,
-        subject: "Your personalized cold email is ready",
-        html: [
-          "<p>Your personalized cold email:</p>",
-          `<pre style=\"white-space:pre-wrap;border:1px solid #e5e7eb;padding:12px;border-radius:8px;\">${generated.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`,
-          `<p><a href=\"${renderTrackedClick(baseUrl, email, "cold_email_result", companyId, upgradeTarget)}\">${paid ? "Generate another" : "Upgrade to unlimited"}</a></p>`,
-          `<img src=\"${renderTrackedPixel(baseUrl, email, "cold_email_result", companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
-        ].join(""),
+        subject: previewLocked ? "Your email preview is ready - unlock full output" : "Your personalized cold email is ready",
+        html: previewLocked
+          ? [
+              `<p>${upsell.title}</p>`,
+              `<p>${upsell.detail}</p>`,
+              `<pre style=\"white-space:pre-wrap;border:1px solid #e5e7eb;padding:12px;border-radius:8px;\">${(lockedPreview ?? "").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`,
+              `<p><a href=\"${renderTrackedClick(baseUrl, email, "cold_email_soft_unlock", companyId, upgradeTarget)}\">Unlock full output</a></p>`,
+              `<img src=\"${renderTrackedPixel(baseUrl, email, "cold_email_soft_unlock", companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
+            ].join("")
+          : [
+              "<p>Your personalized cold email:</p>",
+              `<pre style=\"white-space:pre-wrap;border:1px solid #e5e7eb;padding:12px;border-radius:8px;\">${generated.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>`,
+              `<p><a href=\"${renderTrackedClick(baseUrl, email, "cold_email_result", companyId, upgradeTarget)}\">${paid ? "Generate another" : "Upgrade to unlimited"}</a></p>`,
+              `<img src=\"${renderTrackedPixel(baseUrl, email, "cold_email_result", companyId)}\" alt=\"\" width=\"1\" height=\"1\"/>`,
+            ].join(""),
       });
 
       await scheduleFollowUps({
@@ -1488,9 +1581,31 @@ export function coldEmailRoutes(db: Db) {
         companyId,
         generationCount: updatedGenerationCount,
         paid,
+        previewLocked,
         resultEmailSent: sentResultEmail,
         ...attributionToMetadata(attribution),
       });
+
+      if (previewLocked && companyId) {
+        await db.insert(activityLog).values({
+          companyId,
+          actorType: "system",
+          actorId: "cold-email-generator",
+          agentId: null,
+          runId: null,
+          action: "cold_email.soft_paywall.shown",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            email,
+            generationCount: updatedGenerationCount,
+            freeLimit,
+            checkoutUrl,
+            softPromptTitle: upsell.title,
+            ...attributionToMetadata(attribution),
+          },
+        }).catch(() => undefined);
+      }
 
       if (companyId) {
         await db.insert(activityLog).values({
@@ -1535,7 +1650,12 @@ export function coldEmailRoutes(db: Db) {
 
       res.json({
         success: true,
-        emailCopy: generated,
+        emailCopy: previewLocked ? null : generated,
+        emailPreview: lockedPreview,
+        previewLocked,
+        softPromptTitle: previewLocked ? upsell.title : null,
+        softPromptDetail: previewLocked ? upsell.detail : null,
+        softPromptValueStack: previewLocked ? upsell.valueStack : null,
         paid,
         generationCount: updatedGenerationCount,
         remainingFree: paid ? Number.MAX_SAFE_INTEGER : Math.max(0, freeLimit - updatedGenerationCount),
