@@ -14,6 +14,11 @@ async function main(): Promise<void> {
   const integrationCtx: IntegrationContext = { integrationEnv: {} };
   const url = process.env.TEST_REDDIT_URL ?? "https://example.com";
   const storageStatePath = resolveRedditStorageStatePath(getConfiguredRedditStorageStatePath());
+  const manualLoginWaitMs = Math.max(0, Number(process.env.REDDIT_MANUAL_LOGIN_GRACE_MS ?? 60_000));
+
+  if (manualLoginWaitMs > 0) {
+    console.log(`[Reddit] Manual login grace window enabled: ${Math.round(manualLoginWaitMs / 1000)}s`);
+  }
 
   const result = await postToRedditPlaywright(integrationCtx, {
     subreddit: process.env.TEST_REDDIT_SUBREDDIT ?? "test",
@@ -24,6 +29,7 @@ async function main(): Promise<void> {
     requireStorageState: true,
     allowPasswordLogin: false,
     headless: false,
+    manualLoginWaitMs,
     timeoutMs: Number(process.env.PLAYWRIGHT_TIMEOUT_MS ?? 120000),
   });
 

@@ -89,7 +89,7 @@ async function gotoWithRedirectTolerance(
 
 async function waitForRedditSessionReady(page: import("playwright").Page, timeoutMs: number): Promise<void> {
   const start = Date.now();
-  const manualLoginCheckWindowMs = 30_000;
+  const manualLoginCheckWindowMs = Math.max(30_000, Number(process.env.REDDIT_MANUAL_LOGIN_GRACE_MS ?? 60_000));
 
   while (Date.now() - start < timeoutMs) {
     const currentUrl = page.url();
@@ -198,6 +198,7 @@ async function bootstrapReddit(): Promise<void> {
   try {
     await page.goto("https://www.reddit.com/login", { waitUntil: "domcontentloaded" });
     console.log("[Reddit] Complete login manually in the opened browser window...");
+    console.log(`[Reddit] Waiting up to ${Math.round((Math.max(30_000, Number(process.env.REDDIT_MANUAL_LOGIN_GRACE_MS ?? 60_000))) / 1000)}s before submit re-check while login is in progress.`);
     await waitForRedditSessionReady(page, 5 * 60_000);
     await verifyRedditSession(page, 60_000);
 

@@ -697,6 +697,34 @@ async function resolveWelcomeBackLoop(page: {
   }
 }
 
+async function waitForManualRedditLogin(page: {
+  url: () => string;
+  waitForURL: (
+    urlOrPredicate: string | RegExp | ((url: URL) => boolean),
+    options?: { timeout?: number; waitUntil?: "load" | "domcontentloaded" | "networkidle" | "commit" },
+  ) => Promise<unknown>;
+  waitForTimeout: (ms: number) => Promise<void>;
+}, timeoutMs: number): Promise<boolean> {
+  if (timeoutMs <= 0 || !page.url().includes("/login")) {
+    return false;
+  }
+
+  const startedAt = Date.now();
+  await page
+    .waitForURL(
+      (url) => url.hostname.includes("reddit.com") && !url.pathname.includes("/login"),
+      { timeout: timeoutMs },
+    )
+    .catch(() => undefined);
+
+  const elapsedMs = Date.now() - startedAt;
+  if (elapsedMs < timeoutMs) {
+    await page.waitForTimeout(1200);
+  }
+
+  return !page.url().includes("/login");
+}
+
 async function hasRedditSubmitAccess(page: {
   goto: (url: string, opts?: { waitUntil?: "load" | "domcontentloaded" | "networkidle" | "commit"; timeout?: number }) => Promise<unknown>;
   url: () => string;
@@ -827,6 +855,10 @@ export async function postToRedditPlaywright(
   const maxAttempts = Math.max(1, Math.min(6, Math.round(Number(args.maxAttempts ?? process.env.REDDIT_MAX_ATTEMPTS ?? 3))));
   const retryDelayMs = Math.max(0, Math.round(Number(args.retryDelayMs ?? process.env.REDDIT_RETRY_DELAY_MS ?? 8_000)));
   const preSubmitDelayMs = Math.max(0, Math.round(Number(args.preSubmitDelayMs ?? process.env.REDDIT_PRE_SUBMIT_DELAY_MS ?? 3_000)));
+  const manualLoginWaitMs = Math.max(
+    0,
+    Math.round(Number(args.manualLoginWaitMs ?? process.env.REDDIT_MANUAL_LOGIN_GRACE_MS ?? 0)),
+  );
   const uniqueUserDataDir = parseBoolean(args.uniqueUserDataDir ?? process.env.REDDIT_UNIQUE_USER_DATA_DIR, true);
   const headfulRequested = parseBoolean(process.env.REDDIT_HEADFUL, false);
   const headless =
@@ -897,9 +929,30 @@ export async function postToRedditPlaywright(
           allowPasswordLogin,
         });
         if (!allowPasswordLogin) {
+          if (!headless && manualLoginWaitMs > 0 && page.url().includes("/login")) {
+            console.log("REDDIT DEBUG:", {
+              phase: "manual_login_wait",
+              waitMs: manualLoginWaitMs,
+              currentUrl: page.url(),
+            });
+            const manualLoginComplete = await waitForManualRedditLogin(page, manualLoginWaitMs);
+            if (manualLoginComplete) {
+              submitAccess = await hasRedditSubmitAccess(page, plannedSubreddit, timeoutMs);
+              console.log("REDDIT DEBUG:", {
+                phase: "manual_login_wait_complete",
+                submitAccess,
+                currentUrl: page.url(),
+              });
+            }
+          }
+
+          if (submitAccess) {
+            // Manual login recovered session without password fallback.
+          } else {
           throw new Error(
             `Reddit session is not authenticated for /r/${plannedSubreddit}/submit (url=${page.url()}, welcomeBack=${welcomeBackLoop}). Re-bootstrap storage state and retry.`,
           );
+          }
         }
 
         if (!password) {

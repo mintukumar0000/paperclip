@@ -7,6 +7,8 @@
     "dev:watch": "PAPERCLIP_MIGRATION_PROMPT=never node scripts/dev-runner.mjs watch",
     "dev:server": "pnpm --filter @paperclipai/server dev",
     "dev:ui": "pnpm --filter @paperclipai/ui dev",
+    "reddit:save-session": "pnpm --filter @paperclipai/server playwright:save-reddit-session",
+    "reddit:session-base64": "pnpm --filter @paperclipai/server playwright:reddit-session-base64",
     "reddit:bootstrap-session": "pnpm --filter @paperclipai/server playwright:bootstrap-reddit",
     "reddit:verify-session": "pnpm --filter @paperclipai/server playwright:verify-reddit-session",
     "reddit:test-post": "pnpm --filter @paperclipai/server playwright:test-reddit-post",
