@@ -134,6 +134,7 @@ interface PostResult {
   posted: boolean;
   channel: Channel;
   method: string;
+  postUrl?: string | null;
   error?: string;
   retries: number;
   upvotes?: number;
@@ -692,15 +693,45 @@ async function postToReddit(
       );
       return {
         posted: r.posted === true,
-        postUrl: r.postUrl,
+        postUrl: typeof r.postUrl === "string" ? r.postUrl : null,
         upvotes: typeof r.upvotes === "number" && Number.isFinite(r.upvotes) ? Math.max(0, r.upvotes) : 0,
         comments: typeof r.comments === "number" && Number.isFinite(r.comments) ? Math.max(0, r.comments) : 0,
       };
     }, { maxRetries: 2, delayMs: 5_000, channel: "reddit" });
 
+    const companyId = getTelemetryCompanyId();
+    if (companyId) {
+      await ctx.db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        agentId: null,
+        runId: null,
+        action: result.posted ? "distribution.reddit.posted" : "distribution.reddit.post.failed",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          subreddit: content.subreddit,
+          title: content.title,
+          hook: content.hook,
+          format: content.format,
+          selectionReason: content.selectionReason,
+          variantScores: content.variantScores,
+          posted: result.posted,
+          method: "playwright",
+          postMethod: "playwright",
+          postUrl: result.postUrl ?? null,
+          error: result.posted ? null : "Reddit post attempt completed without confirmation",
+          retries: result.retries,
+          upvotes: result.upvotes ?? 0,
+          comments: result.comments ?? 0,
+          conversion: 0,
+        },
+      });
+    }
+
     if (result.posted) {
       recordChannelSuccess("reddit");
-      const companyId = getTelemetryCompanyId();
       if (companyId) {
         await recordSystemMetric(ctx.db, {
           companyId,
@@ -716,30 +747,6 @@ async function postToReddit(
             hook: content.hook,
             format: content.format,
             postUrl: result.postUrl ?? null,
-            upvotes: result.upvotes ?? 0,
-            comments: result.comments ?? 0,
-            conversion: 0,
-          },
-        });
-        await ctx.db.insert(activityLog).values({
-          companyId,
-          actorType: "system",
-          actorId: "traffic-loop",
-          agentId: null,
-          runId: null,
-          action: "distribution.reddit.posted",
-          entityType: "company",
-          entityId: companyId,
-          details: {
-            subreddit: content.subreddit,
-            title: content.title,
-            hook: content.hook,
-            format: content.format,
-            selectionReason: content.selectionReason,
-            variantScores: content.variantScores,
-            postUrl: result.postUrl ?? null,
-            method: "playwright",
-            retries: result.retries,
             upvotes: result.upvotes ?? 0,
             comments: result.comments ?? 0,
             conversion: 0,
@@ -784,6 +791,7 @@ async function postToReddit(
       posted: result.posted,
       channel: "reddit",
       method: "playwright",
+      postUrl: result.postUrl ?? null,
       retries: result.retries,
       upvotes: result.upvotes,
       comments: result.comments,
@@ -795,6 +803,34 @@ async function postToReddit(
 
     const companyId = getTelemetryCompanyId();
     if (companyId) {
+      await ctx.db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        agentId: null,
+        runId: null,
+        action: "distribution.reddit.post.failed",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          subreddit: content.subreddit,
+          title: content.title,
+          hook: content.hook,
+          format: content.format,
+          selectionReason: content.selectionReason,
+          variantScores: content.variantScores,
+          posted: false,
+          method: "playwright",
+          postMethod: "playwright",
+          postUrl: null,
+          error: message,
+          retries: 2,
+          upvotes: 0,
+          comments: 0,
+          conversion: 0,
+        },
+      });
+
       await recordContentPerformance(ctx.db, companyId, "reddit", content.title, false, {
         error: message,
         format: content.format,
@@ -803,7 +839,7 @@ async function postToReddit(
       });
     }
 
-    return { posted: false, channel: "reddit", method: "playwright", error: message, retries: 2 };
+    return { posted: false, channel: "reddit", method: "playwright", postUrl: null, error: message, retries: 2 };
   }
 }
 

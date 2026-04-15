@@ -221,6 +221,115 @@ async function collectRedditValidationText(page: {
   ]);
 }
 
+function randomInt(min: number, max: number): number {
+  const floorMin = Math.ceil(min);
+  const floorMax = Math.floor(max);
+  return Math.floor(Math.random() * (floorMax - floorMin + 1)) + floorMin;
+}
+
+async function randomHumanDelay(
+  page: { waitForTimeout: (ms: number) => Promise<void> },
+  minMs = 1_000,
+  maxMs = 3_000,
+): Promise<void> {
+  await page.waitForTimeout(randomInt(minMs, maxMs));
+}
+
+async function simulateHumanScroll(page: {
+  mouse: { wheel: (deltaX: number, deltaY: number) => Promise<void> };
+  waitForTimeout: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const passes = randomInt(1, 3);
+  for (let i = 0; i < passes; i += 1) {
+    const deltaY = randomInt(220, 620);
+    await page.mouse.wheel(0, deltaY).catch(() => undefined);
+    await page.waitForTimeout(randomInt(240, 620));
+  }
+}
+
+async function typeLikeHuman(
+  field: {
+    click: () => Promise<void>;
+    fill: (value: string) => Promise<void>;
+    type: (value: string, opts?: { delay?: number }) => Promise<void>;
+    inputValue: () => Promise<string>;
+    innerText: () => Promise<string>;
+  },
+  value: string,
+): Promise<void> {
+  await field.click().catch(() => undefined);
+  await field.fill("").catch(() => undefined);
+  await field.type(value, { delay: randomInt(24, 68) }).catch(() => undefined);
+
+  const typedInput = await field.inputValue().catch(() => "");
+  const typedInner = await field.innerText().catch(() => "");
+  if (!typedInput.trim() && !typedInner.trim()) {
+    await field.fill(value).catch(() => undefined);
+  }
+}
+
+function normalizeRedditPermalink(rawHref: string): string {
+  const clean = rawHref.split("?")[0] ?? rawHref;
+  if (clean.startsWith("http://") || clean.startsWith("https://")) return clean;
+  if (clean.startsWith("/")) return `https://www.reddit.com${clean}`;
+  return `https://www.reddit.com/${clean}`;
+}
+
+async function waitForRedditPostConfirmation(
+  page: {
+    waitForURL: (url: string | RegExp | ((url: URL) => boolean), options?: { timeout?: number; waitUntil?: "load" | "domcontentloaded" | "networkidle" | "commit" }) => Promise<void>;
+    waitForTimeout: (ms: number) => Promise<void>;
+    url: () => string;
+    locator: (selector: string) => {
+      first: () => {
+        isVisible: () => Promise<boolean>;
+        getAttribute: (name: string) => Promise<string | null>;
+      };
+    };
+  },
+  timeoutMs: number,
+): Promise<{ postUrl: string | null; successSignal: "url" | "banner_or_link" | null }> {
+  await page.waitForURL(/\/comments\//, { timeout: timeoutMs }).catch(() => undefined);
+  if (/\/comments\//.test(page.url())) {
+    return { postUrl: page.url().split("?")[0] ?? page.url(), successSignal: "url" };
+  }
+
+  const startedAt = Date.now();
+  let sawSuccessHint = false;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const currentUrl = page.url();
+    if (/\/comments\//.test(currentUrl)) {
+      return { postUrl: currentUrl.split("?")[0] ?? currentUrl, successSignal: "url" };
+    }
+
+    const permalinkCandidate = page
+      .locator('a[href*="/comments/"], a:has-text("View post"), a:has-text("View Post")')
+      .first();
+    const permalinkVisible = await permalinkCandidate.isVisible().catch(() => false);
+    if (permalinkVisible) {
+      const href = await permalinkCandidate.getAttribute("href").catch(() => null);
+      if (href && href.includes("/comments/")) {
+        return { postUrl: normalizeRedditPermalink(href), successSignal: "banner_or_link" };
+      }
+      sawSuccessHint = true;
+    }
+
+    const successBannerVisible = await page
+      .locator('text=/post(ed)?\s+(successfully|submitted|live)|your\s+post\s+is\s+live/i, [data-testid*="toast"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (successBannerVisible) {
+      sawSuccessHint = true;
+    }
+
+    await page.waitForTimeout(450);
+  }
+
+  return { postUrl: null, successSignal: sawSuccessHint ? "banner_or_link" : null };
+}
+
 async function fillRedditBodyInput(
   page: {
     locator: (selector: string) => {
@@ -260,17 +369,22 @@ async function fillRedditBodyInput(
 
       await node.click().catch(() => undefined);
       await node.fill("").catch(() => undefined);
-      await node.fill(body).catch(() => undefined);
+      await node.type(body, { delay: randomInt(22, 58) }).catch(() => undefined);
 
       const inputValue = await node.inputValue().catch(() => "");
-      if (inputValue.trim().length > 0) return true;
-
-      await node.type(body, { delay: 8 }).catch(() => undefined);
       const textValue = await node.innerText().catch(() => "");
-      if (textValue.trim().length > 0) return true;
+      if (inputValue.trim().length > 0 || textValue.trim().length > 0) {
+        return true;
+      }
+
+      await node.fill(body).catch(() => undefined);
+      const filledInput = await node.inputValue().catch(() => "");
+      if (filledInput.trim().length > 0) {
+        return true;
+      }
 
       await page.keyboard.press("Meta+A").catch(() => undefined);
-      await page.keyboard.type(body, { delay: 8 }).catch(() => undefined);
+      await page.keyboard.type(body, { delay: randomInt(20, 54) }).catch(() => undefined);
       const typedValue = await node.innerText().catch(() => "");
       if (typedValue.trim().length > 0) return true;
     }
@@ -586,6 +700,9 @@ async function resolveWelcomeBackLoop(page: {
 async function hasRedditSubmitAccess(page: {
   goto: (url: string, opts?: { waitUntil?: "load" | "domcontentloaded" | "networkidle" | "commit"; timeout?: number }) => Promise<unknown>;
   url: () => string;
+  mouse: {
+    wheel: (deltaX: number, deltaY: number) => Promise<void>;
+  };
   locator: (selector: string) => {
     first: () => {
       click: () => Promise<void>;
@@ -594,19 +711,40 @@ async function hasRedditSubmitAccess(page: {
   };
   waitForTimeout: (ms: number) => Promise<void>;
 }, subreddit: string, timeoutMs: number): Promise<boolean> {
-  await page.goto(`https://www.reddit.com/r/${subreddit}/submit`, {
+  await page.goto(`https://www.reddit.com/r/${subreddit}/`, {
     waitUntil: "domcontentloaded",
     timeout: timeoutMs,
   });
-  await page.waitForTimeout(1500);
+  await randomHumanDelay(page, 900, 1_800);
+
+  await simulateHumanScroll(page).catch(() => undefined);
 
   if (page.url().includes("/login")) {
     await resolveWelcomeBackLoop(page);
+    await page.goto(`https://www.reddit.com/r/${subreddit}/`, {
+      waitUntil: "domcontentloaded",
+      timeout: timeoutMs,
+    });
+    await randomHumanDelay(page, 900, 1_800);
+  }
+
+  const createPostCta = page
+    .locator(
+      'a[href*="/submit"], button:has-text("Create Post"), button:has-text("Create post"), a:has-text("Create Post"), a:has-text("Create post")',
+    )
+    .first();
+  if (await createPostCta.isVisible().catch(() => false)) {
+    await randomHumanDelay(page, 600, 1_400);
+    await createPostCta.click().catch(() => undefined);
+    await randomHumanDelay(page, 700, 1_500);
+  }
+
+  if (!page.url().includes("/submit")) {
     await page.goto(`https://www.reddit.com/r/${subreddit}/submit`, {
       waitUntil: "domcontentloaded",
       timeout: timeoutMs,
     });
-    await page.waitForTimeout(1500);
+    await randomHumanDelay(page, 900, 1_600);
   }
 
   const titleInput = page
@@ -737,7 +875,7 @@ export async function postToRedditPlaywright(
       }
 
       const page = await context.newPage();
-      await page.waitForTimeout(500 + Math.min(2_500, attempt * 400));
+      await randomHumanDelay(page, 700, 1_700);
       let submitAccess = await hasRedditSubmitAccess(page, plannedSubreddit, timeoutMs);
       console.log("REDDIT DEBUG:", {
         storageUsed: existsSync(sessionPath),
@@ -791,9 +929,12 @@ export async function postToRedditPlaywright(
         .locator('textarea[name="title"], textarea[name="title-textarea"], textarea#innerTextArea')
         .first();
       await finalTitleInput.waitFor({ timeout: timeoutMs });
-      await finalTitleInput.fill(attemptTitle);
+      await randomHumanDelay(page, 800, 1_800);
+      await typeLikeHuman(finalTitleInput, attemptTitle);
 
       if (kind === "self") {
+        await simulateHumanScroll(page).catch(() => undefined);
+        await randomHumanDelay(page, 750, 1_800);
         const bodyFilled = await fillRedditBodyInput(page, minimumBody);
         if (!bodyFilled) {
           throw new Error("Unable to locate a visible Reddit body input/editor for self post");
@@ -805,8 +946,9 @@ export async function postToRedditPlaywright(
           )
           .first();
         if (await linkTab.isVisible().catch(() => false)) {
+          await randomHumanDelay(page, 700, 1_500);
           await linkTab.click().catch(() => undefined);
-          await page.waitForTimeout(1500);
+          await randomHumanDelay(page, 900, 1_700);
         }
 
         let filledUrl = false;
@@ -815,6 +957,7 @@ export async function postToRedditPlaywright(
           if (!(await candidate.isVisible().catch(() => false))) {
             continue;
           }
+          await randomHumanDelay(page, 650, 1_300);
           await candidate.fill(attemptLinkUrl).catch(() => undefined);
           const value = await candidate.inputValue().catch(() => "");
           if (value && value.trim().length > 0) {
@@ -828,7 +971,7 @@ export async function postToRedditPlaywright(
       }
 
       if (preSubmitDelayMs > 0) {
-        await page.waitForTimeout(preSubmitDelayMs);
+        await page.waitForTimeout(preSubmitDelayMs + randomInt(450, 1_300));
       }
 
       const submitButton = page
@@ -855,11 +998,11 @@ export async function postToRedditPlaywright(
         const requiredPhrase = parseRequiredTitlePhrase(validationText);
         if (requiredPhrase) {
           attemptTitle = withRequiredTitlePrefix(attemptTitle, requiredPhrase);
-          await finalTitleInput.fill(attemptTitle);
+          await typeLikeHuman(finalTitleInput, attemptTitle);
           if (kind === "self") {
             await fillRedditBodyInput(page, minimumBody);
           }
-          await page.waitForTimeout(1200);
+          await page.waitForTimeout(1200 + randomInt(150, 500));
           validationText = await collectRedditValidationText(page);
           finalBody = await readFirstVisibleInnerText(page, [
             '[data-testid="post-content"]',
@@ -880,13 +1023,15 @@ export async function postToRedditPlaywright(
         throw new Error(`POST_BUTTON_DISABLED: ${validationText ?? "validation_blocked_or_missing_required_fields"}`);
       }
 
+      await randomHumanDelay(page, 900, 1_900);
       await submitButton.click();
 
       let postUrl: string | null = null;
-      await page.waitForURL(/\/comments\//, { timeout: timeoutMs }).catch(() => undefined);
-      await page.waitForTimeout(3500);
-      if (/\/comments\//.test(page.url())) {
-        postUrl = page.url();
+      const confirmation = await waitForRedditPostConfirmation(page, 10_000);
+      if (confirmation.postUrl) {
+        postUrl = confirmation.postUrl;
+      } else if (!confirmation.successSignal) {
+        throw new Error("Reddit submit did not produce a confirmed success signal within 10 seconds");
       }
 
       if (!postUrl) {
@@ -894,7 +1039,7 @@ export async function postToRedditPlaywright(
           waitUntil: "domcontentloaded",
           timeout: timeoutMs,
         });
-        await page.waitForTimeout(2000);
+        await randomHumanDelay(page, 900, 2_000);
 
         const titleLower = attemptTitle.toLowerCase();
         const submittedLinks = page.locator('a[href*="/comments/"]');
@@ -911,6 +1056,10 @@ export async function postToRedditPlaywright(
         }
       }
 
+      if (!postUrl) {
+        throw new Error("Reddit post could not be verified with a permalink after submit");
+      }
+
       const finalUrl = postUrl ?? page.url();
       const looksLikeSubmitPage = finalUrl.includes("/submit") || finalUrl.includes("type=LINK");
       if (looksLikeSubmitPage) {
@@ -921,7 +1070,7 @@ export async function postToRedditPlaywright(
       }
 
       await page.goto(finalUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-      await page.waitForTimeout(1500);
+      await randomHumanDelay(page, 900, 1_700);
 
       const upvoteText = await readFirstVisibleInnerText(page, [
         '[data-testid="upvoteRatio"]',
@@ -934,7 +1083,7 @@ export async function postToRedditPlaywright(
 
       const upvotes = parseEngagementCount(upvoteText);
       const comments = parseEngagementCount(commentText);
-      const verificationSuccess = upvotes > 5 || comments > 2;
+        const verificationSuccess = /\/comments\//.test(finalUrl);
 
       await saveStorageState(context, sessionPath);
 
