@@ -30,9 +30,11 @@ RUN pnpm --filter @paperclipai/server build
 FROM base AS production
 WORKDIR /app
 COPY --from=build /app /app
+RUN PLAYWRIGHT_BROWSERS_PATH=0 pnpm --filter @paperclipai/server exec playwright install --with-deps chromium
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest
 
 ENV NODE_ENV=production \
+  PLAYWRIGHT_BROWSERS_PATH=0 \
   HOME=/paperclip \
   HOST=0.0.0.0 \
   PORT=3100 \
