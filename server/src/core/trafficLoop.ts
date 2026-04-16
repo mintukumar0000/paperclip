@@ -21,7 +21,7 @@ function usesCompletionTokens(model: string): boolean {
 type Channel = "reddit" | "twitter";
 type RedditFormat = "story" | "tool" | "question";
 
-const SUBREDDITS = [
+const DEFAULT_SUBREDDITS = [
   "startups",
   "SideProject",
   "Entrepreneur",
@@ -29,6 +29,29 @@ const SUBREDDITS = [
   "indiehackers",
   "microsaas",
 ];
+
+function getConfiguredSubreddits(): string[] {
+  const raw = (process.env.REDDIT_SUBREDDITS ?? "").trim();
+  if (!raw) return [...DEFAULT_SUBREDDITS];
+
+  const entries = raw
+    .split(",")
+    .map((entry) => entry.trim().replace(/^r\//i, ""))
+    .filter((entry) => entry.length > 0);
+
+  if (entries.length === 0) return [...DEFAULT_SUBREDDITS];
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const key = entry.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(entry);
+  }
+
+  return deduped.length > 0 ? deduped : [...DEFAULT_SUBREDDITS];
+}
 
 const POST_TEMPLATES = [
   {
@@ -664,17 +687,17 @@ async function postToReddit(
   }
 
   try {
+    const configuredSubreddits = getConfiguredSubreddits();
     const result = await withRetry(async () => {
       const { postToRedditPlaywright } = await import("../ai/tools/externalTools.js");
       const r = (await postToRedditPlaywright({ integrationEnv: {} }, {
         subreddit: content.subreddit,
-        fallbackSubreddits: SUBREDDITS.filter((entry) => entry.toLowerCase() !== content.subreddit.toLowerCase()),
+        fallbackSubreddits: configuredSubreddits.filter((entry) => entry.toLowerCase() !== content.subreddit.toLowerCase()),
         title: content.title,
         text: content.body,
         kind: "self",
         username,
         storageStatePath: storagePath || undefined,
-        headless: false,
         requireStorageState: true,
         allowPasswordLogin: false,
       })) as Record<string, unknown>;
@@ -940,11 +963,12 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
   const results: PostResult[] = [];
 
   try {
+    const subreddits = getConfiguredSubreddits();
     const channels = getEnabledChannels();
 
     // Reddit post
     if (channels.includes("reddit")) {
-      const subreddit = SUBREDDITS[postIndex % SUBREDDITS.length]!;
+      const subreddit = subreddits[postIndex % subreddits.length]!;
       logger.info({ subreddit, postIndex }, "Traffic loop: generating Reddit content");
       const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
       logger.info({ subreddit, title: content.title.slice(0, 60) }, "Traffic loop: posting to Reddit");
@@ -1020,8 +1044,9 @@ export function startTrafficLoop(db: Db, intervalMs = 3 * 60 * 60_000): () => vo
     : intervalMs;
 
   const channels = getEnabledChannels();
+  const subreddits = getConfiguredSubreddits();
   logger.info(
-    { intervalMs: effectiveInterval, channels, subreddits: SUBREDDITS },
+    { intervalMs: effectiveInterval, channels, subreddits },
     "Starting multi-channel traffic loop",
   );
 

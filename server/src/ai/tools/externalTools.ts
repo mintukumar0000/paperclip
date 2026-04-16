@@ -303,15 +303,12 @@ async function waitForRedditPostConfirmation(
       return { postUrl: currentUrl.split("?")[0] ?? currentUrl, successSignal: "url" };
     }
 
-    const permalinkCandidate = page
-      .locator('a[href*="/comments/"], a:has-text("View post"), a:has-text("View Post")')
-      .first();
-    const permalinkVisible = await permalinkCandidate.isVisible().catch(() => false);
-    if (permalinkVisible) {
-      const href = await permalinkCandidate.getAttribute("href").catch(() => null);
-      if (href && href.includes("/comments/")) {
-        return { postUrl: normalizeRedditPermalink(href), successSignal: "banner_or_link" };
-      }
+    const viewPostLinkVisible = await page
+      .locator('a:has-text("View post"), a:has-text("View Post")')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (viewPostLinkVisible) {
       sawSuccessHint = true;
     }
 
@@ -328,6 +325,27 @@ async function waitForRedditPostConfirmation(
   }
 
   return { postUrl: null, successSignal: sawSuccessHint ? "banner_or_link" : null };
+}
+
+async function isRedditPostFiltered(page: {
+  locator: (selector: string) => {
+    first: () => {
+      isVisible: () => Promise<boolean>;
+    };
+  };
+}): Promise<boolean> {
+  const selectors = [
+    "text=/removed by reddit'?s filters/i",
+    "text=/this post was removed by reddit'?s filters/i",
+    "text=/post removed by reddit'?s filters/i",
+  ];
+
+  for (const selector of selectors) {
+    const visible = await page.locator(selector).first().isVisible().catch(() => false);
+    if (visible) return true;
+  }
+
+  return false;
 }
 
 async function fillRedditBodyInput(
@@ -1120,8 +1138,6 @@ export async function postToRedditPlaywright(
       const confirmation = await waitForRedditPostConfirmation(page, 10_000);
       if (confirmation.postUrl) {
         postUrl = confirmation.postUrl;
-      } else if (!confirmation.successSignal) {
-        throw new Error("Reddit submit did not produce a confirmed success signal within 10 seconds");
       }
 
       if (!postUrl) {
@@ -1161,6 +1177,11 @@ export async function postToRedditPlaywright(
 
       await page.goto(finalUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
       await randomHumanDelay(page, 900, 1_700);
+
+      const removedByFilters = await isRedditPostFiltered(page);
+      if (removedByFilters) {
+        throw new Error("POST_REMOVED_BY_REDDIT_FILTERS");
+      }
 
       const upvoteText = await readFirstVisibleInnerText(page, [
         '[data-testid="upvoteRatio"]',
