@@ -30,6 +30,15 @@ const DEFAULT_SUBREDDITS = [
   "microsaas",
 ];
 
+const SUBREDDIT_DESCRIPTIONS: Record<string, string> = {
+  startups: "Founders sharing startup execution lessons, traction updates, and operational insights.",
+  sideproject: "Builders showcasing projects, asking for practical product feedback, and sharing build logs.",
+  entrepreneur: "General entrepreneurship audience with stricter anti-promo moderation.",
+  entrepreneurridealong: "Operator-focused discussions about execution, systems, and learning publicly.",
+  indiehackers: "Bootstrapped SaaS and maker content focused on transparent metrics and product learnings.",
+  microsaas: "Niche SaaS builder community; product updates are accepted when educational and non-spammy.",
+};
+
 function getConfiguredSubreddits(): string[] {
   const raw = (process.env.REDDIT_SUBREDDITS ?? "").trim();
   if (!raw) return [...DEFAULT_SUBREDDITS];
@@ -301,6 +310,72 @@ function getLLMHeaders(): Record<string, string> {
   if (siteUrl) headers["HTTP-Referer"] = siteUrl;
   if (appName) headers["X-Title"] = appName;
   return headers;
+}
+
+async function chooseSubredditWithLLM(
+  subreddits: string[],
+  stats: {
+    signups: number;
+    revenue: string;
+    conversionRate: string;
+    paymentConvRate: string;
+    issueCount: number;
+  },
+): Promise<string | null> {
+  const apiKey = (process.env.OPENAI_API_KEY ?? "").trim();
+  if (!apiKey || subreddits.length <= 1) return null;
+
+  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
+  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+  const subredditProfiles = subreddits
+    .map((name) => `- ${name}: ${SUBREDDIT_DESCRIPTIONS[name.toLowerCase()] ?? "General startup/building audience."}`)
+    .join("\n");
+
+  try {
+    const requestBody: Record<string, unknown> = {
+      model,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content: "You are a Reddit distribution planner. Choose the single best subreddit from the provided options for a build-in-public startup post. Prioritize communities where educational, non-spam operator content is likely to survive moderation.",
+        },
+        {
+          role: "user",
+          content: `Business snapshot:\n- Signups: ${stats.signups}\n- Revenue: ${stats.revenue}\n- Conversion: ${stats.conversionRate}%\n- Payment conversion: ${stats.paymentConvRate}%\n- Open improvement tasks: ${stats.issueCount}\n\nCandidate subreddits:\n${subredditProfiles}\n\nReturn strict JSON: {"subreddit":"<exact subreddit name>","reason":"<short reason>"}`,
+        },
+      ],
+      response_format: { type: "json_object" },
+    };
+    if (usesCompletionTokens(model)) {
+      requestBody.max_completion_tokens = 120;
+    } else {
+      requestBody.max_tokens = 120;
+    }
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: getLLMHeaders(),
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) return null;
+    const payload = (await response.json()) as Record<string, unknown>;
+    const choices = payload.choices as Array<{ message?: { content?: string } }> | undefined;
+    const content = choices?.[0]?.message?.content?.trim();
+    if (!content) return null;
+
+    const parsed = JSON.parse(content) as { subreddit?: string; reason?: string };
+    const picked = (parsed.subreddit ?? "").trim();
+    if (!picked) return null;
+    const match = subreddits.find((entry) => entry.toLowerCase() === picked.toLowerCase());
+    if (!match) return null;
+
+    logger.info({ subreddit: match, reason: parsed.reason ?? null }, "LLM selected subreddit for this cycle");
+    return match;
+  } catch {
+    return null;
+  }
 }
 
 async function generateLLMTitle(context: string, channel: Channel, subreddit?: string, db?: Db): Promise<string | null> {
@@ -968,7 +1043,10 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
 
     // Reddit post
     if (channels.includes("reddit")) {
-      const subreddit = subreddits[postIndex % subreddits.length]!;
+      const defaultSubreddit = subreddits[postIndex % subreddits.length]!;
+      const stats = await getSystemStats(ctx.db);
+      const selectedSubreddit = await chooseSubredditWithLLM(subreddits, stats);
+      const subreddit = selectedSubreddit ?? defaultSubreddit;
       logger.info({ subreddit, postIndex }, "Traffic loop: generating Reddit content");
       const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
       logger.info({ subreddit, title: content.title.slice(0, 60) }, "Traffic loop: posting to Reddit");

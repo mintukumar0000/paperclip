@@ -1078,6 +1078,12 @@ export async function postToRedditPlaywright(
         }
       }
 
+      // Blur any active link popover/editor state so the Post button can become actionable.
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await finalTitleInput.click().catch(() => undefined);
+      await page.waitForTimeout(300 + randomInt(120, 360));
+
       if (preSubmitDelayMs > 0) {
         await page.waitForTimeout(preSubmitDelayMs + randomInt(450, 1_300));
       }
