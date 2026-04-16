@@ -425,12 +425,13 @@ function resolveExistingSessionPath(candidates: string[]): string | null {
   return null;
 }
 
-function getPlaywrightLaunchOptions(headless: boolean): {
+function getPlaywrightLaunchOptions(headless: boolean, channelOverride?: string): {
   headless: boolean;
   channel?: string;
   args?: string[];
 } {
-  const channel = process.env.PLAYWRIGHT_BROWSER_CHANNEL?.trim();
+  const configuredChannel = (process.env.PLAYWRIGHT_BROWSER_CHANNEL ?? "").trim();
+  const channel = channelOverride ?? configuredChannel;
   const args = [
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
@@ -826,7 +827,11 @@ export async function postToRedditPlaywright(
   const userDataDirRaw =
     typeof args.userDataDir === "string" && args.userDataDir.trim().length > 0
       ? args.userDataDir.trim()
-      : (process.env.PLAYWRIGHT_USER_DATA_DIR ?? "").trim();
+      : (
+        process.env.REDDIT_USER_DATA_DIR
+        ?? process.env.PLAYWRIGHT_USER_DATA_DIR
+        ?? "storage/playwright/reddit-profile"
+      ).trim();
   const userDataDir = userDataDirRaw ? resolveSessionPath(userDataDirRaw) : null;
 
   const hasInitialStorageState = existsSync(sessionPath);
@@ -859,7 +864,18 @@ export async function postToRedditPlaywright(
     0,
     Math.round(Number(args.manualLoginWaitMs ?? process.env.REDDIT_MANUAL_LOGIN_GRACE_MS ?? 0)),
   );
-  const uniqueUserDataDir = parseBoolean(args.uniqueUserDataDir ?? process.env.REDDIT_UNIQUE_USER_DATA_DIR, true);
+  const uniqueUserDataDir = parseBoolean(args.uniqueUserDataDir ?? process.env.REDDIT_UNIQUE_USER_DATA_DIR, false);
+  const explicitBrowserChannel =
+    typeof args.browserChannel === "string" && args.browserChannel.trim().length > 0
+      ? args.browserChannel.trim()
+      : (
+        process.env.REDDIT_BROWSER_CHANNEL
+        ?? process.env.PLAYWRIGHT_BROWSER_CHANNEL
+        ?? ""
+      ).trim();
+  const browserChannelCandidates = explicitBrowserChannel
+    ? [explicitBrowserChannel]
+    : (process.platform === "darwin" ? ["chrome", ""] : [""]);
   const headfulRequested = parseBoolean(process.env.REDDIT_HEADFUL, false);
   const headless =
     typeof args.headless === "boolean"
@@ -891,19 +907,40 @@ export async function postToRedditPlaywright(
       userDataDir && uniqueUserDataDir ? path.join(userDataDir, `reddit-${Date.now()}-${attempt}`) : userDataDir;
 
     try {
-      if (attemptUserDataDir) {
-        await mkdir(attemptUserDataDir, { recursive: true });
-        const hasState = existsSync(sessionPath);
-        context = await playwright.chromium.launchPersistentContext(attemptUserDataDir, {
-          ...getPlaywrightLaunchOptions(headless),
-          ...(hasState ? getPlaywrightContextOptions(sessionPath) : getPlaywrightContextOptions()),
-        });
-      } else {
-        browser = await playwright.chromium.launch(getPlaywrightLaunchOptions(headless));
-        const hasState = existsSync(sessionPath);
-        context = await browser.newContext(
-          hasState ? getPlaywrightContextOptions(sessionPath) : getPlaywrightContextOptions(),
-        );
+      const hasState = existsSync(sessionPath);
+      let launchError: unknown = null;
+      for (const channelCandidate of browserChannelCandidates) {
+        try {
+          if (attemptUserDataDir) {
+            await mkdir(attemptUserDataDir, { recursive: true });
+            context = await playwright.chromium.launchPersistentContext(attemptUserDataDir, {
+              ...getPlaywrightLaunchOptions(headless, channelCandidate || undefined),
+              ...(hasState ? getPlaywrightContextOptions(sessionPath) : getPlaywrightContextOptions()),
+            });
+            break;
+          }
+
+          browser = await playwright.chromium.launch(getPlaywrightLaunchOptions(headless, channelCandidate || undefined));
+          try {
+            context = await browser.newContext(
+              hasState ? getPlaywrightContextOptions(sessionPath) : getPlaywrightContextOptions(),
+            );
+            break;
+          } catch (err) {
+            await browser.close().catch(() => undefined);
+            browser = null;
+            throw err;
+          }
+        } catch (err) {
+          launchError = err;
+          if (channelCandidate) {
+            console.warn(`REDDIT DEBUG: failed launch with channel='${channelCandidate}', retrying fallback channel`);
+          }
+        }
+      }
+
+      if (!context) {
+        throw launchError instanceof Error ? launchError : new Error(String(launchError));
       }
 
       const page = await context.newPage();

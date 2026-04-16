@@ -4,7 +4,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   getConfiguredRedditStorageStatePath,
-  resolveRedditStorageStatePath,
 } from "../src/reddit-storage-state.js";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -13,8 +12,16 @@ const repoRoot = path.resolve(scriptDir, "../..");
 loadDotenv({ path: path.resolve(repoRoot, ".env"), override: true });
 loadDotenv({ path: path.resolve(process.cwd(), ".env"), override: false });
 
+function resolveConfiguredStoragePath(): string {
+  const configured = getConfiguredRedditStorageStatePath().trim() || "storage/reddit.json";
+  if (path.isAbsolute(configured)) {
+    return configured;
+  }
+  return path.resolve(repoRoot, configured);
+}
+
 function main(): void {
-  const storagePath = resolveRedditStorageStatePath(getConfiguredRedditStorageStatePath());
+  const storagePath = resolveConfiguredStoragePath();
 
   if (!existsSync(storagePath)) {
     throw new Error(`Reddit session file not found at ${storagePath}`);

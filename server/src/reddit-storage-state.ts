@@ -102,13 +102,14 @@ export function getRedditStorageStateCandidates(configuredPath?: string): string
   const materializedPath = maybeMaterializeRedditStorageStateFromBase64();
   const configured = (configuredPath ?? getConfiguredRedditStorageStatePath()).trim() || "storage/reddit.json";
   const candidates = [
-    materializedPath,
     configured,
     process.env.REDDIT_STORAGE_STATE_PATH,
     process.env.REDDIT_STORAGE_PATH,
     "storage/reddit.json",
     "data/playwright/reddit-storage-state.json",
     "server/data/playwright/reddit-storage-state.json",
+    materializedPath,
+    process.env.REDDIT_STORAGE_RUNTIME_PATH,
   ]
     .map((value) => (typeof value === "string" ? value.trim() : ""))
     .filter((value) => value.length > 0);
