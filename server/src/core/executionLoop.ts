@@ -8,6 +8,9 @@ import { dispatchAgentExecution } from "../services/agentDispatchService.js";
 import { recordSystemMetric, getRecentSystemMetricsSnapshot } from "../ai/feedback/metricsEngine.js";
 import { runAutonomousDecisionCycle } from "../ai/governance/decisionEngine.js";
 import { getActiveCompanyId } from "./companyScope.js";
+import { setCycleState } from "../services/cycle-state.js";
+import { logActivity } from "../services/activity-log.js";
+import { getSystemControls } from "../services/system-controls.js";
 
 const logger = pino({ name: "execution-loop" });
 
@@ -60,6 +63,7 @@ export function executionLoop(db: Db) {
     /** Run one cycle of the execution loop for a company */
     async runCycle(companyId: string): Promise<LoopCycleResult> {
       const cycleStarted = new Date().toISOString();
+      const cycleStartedAtMs = Date.now();
       const companyRow = await db
         .select({ id: companies.id, status: companies.status })
         .from(companies)
@@ -78,6 +82,18 @@ export function executionLoop(db: Db) {
         };
       }
 
+      const controls = await getSystemControls(db, companyId).catch(() => null);
+      await setCycleState(db, companyId, "execution_loop", {
+        status: "running",
+        stage: "planning",
+        currentAction: "analyze_goals",
+        lastError: null,
+        lastRunStartedAt: new Date(cycleStartedAtMs),
+        details: {
+          source: "execution_loop",
+        },
+      }).catch(() => undefined);
+
       const maxExecutionsPerCycle = readPositiveIntEnv(
         "MAX_EXECUTIONS_PER_CYCLE",
         DEFAULT_MAX_EXECUTIONS_PER_CYCLE,
@@ -88,6 +104,24 @@ export function executionLoop(db: Db) {
       );
       const maxActiveAgents = readPositiveIntEnv("MAX_ACTIVE_AGENTS", DEFAULT_MAX_ACTIVE_AGENTS);
       const hourlyBudget = getCompanyExecutionBudgetState(companyId);
+
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "execution-loop",
+        action: "execution.execution.plan",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "pending",
+          source: "execution_loop",
+          maxExecutionsPerCycle,
+          maxExecutionsPerHour,
+          maxActiveAgents,
+          decisionMode: controls?.decisionMode ?? null,
+          autonomyLevel: controls?.autonomyLevel ?? null,
+        },
+      }).catch(() => undefined);
 
       if (hourlyBudget.executionsInWindow >= maxExecutionsPerHour) {
         logger.warn(
@@ -104,6 +138,31 @@ export function executionLoop(db: Db) {
           skippedBy: "hourly_execution_cap",
           maxExecutionsPerHour,
         });
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "execution-loop",
+          action: "execution.execution.result",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            status: "blocked",
+            source: "execution_loop",
+            skippedBy: "hourly_execution_cap",
+            maxExecutionsPerHour,
+          },
+        }).catch(() => undefined);
+        await setCycleState(db, companyId, "execution_loop", {
+          status: "blocked",
+          stage: "idle",
+          currentAction: null,
+          lastRunCompletedAt: new Date(),
+          lastRunDurationMs: Date.now() - cycleStartedAtMs,
+          details: {
+            reason: "hourly_execution_cap",
+            maxExecutionsPerHour,
+          },
+        }).catch(() => undefined);
         return {
           companyId,
           cycleStarted,
@@ -255,6 +314,35 @@ export function executionLoop(db: Db) {
       };
 
       await publishEvent("loop.cycle.completed", { ...result });
+
+      await logActivity(db, {
+        companyId,
+        actorType: "system",
+        actorId: "execution-loop",
+        action: "execution.execution.result",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "success",
+          source: "execution_loop",
+          goalsAnalyzed: plan.goalSnapshots.length,
+          tasksDispatched,
+          agentsActivated: activatedAgentIds.size,
+        },
+      }).catch(() => undefined);
+
+      await setCycleState(db, companyId, "execution_loop", {
+        status: "completed",
+        stage: "idle",
+        currentAction: null,
+        lastRunCompletedAt: new Date(),
+        lastRunDurationMs: Date.now() - cycleStartedAtMs,
+        details: {
+          goalsAnalyzed: plan.goalSnapshots.length,
+          tasksDispatched,
+          agentsActivated: activatedAgentIds.size,
+        },
+      }).catch(() => undefined);
 
       try {
         const taskSuccessRate = tasksDispatched > 0

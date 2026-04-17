@@ -1,8 +1,23 @@
 import type { Db } from "@paperclipai/db";
 import { companies } from "@paperclipai/db";
 import { and, eq } from "@paperclipai/db";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+const activeCompanyScope = new AsyncLocalStorage<string | null>();
+
+export async function withActiveCompanyScope<T>(
+  companyId: string | null,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return activeCompanyScope.run(companyId, fn);
+}
 
 export function getActiveCompanyId(): string | null {
+  const scoped = activeCompanyScope.getStore();
+  if (typeof scoped === "string" && scoped.trim().length > 0) {
+    return scoped.trim();
+  }
+
   const raw = (process.env.ACTIVE_COMPANY_ID ?? "").trim();
   return raw.length > 0 ? raw : null;
 }

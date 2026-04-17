@@ -104,6 +104,35 @@ export type GoalLevel = (typeof GOAL_LEVELS)[number];
 export const GOAL_STATUSES = ["planned", "active", "achieved", "cancelled"] as const;
 export type GoalStatus = (typeof GOAL_STATUSES)[number];
 
+export const CYCLE_MODES = ["launch", "improve", "scale", "dominate"] as const;
+export type CycleMode = (typeof CYCLE_MODES)[number];
+
+export const AUTONOMY_LEVELS = ["manual", "semi", "full"] as const;
+export type AutonomyLevel = (typeof AUTONOMY_LEVELS)[number];
+
+export const TRAFFIC_CHANNELS = ["reddit", "twitter", "indie_hackers", "hacker_news"] as const;
+export type TrafficChannel = (typeof TRAFFIC_CHANNELS)[number];
+
+export const TRAFFIC_MODES = ["conservative", "balanced", "aggressive"] as const;
+export type TrafficMode = (typeof TRAFFIC_MODES)[number];
+
+export const DECISION_MODES = ["approval_required", "approval_for_high_impact", "auto_execute"] as const;
+export type DecisionMode = (typeof DECISION_MODES)[number];
+
+export const CYCLE_STATE_STATUSES = ["idle", "running", "completed", "failed", "blocked", "skipped"] as const;
+export type CycleStateStatus = (typeof CYCLE_STATE_STATUSES)[number];
+
+export const SYSTEM_DECISION_STATUSES = [
+  "pending",
+  "awaiting_approval",
+  "approved",
+  "rejected",
+  "executed",
+  "failed",
+  "overridden",
+] as const;
+export type SystemDecisionStatus = (typeof SYSTEM_DECISION_STATUSES)[number];
+
 export const PROJECT_STATUSES = [
   "backlog",
   "planned",

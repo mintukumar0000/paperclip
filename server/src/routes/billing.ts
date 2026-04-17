@@ -20,6 +20,7 @@ import {
   normalizeFeatureKey,
   setEntitlement,
 } from "../lib/entitlements.js";
+import { recordPricingConversion } from "../core/pricingOptimizer.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -1362,6 +1363,37 @@ export function billingRoutes(db: Db) {
       "data.name",
       "customer_name",
     ]);
+
+    const pricingTier =
+      readString(metadata.pricingCheckoutTier)
+      ?? readString(metadata.pricing_checkout_tier)
+      ?? readString(metadata.pricingRequestedTier)
+      ?? readString(metadata.pricing_requested_tier)
+      ?? readString(metadata.tier);
+    const pricingVariantId =
+      readString(metadata.pricingVariantId)
+      ?? readString(metadata.pricing_variant_id)
+      ?? readString(metadata.variantId)
+      ?? readString(metadata.variant_id);
+    const pricingVariantPriceCents =
+      readNumber(metadata.pricingVariantPriceCents)
+      ?? readNumber(metadata.pricing_variant_price_cents)
+      ?? readNumber(metadata.pricingVariantCents)
+      ?? readNumber(metadata.pricing_variant_cents);
+
+    if (emailForPosthog && pricingTier) {
+      await recordPricingConversion(
+        db,
+        companyId,
+        emailForPosthog,
+        amountCents,
+        pricingTier,
+        {
+          variantId: pricingVariantId,
+          assignedPriceCents: pricingVariantPriceCents,
+        },
+      ).catch(() => undefined);
+    }
 
     await recordPaymentEvent(db, {
       companyId,

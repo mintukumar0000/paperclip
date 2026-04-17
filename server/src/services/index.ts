@@ -18,6 +18,16 @@ export { logActivity, type LogActivityInput } from "./activity-log.js";
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
 export { messageService } from "./messages.js";
+export {
+  getSystemControls,
+  updateSystemControls,
+  listSystemDecisions,
+  getSystemDecisionById,
+  createSystemDecision,
+  resolveSystemDecision,
+  setSystemDecisionExecutionResult,
+  isDecisionKeyBlocked,
+} from "./system-controls.js";
 export { dispatchAgentExecution } from "./agentDispatchService.js";
 export { dispatchDecisionCycle, runDecisionCycleForCompany } from "./decision-dispatch.js";
 export {

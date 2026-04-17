@@ -21,10 +21,18 @@ import {
 import type { SystemMetricSnapshot } from "../feedback/metricsEngine.js";
 import { analyzeMeisticsWithLLM } from "./llmDecisionAdvisor.js";
 import { recordActionOutcome } from "../../memory/embeddingMemory.js";
+import {
+  createSystemDecision,
+  getSystemControls,
+  shouldRequireApprovalForAction,
+  isDecisionKeyBlocked,
+  setSystemDecisionExecutionResult,
+} from "../../services/system-controls.js";
+import { setCycleState } from "../../services/cycle-state.js";
 
 const logger = pino({ name: "decision-engine" });
 
-export type DecisionActionType = "create_issue" | "update_strategy" | "trigger_expansion";
+export type DecisionActionType = "create_issue" | "update_strategy" | "trigger_expansion" | "run_traffic_cycle";
 
 export interface DecisionAction {
   type: DecisionActionType;
@@ -66,6 +74,7 @@ function mapFeedbackToDecisionActions(
   companyId: string,
   feedback: FeedbackAction[],
   metrics: SystemMetricSnapshot,
+  options?: { trafficScaleThreshold?: number },
 ): DecisionAction[] {
   const actions: DecisionAction[] = [];
 
@@ -246,12 +255,15 @@ function mapFeedbackToDecisionActions(
     });
   }
 
-  const trafficScaleThreshold = Number(process.env.DECISION_TRAFFIC_SCALE_THRESHOLD ?? 120);
-  if (metrics.sample_count >= 3 && metrics.traffic < (Number.isFinite(trafficScaleThreshold) ? trafficScaleThreshold : 120)) {
+  const trafficScaleThreshold =
+    typeof options?.trafficScaleThreshold === "number" && Number.isFinite(options.trafficScaleThreshold)
+      ? Math.max(1, options.trafficScaleThreshold)
+      : 120;
+  if (metrics.sample_count >= 3 && metrics.traffic < trafficScaleThreshold) {
     actions.push({
       type: "create_issue",
       key: "reddit_autopost_boost",
-      reason: `Traffic ${metrics.traffic} is below threshold ${Number.isFinite(trafficScaleThreshold) ? trafficScaleThreshold : 120}; increase autonomous Reddit distribution.`,
+      reason: `Traffic ${metrics.traffic} is below threshold ${trafficScaleThreshold}; increase autonomous Reddit distribution.`,
       payload: {
         title: "Boost autonomous Reddit posting on low traffic",
         description:
@@ -474,6 +486,7 @@ async function executeAction(
   db: Db,
   companyId: string,
   action: DecisionAction,
+  decisionId?: string,
 ): Promise<{ success: boolean; details?: Record<string, unknown>; error?: string }> {
   if (!shouldExecuteAction(companyId, action.key)) {
     return {
@@ -573,6 +586,29 @@ async function executeAction(
     }
 
     return { success: true, details: { expansionRequests: requests } };
+  }
+
+  if (action.type === "run_traffic_cycle") {
+    const { runTrafficCycleWithDecision } = await import("../../core/trafficLoop.js");
+    const baseUrl =
+      typeof action.payload.baseUrl === "string" && action.payload.baseUrl.trim().length > 0
+        ? action.payload.baseUrl.trim()
+        : (process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ?? "http://localhost:3100").trim();
+
+    const summary = await runTrafficCycleWithDecision({ db, baseUrl }, {
+      bypassDecisionGate: true,
+      decisionId,
+    });
+
+    return {
+      success: summary.successCount > 0 || summary.failCount === 0,
+      details: {
+        successCount: summary.successCount,
+        failCount: summary.failCount,
+        error: summary.error ?? null,
+      },
+      error: summary.error,
+    };
   }
 
   return { success: false, error: `Unsupported action type: ${action.type}` };
@@ -740,6 +776,84 @@ async function executeDirectAction(
   return { attempted: false, success: false, details: { reason: "no_direct_handler" } };
 }
 
+function deriveDecisionEvidence(
+  action: DecisionAction,
+  metrics: SystemMetricSnapshot,
+): { metricName: string | null; metricValue: number | null; thresholdValue: number | null } {
+  const key = action.key.toLowerCase();
+  if (key.includes("traffic") || key.includes("reddit") || key.includes("distribution")) {
+    return { metricName: "traffic", metricValue: metrics.traffic, thresholdValue: 120 };
+  }
+  if (key.includes("conversion")) {
+    return { metricName: "conversion_rate", metricValue: metrics.conversion_rate, thresholdValue: 2 };
+  }
+  if (key.includes("payment")) {
+    return {
+      metricName: "payment_conversion_rate",
+      metricValue: metrics.payment_conversion_rate,
+      thresholdValue: 1,
+    };
+  }
+  if (key.includes("revenue") || key.includes("pricing") || key.includes("monetization")) {
+    return { metricName: "revenue_per_visit", metricValue: metrics.revenue_per_visit, thresholdValue: 50 };
+  }
+  if (key.includes("task") || key.includes("strategy")) {
+    return { metricName: "task_success_rate", metricValue: metrics.task_success_rate, thresholdValue: 0.6 };
+  }
+  return { metricName: null, metricValue: null, thresholdValue: null };
+}
+
+export async function executeDecisionActionNow(
+  db: Db,
+  companyId: string,
+  action: DecisionAction,
+  source: DecisionCycleInput["source"] | "approval" = "manual",
+  decisionId?: string,
+): Promise<{ success: boolean; details?: Record<string, unknown>; error?: string }> {
+  try {
+    const result = await executeAction(db, companyId, action, decisionId);
+    const details: Record<string, unknown> = result.details ? { ...result.details } : {};
+    const issueId = typeof details.issueId === "string" ? details.issueId : null;
+    const skipped = details.skipped === true;
+
+    if (skipped) {
+      const fallbackReason = typeof details.reason === "string" ? details.reason : "skipped";
+      const fallback = await createFallbackForSkippedAction(db, companyId, action, fallbackReason);
+      if (fallback) {
+        details.fallback = fallback;
+        details.fallbackTriggered = true;
+      }
+    }
+
+    if (result.success && !skipped) {
+      const direct = await executeDirectAction(db, companyId, action);
+      details.directExecution = direct;
+
+      if (issueId && direct.success) {
+        await issueService(db).update(issueId, { status: "done" });
+        details.issueCompleted = true;
+      }
+    }
+
+    const completed = !skipped && (details.issueCompleted === true || action.type !== "create_issue");
+    details.completed = completed;
+    const success = result.success && !skipped;
+
+    await recordActionOutcome(db, companyId, action.key, success, {
+      actionType: action.type,
+      reason: action.reason,
+      skipped,
+      source,
+      decisionId: decisionId ?? null,
+    }).catch(() => {});
+
+    return { success, details, error: result.error };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Action execution failed";
+    return { success: false, error: message };
+  }
+}
+
 export async function runAutonomousDecisionCycle(
   db: Db,
   input: DecisionCycleInput,
@@ -764,185 +878,212 @@ export async function runAutonomousDecisionCycle(
     };
   }
 
-  const feedback = runBehaviorFeedback(input.companyId, {
-    traffic: input.metrics.traffic,
-    conversions: input.metrics.conversions,
-    revenueCents: input.metrics.revenue,
-    taskSuccessRate: input.metrics.task_success_rate,
-    costPerActionCents: input.metrics.cost_per_action,
-    conversionRatePercent: input.metrics.conversion_rate,
-    bounceRatePercent: input.metrics.bounce_rate,
-    sampleCount: input.metrics.sample_count,
+  const cycleStartedAt = Date.now();
+  await setCycleState(db, input.companyId, "decision_engine", {
+    status: "running",
+    stage: "planning",
+    currentAction: "collect_feedback",
+    lastError: null,
+    lastRunStartedAt: new Date(cycleStartedAt),
+    details: { source: input.source },
   });
 
-  const ruleActions = mapFeedbackToDecisionActions(input.companyId, feedback, input.metrics);
-
-  // STEP 3: LLM Decision Intelligence Layer
-  let llmAdvice: Awaited<ReturnType<typeof analyzeMeisticsWithLLM>> = null;
-  const llmEnabled = (process.env.LLM_DECISION_ENABLED ?? "true").trim().toLowerCase() !== "false";
-  if (llmEnabled && input.metrics.sample_count >= 3) {
-    try {
-      llmAdvice = await analyzeMeisticsWithLLM(db, input.companyId, input.metrics, ruleActions);
-    } catch (err) {
-      logger.warn({ err }, "LLM decision advisor error (non-fatal)");
-    }
-  }
-
-  const proposedActions = llmAdvice?.suggestedActions
-    ? dedupeDecisionActions([...ruleActions, ...llmAdvice.suggestedActions])
-    : ruleActions;
-
-  const currentRpv = currentRPVCents(input.metrics);
-  const rpvMode = selectRpvExecutionMode(input.metrics);
-  const actions = proposedActions.filter((action) => {
-    if (rpvMode === "exploration") return true;
-    if (rpvMode === "validation") return !rejectActionInValidationMode(action, currentRpv);
-    return !rejectAction(action, currentRpv);
-  });
-  const rejectedByRpv = proposedActions.filter((action) => {
-    if (rpvMode === "exploration") return false;
-    if (rpvMode === "validation") return rejectActionInValidationMode(action, currentRpv);
-    return rejectAction(action, currentRpv);
-  });
-
-  if (rpvMode === "exploration") {
-    await db.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "system",
-      actorId: "decision-engine",
-      agentId: null,
-      runId: null,
-      action: "ai.decision.rpv_gate.bypassed",
-      entityType: "company",
-      entityId: input.companyId,
-      details: {
-        source: input.source,
-        revenue: input.metrics.revenue,
-        traffic: input.metrics.traffic,
-        reason: "early_stage_zero_revenue",
-      },
-    });
-  }
-
-  await db.insert(activityLog).values({
-    companyId: input.companyId,
-    actorType: "system",
-    actorId: "decision-engine",
-    agentId: null,
-    runId: null,
-    action: "ai.decision.rpv_gate.mode",
-    entityType: "company",
-    entityId: input.companyId,
-    details: {
-      source: input.source,
-      mode: rpvMode,
-      revenue: input.metrics.revenue,
+  try {
+    const feedback = runBehaviorFeedback(input.companyId, {
       traffic: input.metrics.traffic,
-      currentRpv,
-      validationThresholdCents: getValidationRevenueThresholdCents(),
-      proposedCount: proposedActions.length,
-      allowedCount: actions.length,
-      rejectedCount: rejectedByRpv.length,
-    },
-  });
+      conversions: input.metrics.conversions,
+      revenueCents: input.metrics.revenue,
+      taskSuccessRate: input.metrics.task_success_rate,
+      costPerActionCents: input.metrics.cost_per_action,
+      conversionRatePercent: input.metrics.conversion_rate,
+      bounceRatePercent: input.metrics.bounce_rate,
+      sampleCount: input.metrics.sample_count,
+    });
 
-  if (rejectedByRpv.length > 0) {
+    const controls = await getSystemControls(db, input.companyId);
+    const decisionMode = (controls.decisionMode ?? "approval_for_high_impact") as
+      | "approval_required"
+      | "approval_for_high_impact"
+      | "auto_execute";
+    const trafficScaleThreshold = Math.max(30, controls.postFrequency * 60);
+
+    const ruleActions = mapFeedbackToDecisionActions(input.companyId, feedback, input.metrics, {
+      trafficScaleThreshold,
+    });
+
+    let llmAdvice: Awaited<ReturnType<typeof analyzeMeisticsWithLLM>> = null;
+    const llmEnabled = (process.env.LLM_DECISION_ENABLED ?? "true").trim().toLowerCase() !== "false";
+    if (llmEnabled && input.metrics.sample_count >= 3) {
+      try {
+        llmAdvice = await analyzeMeisticsWithLLM(db, input.companyId, input.metrics, ruleActions);
+      } catch (err) {
+        logger.warn({ err }, "LLM decision advisor error (non-fatal)");
+      }
+    }
+
+    const proposedActions = llmAdvice?.suggestedActions
+      ? dedupeDecisionActions([...ruleActions, ...llmAdvice.suggestedActions])
+      : ruleActions;
+
+    const currentRpv = currentRPVCents(input.metrics);
+    const rpvMode = selectRpvExecutionMode(input.metrics);
+    const actions = proposedActions.filter((action) => {
+      if (rpvMode === "exploration") return true;
+      if (rpvMode === "validation") return !rejectActionInValidationMode(action, currentRpv);
+      return !rejectAction(action, currentRpv);
+    });
+    const rejectedByRpv = proposedActions.filter((action) => {
+      if (rpvMode === "exploration") return false;
+      if (rpvMode === "validation") return rejectActionInValidationMode(action, currentRpv);
+      return rejectAction(action, currentRpv);
+    });
+
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "system",
       actorId: "decision-engine",
       agentId: null,
       runId: null,
-      action: "ai.decision.action.rejected.rpv",
+      action: "decision.execution.plan",
       entityType: "company",
       entityId: input.companyId,
       details: {
+        status: "pending",
         source: input.source,
-        mode: rpvMode,
-        currentRpv,
-        rejectedCount: rejectedByRpv.length,
-        rejectedKeys: rejectedByRpv.map((entry) => entry.key),
+        decisionMode,
+        rpvMode,
+        proposedCount: proposedActions.length,
+        actionCount: actions.length,
+        rejectedByRpv: rejectedByRpv.map((entry) => entry.key),
       },
     });
-  }
 
-  if (llmAdvice) {
-    await db.insert(activityLog).values({
-      companyId: input.companyId,
-      actorType: "system",
-      actorId: "decision-engine-llm",
-      agentId: null,
-      runId: null,
-      action: "ai.decision.llm.analysis",
-      entityType: "company",
-      entityId: input.companyId,
+    if (llmAdvice) {
+      await db.insert(activityLog).values({
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "decision-engine-llm",
+        agentId: null,
+        runId: null,
+        action: "ai.decision.llm.analysis",
+        entityType: "company",
+        entityId: input.companyId,
+        details: {
+          reasoning: llmAdvice.reasoning,
+          pricingAdvice: llmAdvice.pricingAdvice,
+          audienceAdvice: llmAdvice.audienceAdvice,
+          channelAdvice: llmAdvice.channelAdvice,
+          suggestedActionCount: llmAdvice.suggestedActions.length,
+          source: input.source,
+        },
+      });
+    }
+
+    const executed: DecisionCycleResult["executed"] = [];
+    await setCycleState(db, input.companyId, "decision_engine", {
+      status: "running",
+      stage: "executing",
+      currentAction: actions[0]?.key ?? "no_actions",
       details: {
-        reasoning: llmAdvice.reasoning,
-        pricingAdvice: llmAdvice.pricingAdvice,
-        audienceAdvice: llmAdvice.audienceAdvice,
-        channelAdvice: llmAdvice.channelAdvice,
-        suggestedActionCount: llmAdvice.suggestedActions.length,
         source: input.source,
+        actionCount: actions.length,
       },
     });
-  }
 
-  const executed: DecisionCycleResult["executed"] = [];
-  for (const action of actions) {
-    try {
-      const result = await executeAction(db, input.companyId, action);
-      const details: Record<string, unknown> = result.details ? { ...result.details } : {};
-      const issueId = typeof details.issueId === "string" ? details.issueId : null;
-      const skipped = details.skipped === true;
+    for (const action of actions) {
+      const evidence = deriveDecisionEvidence(action, input.metrics);
+      const requiresApproval =
+        controls.autonomyLevel === "manual"
+        || shouldRequireApprovalForAction(decisionMode, action.type, action.key);
+      const decisionRow = await createSystemDecision(db, {
+        companyId: input.companyId,
+        source: input.source,
+        actionType: action.type,
+        actionKey: action.key,
+        reason: action.reason,
+        metricName: evidence.metricName,
+        metricValue: evidence.metricValue,
+        thresholdValue: evidence.thresholdValue,
+        actionPayload: action.payload,
+        status: requiresApproval ? "awaiting_approval" : "pending",
+      });
 
-      if (skipped) {
-        const fallbackReason = typeof details.reason === "string" ? details.reason : "skipped";
-        const fallback = await createFallbackForSkippedAction(db, input.companyId, action, fallbackReason);
-        if (fallback) {
-          details.fallback = fallback;
-          details.fallbackTriggered = true;
-        }
+      if (requiresApproval) {
+        const pendingDetails = {
+          status: "pending",
+          source: input.source,
+          decisionMode,
+          decisionId: decisionRow.id,
+          pendingApproval: true,
+          actionType: action.type,
+          actionKey: action.key,
+          reason: action.reason,
+        };
+        executed.push({ action, success: false, details: pendingDetails });
+
+        await db.insert(activityLog).values({
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "decision-engine",
+          agentId: null,
+          runId: null,
+          action: "decision.execution.awaiting_approval",
+          entityType: "company",
+          entityId: input.companyId,
+          details: pendingDetails,
+        });
+        continue;
       }
 
-      // STEP 2: After creating an issue, also trigger direct execution
-      if (result.success && !skipped) {
-        const direct = await executeDirectAction(db, input.companyId, action);
-        details.directExecution = direct;
-
-        if (issueId && direct.success) {
-          await issueService(db).update(issueId, { status: "done" });
-          details.issueCompleted = true;
+      if (controls.autonomyLevel === "semi") {
+        const blockedByOverride = await isDecisionKeyBlocked(db, input.companyId, action.key, 24);
+        if (blockedByOverride) {
+          await setSystemDecisionExecutionResult(db, input.companyId, decisionRow.id, {
+            status: "overridden",
+            note: "blocked by recent operator rejection",
+          });
+          const blockedDetails = {
+            status: "blocked",
+            decisionId: decisionRow.id,
+            skipped: true,
+            reason: "blocked_by_operator_override",
+            actionType: action.type,
+            actionKey: action.key,
+          };
+          executed.push({
+            action,
+            success: false,
+            details: blockedDetails,
+          });
           await db.insert(activityLog).values({
             companyId: input.companyId,
             actorType: "system",
             actorId: "decision-engine",
             agentId: null,
             runId: null,
-            action: "ai.decision.action.completed",
-            entityType: "issue",
-            entityId: issueId,
-            details: {
-              source: input.source,
-              key: action.key,
-              reason: "direct_execution_success",
-            },
+            action: "decision.execution.blocked",
+            entityType: "company",
+            entityId: input.companyId,
+            details: blockedDetails,
           });
+          continue;
         }
       }
 
-      const completed = !skipped && (details.issueCompleted === true || action.type !== "create_issue");
-      details.completed = completed;
-      const successForTelemetry = result.success && !skipped;
+      const actionResult = await executeDecisionActionNow(db, input.companyId, action, input.source, decisionRow.id);
+      await setSystemDecisionExecutionResult(db, input.companyId, decisionRow.id, {
+        status: actionResult.success ? "executed" : "failed",
+        note: actionResult.error ?? null,
+      });
 
-      executed.push({ action, success: successForTelemetry, details, error: result.error });
+      const details: Record<string, unknown> = {
+        ...(actionResult.details ?? {}),
+        status: actionResult.success ? "success" : "failed",
+        decisionId: decisionRow.id,
+      };
+      const issueId = typeof details.issueId === "string" ? details.issueId : null;
 
-      // STEP 4: Record action outcome in vector memory for learning
-      await recordActionOutcome(db, input.companyId, action.key, successForTelemetry, {
-        actionType: action.type,
-        reason: action.reason,
-        skipped,
-        source: input.source,
-      }).catch(() => {});
+      executed.push({ action, success: actionResult.success, details, error: actionResult.error });
 
       await db.insert(activityLog).values({
         companyId: input.companyId,
@@ -950,17 +1091,18 @@ export async function runAutonomousDecisionCycle(
         actorId: "decision-engine",
         agentId: null,
         runId: null,
-        action: "ai.decision.action.executed",
+        action: "decision.execution.result",
         entityType: issueId ? "issue" : "company",
         entityId: issueId ?? input.companyId,
         details: {
           source: input.source,
+          decisionMode,
           actionType: action.type,
-          key: action.key,
+          actionKey: action.key,
           reason: action.reason,
-          success: successForTelemetry,
+          success: actionResult.success,
           ...details,
-          error: result.error ?? null,
+          error: actionResult.error ?? null,
         },
       });
 
@@ -969,64 +1111,91 @@ export async function runAutonomousDecisionCycle(
         source: input.source,
         actionType: action.type,
         key: action.key,
-        success: successForTelemetry,
-        details: details,
-        error: result.error ?? null,
+        success: actionResult.success,
+        details,
+        error: actionResult.error ?? null,
         timestamp: new Date().toISOString(),
       });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Action execution failed";
-      executed.push({ action, success: false, error: message });
-      logger.error({ err, companyId: input.companyId, action }, "Decision action failed");
     }
-  }
 
-  const result: DecisionCycleResult = {
-    companyId: input.companyId,
-    source: input.source,
-    feedback,
-    actions,
-    executed,
-  };
+    const result: DecisionCycleResult = {
+      companyId: input.companyId,
+      source: input.source,
+      feedback,
+      actions,
+      executed,
+    };
 
-  eventBus.publish("decision.cycle.completed", {
-    companyId: input.companyId,
-    source: input.source,
-    feedbackCount: feedback.length,
-    actionCount: actions.length,
-    executedCount: executed.length,
-    successCount: executed.filter((entry) => entry.success).length,
-    timestamp: new Date().toISOString(),
-  });
-
-  await db.insert(activityLog).values({
-    companyId: input.companyId,
-    actorType: "system",
-    actorId: "decision-engine",
-    agentId: null,
-    runId: null,
-    action: "ai.decision.cycle.completed",
-    entityType: "company",
-    entityId: input.companyId,
-    details: {
+    eventBus.publish("decision.cycle.completed", {
+      companyId: input.companyId,
       source: input.source,
       feedbackCount: feedback.length,
       actionCount: actions.length,
       executedCount: executed.length,
       successCount: executed.filter((entry) => entry.success).length,
-    },
-  });
+      timestamp: new Date().toISOString(),
+    });
 
-  logger.info(
-    {
+    await db.insert(activityLog).values({
       companyId: input.companyId,
-      source: input.source,
-      feedbackCount: feedback.length,
-      actionCount: actions.length,
-      successCount: executed.filter((entry) => entry.success).length,
-    },
-    "Autonomous decision cycle completed",
-  );
+      actorType: "system",
+      actorId: "decision-engine",
+      agentId: null,
+      runId: null,
+      action: "decision.execution.cycle.result",
+      entityType: "company",
+      entityId: input.companyId,
+      details: {
+        status: "success",
+        source: input.source,
+        feedbackCount: feedback.length,
+        actionCount: actions.length,
+        executedCount: executed.length,
+        successCount: executed.filter((entry) => entry.success).length,
+        pendingApprovalCount: executed.filter((entry) => entry.details?.pendingApproval === true).length,
+      },
+    });
 
-  return result;
+    await setCycleState(db, input.companyId, "decision_engine", {
+      status: "completed",
+      stage: "idle",
+      currentAction: null,
+      lastRunCompletedAt: new Date(),
+      lastRunDurationMs: Date.now() - cycleStartedAt,
+      details: {
+        source: input.source,
+        feedbackCount: feedback.length,
+        actionCount: actions.length,
+        executedCount: executed.length,
+        successCount: executed.filter((entry) => entry.success).length,
+      },
+    });
+
+    logger.info(
+      {
+        companyId: input.companyId,
+        source: input.source,
+        feedbackCount: feedback.length,
+        actionCount: actions.length,
+        successCount: executed.filter((entry) => entry.success).length,
+      },
+      "Autonomous decision cycle completed",
+    );
+
+    return result;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "decision cycle failed";
+    await setCycleState(db, input.companyId, "decision_engine", {
+      status: "failed",
+      stage: "idle",
+      currentAction: null,
+      lastError: message,
+      lastRunCompletedAt: new Date(),
+      lastRunDurationMs: Date.now() - cycleStartedAt,
+      details: {
+        source: input.source,
+      },
+    }).catch(() => undefined);
+    throw err;
+  }
 }

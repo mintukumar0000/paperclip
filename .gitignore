@@ -41,3 +41,8 @@ tmp/
 .vscode/
 .claude/settings.local.json
 .paperclip-local/
+
+# Generated local runtime artifacts
+server/tsx-501/
+server/playwright-artifacts-*/
+server/playwright_chromiumdev_profile-*/

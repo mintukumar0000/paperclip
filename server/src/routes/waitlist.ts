@@ -40,15 +40,15 @@ let resolvingOfferProductIds: Promise<Record<OfferTier, string | null>> | null =
 
 const OFFER_TIER_CONFIG: Record<OfferTier, { defaultPriceCents: number; defaultName: string }> = {
   entry: {
-    defaultPriceCents: 500,
+    defaultPriceCents: 900,
     defaultName: "Founder Cold Email Template Pack",
   },
   upsell: {
-    defaultPriceCents: 1500,
+    defaultPriceCents: 1900,
     defaultName: "Founder Outbound Pro Pack",
   },
   premium: {
-    defaultPriceCents: 4900,
+    defaultPriceCents: 2900,
     defaultName: "Founder Revenue System Premium",
   },
 };
@@ -96,6 +96,22 @@ function firstString(root: unknown, keys: string[]): string | null {
 function resolveOfferTier(raw: string | null): OfferTier {
   if (raw === "upsell" || raw === "premium") return raw;
   return "entry";
+}
+
+function mapPriceToOfferTier(priceCents: number): OfferTier {
+  const tiers: OfferTier[] = ["entry", "upsell", "premium"];
+  let winner: OfferTier = "entry";
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const tier of tiers) {
+    const distance = Math.abs(offerPriceFromEnv(tier) - Math.max(0, priceCents));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      winner = tier;
+    }
+  }
+
+  return winner;
 }
 
 function offerPriceFromEnv(tier: OfferTier): number {
@@ -515,6 +531,12 @@ async function resolveOfferCheckoutUrl(
   name: string | null,
   companyId: string | null,
   tier: OfferTier,
+  pricing?: {
+    variantId?: string | null;
+    variantPriceCents?: number | null;
+    variantLabel?: string | null;
+    requestedTier?: OfferTier;
+  },
 ): Promise<string | null> {
   const hostedCheckout = (process.env.WAITLIST_OFFER_PAYMENT_LINK ?? process.env.DODO_PAYMENTS_CHECKOUT_URL ?? "").trim();
   const productIds = await ensureOfferProductIds();
@@ -534,6 +556,11 @@ async function resolveOfferCheckoutUrl(
             name,
             companyId,
             tier,
+            pricingVariantId: pricing?.variantId ?? null,
+            pricingVariantPriceCents: pricing?.variantPriceCents ?? null,
+            pricingVariantLabel: pricing?.variantLabel ?? null,
+            pricingRequestedTier: pricing?.requestedTier ?? tier,
+            pricingCheckoutTier: tier,
           },
         },
         hostedCheckoutUrl: hostedCheckout || undefined,
@@ -923,20 +950,28 @@ export function waitlistRoutes(db: Db) {
   router.get("/waitlist/offer-click", async (req, res) => {
     const email = normalizeEmailQueryString(req.query.email);
     const checkoutFromQuery = normalizeOptionalString(req.query.checkout);
-    const tier = resolveOfferTier(normalizeOptionalString(req.query.tier));
+    const requestedTier = resolveOfferTier(normalizeOptionalString(req.query.tier));
     const requestedCompanyId = normalizeOptionalString(req.query.companyId);
     const companyId = requestedCompanyId ?? await resolveCompanyIdForEmail(db, email);
 
     // Pricing experiment: assign variant for this user
-    const priceVariant = email ? assignPriceVariant(email, tier) : null;
+    const priceVariant = email ? assignPriceVariant(email, requestedTier) : null;
+    const checkoutTier = priceVariant
+      ? mapPriceToOfferTier(priceVariant.priceCents)
+      : requestedTier;
     if (priceVariant && companyId) {
-      await recordPricingImpression(db, companyId, email ?? "unknown", priceVariant, tier).catch(() => {});
+      await recordPricingImpression(db, companyId, email ?? "unknown", priceVariant, requestedTier).catch(() => {});
     }
 
     let checkout: string | null = null;
 
     if (email) {
-      checkout = await resolveOfferCheckoutUrl(email, null, companyId, tier);
+      checkout = await resolveOfferCheckoutUrl(email, null, companyId, checkoutTier, {
+        variantId: priceVariant?.id ?? null,
+        variantPriceCents: priceVariant?.priceCents ?? null,
+        variantLabel: priceVariant?.label ?? null,
+        requestedTier,
+      });
     }
 
     if (!checkout && checkoutFromQuery) {
@@ -965,7 +1000,8 @@ export function waitlistRoutes(db: Db) {
       email: email ?? "unknown",
       source: "waitlist_offer",
       checkout,
-      tier,
+      tier: requestedTier,
+      checkout_tier: checkoutTier,
       companyId,
       checkout_mode: checkoutMode,
       entry_point: "email_click",
@@ -974,11 +1010,13 @@ export function waitlistRoutes(db: Db) {
       screen: "offer_click_redirect",
       pricing_variant_id: priceVariant?.id ?? null,
       pricing_variant_cents: priceVariant?.priceCents ?? null,
+      pricing_variant_label: priceVariant?.label ?? null,
     });
 
     console.log("[waitlist.offer-click] payment_started event fired", {
       email: email ?? "unknown",
-      tier,
+      tier: requestedTier,
+      checkoutTier,
       companyId,
       checkoutMode,
       pricingVariant: priceVariant?.id ?? "default",

@@ -21,6 +21,7 @@ export { economyRoutes } from "./economy.js";
 export { billingRoutes } from "./billing.js";
 export { coldEmailRoutes } from "./cold-email.js";
 export { governanceRoutes } from "./governance.js";
+export { systemControlsRoutes } from "./system-controls.js";
 export { stabilityRoutes } from "./stability.js";
 export { simulationRoutes } from "./simulation.js";
 export { systemDebugRoutes } from "./system-debug.js";

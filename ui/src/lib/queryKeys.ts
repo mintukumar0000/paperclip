@@ -65,6 +65,16 @@ export const queryKeys = {
     ["costs", companyId, from, to] as const,
   heartbeats: (companyId: string, agentId?: string) =>
     ["heartbeats", companyId, agentId] as const,
+  systemControls: (companyId: string) => ["system-controls", companyId] as const,
+  systemDecisions: (companyId: string, limit = 100) =>
+    ["system-decisions", companyId, limit] as const,
+  cycleState: (companyId: string) => ["cycle-state", companyId] as const,
+  executionFeed: (
+    companyId: string,
+    categories?: string,
+    statuses?: string,
+    limit: number = 120,
+  ) => ["execution-feed", companyId, categories ?? "all", statuses ?? "all", limit] as const,
   liveRuns: (companyId: string) => ["live-runs", companyId] as const,
   runIssues: (runId: string) => ["run-issues", runId] as const,
   org: (companyId: string) => ["org", companyId] as const,

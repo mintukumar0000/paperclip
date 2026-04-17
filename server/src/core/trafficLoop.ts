@@ -3,7 +3,7 @@ import { companies, waitlistSignups, activityLog, aiLearningRecords } from "@pap
 import { and, eq, sql, desc } from "@paperclipai/db";
 import pino from "pino";
 import { eventBus } from "../events/eventBus.js";
-import { recordSystemMetric } from "../ai/feedback/metricsEngine.js";
+import { getRecentSystemMetricsSnapshot, recordSystemMetric } from "../ai/feedback/metricsEngine.js";
 import { recordContentPerformance } from "../memory/embeddingMemory.js";
 import { getSkillsByCategory } from "../ai/skills/skillStore.js";
 import { buildSkillPromptBlock } from "../ai/skills/applySkills.js";
@@ -11,6 +11,14 @@ import { validateOutput } from "../ai/quality/executionQualityGate.js";
 import { getActiveCompanyId, listScopedCompanyIds } from "./companyScope.js";
 import { resolvePublicBaseUrl, isPublicDeployment } from "../public-base-url.js";
 import { resolveExistingRedditStorageStatePath, resolveRedditStorageStatePath } from "../reddit-storage-state.js";
+import {
+  createSystemDecision,
+  getSystemControls,
+  hasOpenDecisionForActionKey,
+  shouldRequireApprovalForAction,
+} from "../services/system-controls.js";
+import { setCycleState } from "../services/cycle-state.js";
+import { logActivity } from "../services/activity-log.js";
 
 const logger = pino({ name: "traffic-loop" });
 
@@ -18,7 +26,7 @@ function usesCompletionTokens(model: string): boolean {
   return /^gpt-5(?:$|[.-])/.test(model);
 }
 
-type Channel = "reddit" | "twitter";
+type Channel = "reddit" | "twitter" | "indie_hackers" | "hacker_news";
 type RedditFormat = "story" | "tool" | "question";
 
 const DEFAULT_SUBREDDITS = [
@@ -39,27 +47,15 @@ const SUBREDDIT_DESCRIPTIONS: Record<string, string> = {
   microsaas: "Niche SaaS builder community; product updates are accepted when educational and non-spammy.",
 };
 
-function getConfiguredSubreddits(): string[] {
-  const raw = (process.env.REDDIT_SUBREDDITS ?? "").trim();
-  if (!raw) return [...DEFAULT_SUBREDDITS];
-
-  const entries = raw
-    .split(",")
-    .map((entry) => entry.trim().replace(/^r\//i, ""))
-    .filter((entry) => entry.length > 0);
-
-  if (entries.length === 0) return [...DEFAULT_SUBREDDITS];
-
-  const deduped: string[] = [];
-  const seen = new Set<string>();
-  for (const entry of entries) {
-    const key = entry.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(entry);
+function getConfiguredSubreddits(fromControls?: string[] | null): string[] {
+  const controlEntries = Array.isArray(fromControls)
+    ? fromControls.map((entry) => entry.trim()).filter((entry) => entry.length > 0)
+    : [];
+  if (controlEntries.length > 0) {
+    return controlEntries;
   }
 
-  return deduped.length > 0 ? deduped : [...DEFAULT_SUBREDDITS];
+  return [...DEFAULT_SUBREDDITS];
 }
 
 const POST_TEMPLATES = [
@@ -87,9 +83,9 @@ Would love feedback from other builders. What metrics do you track for autonomou
     bodyTemplate: `My AI-powered startup system generates and tests outbound email templates automatically.
 
 Here are the top-performing patterns so far:
-- Urgency-based: "{name}, your $5 founder offer closes in 24h"
-- ROI-focused: "{name}, turn $5 into faster outbound replies this week"
-- Social proof: "{name}, founders are using this $5 pack to close more calls"
+- Urgency-based: "{name}, your $9 founder offer closes in 24h"
+- ROI-focused: "{name}, turn $9 into faster outbound replies this week"
+- Social proof: "{name}, founders are using this $9 pack to close more calls"
 
 These are real templates from a live system with {signups} signups and {revenue} in revenue.
 
@@ -147,11 +143,52 @@ It's not just rule-based anymore — it uses LLM to analyze WHY.
 
 My system actually:
 - Generates its own Reddit posts
-- Tests pricing variants ($5/$9/$19)
+- Tests pricing variants ($9/$19/$29)
 - Learns from payment data
 - Creates tasks without human input
 
 {signups} signups, {revenue} revenue. All autonomous.
+
+{tracking_link}`,
+  },
+];
+
+const INDIE_HACKERS_TEMPLATES = [
+  {
+    title: "Built an autonomous growth loop for a tiny SaaS - metrics and mistakes",
+    body: `Sharing a transparent build update on an autonomous growth loop I've been shipping.
+
+What it currently does:
+- Generates and posts distribution content
+- Tracks attribution into payment events
+- Re-prioritizes actions around revenue-per-visit (RPV)
+
+Current numbers:
+- {signups} signups
+- {revenue} revenue
+- {conversion_rate}% signup conversion
+
+Biggest lesson: attribution wiring mattered more than generation quality in the first phase.
+
+If you're building in public too, what broke first for you: channel quality, conversion, or pricing?
+
+{tracking_link}`,
+  },
+];
+
+const HACKER_NEWS_TEMPLATES = [
+  {
+    title: "Show HN: autonomous startup control loop with RPV-first decisions",
+    text: `I built a control loop that ships distribution + monetization steps, then routes decisions by revenue-per-visit.
+
+Current snapshot: {signups} signups, {revenue} revenue, {conversion_rate}% conversion.
+
+What worked:
+- strict attribution from post -> signup -> payment
+- deterministic verification after each cycle
+- preserving human override boundaries
+
+Would love feedback on where you'd harden this architecture next.
 
 {tracking_link}`,
   },
@@ -197,6 +234,17 @@ interface TrafficCycleSummary {
   successCount: number;
   failCount: number;
   error?: string;
+}
+
+interface ExpansionPostContent {
+  title: string;
+  body: string;
+  trackingLink: string;
+}
+
+interface TrafficLearningBias {
+  channelScores: Record<Channel, number>;
+  preferredSubreddits: string[];
 }
 
 // STEP 6: Self-healing retry state
@@ -299,6 +347,165 @@ function getTelemetryCompanyId(): string | null {
   return billingCompanyId || null;
 }
 
+interface TrafficRuntimeControls {
+  trafficEnabled: boolean;
+  redditEnabled: boolean;
+  twitterEnabled: boolean;
+  indieHackersEnabled: boolean;
+  hackerNewsEnabled: boolean;
+  maxMultiplier: number;
+  postFrequency: number;
+  subredditTargets: string[];
+  trafficChannels: Channel[];
+  trafficMultiplier: number;
+  trafficPostIntervalMs: number;
+  trafficMaxPostsPerCycle: number;
+  trafficSubredditWhitelist: string[];
+  trafficMode: "conservative" | "balanced" | "aggressive";
+  decisionMode: "approval_required" | "approval_for_high_impact" | "auto_execute";
+}
+
+interface TrafficCycleRunOptions {
+  bypassDecisionGate?: boolean;
+  decisionId?: string;
+}
+
+function sortChannelsByBias(channels: Channel[], bias: Record<Channel, number>): Channel[] {
+  return [...channels].sort((left, right) => {
+    if (left === "reddit") return -1;
+    if (right === "reddit") return 1;
+    return (bias[right] ?? 0) - (bias[left] ?? 0);
+  });
+}
+
+function applySubredditBias(subreddits: string[], preferred: string[]): string[] {
+  if (preferred.length === 0) return subreddits;
+
+  const preferredLower = preferred.map((entry) => entry.toLowerCase());
+  const preferredSet = new Set(preferredLower);
+  const pinned: string[] = [];
+  const rest: string[] = [];
+
+  for (const subreddit of subreddits) {
+    if (preferredSet.has(subreddit.toLowerCase())) {
+      pinned.push(subreddit);
+    } else {
+      rest.push(subreddit);
+    }
+  }
+
+  pinned.sort((a, b) => preferredLower.indexOf(a.toLowerCase()) - preferredLower.indexOf(b.toLowerCase()));
+  return [...pinned, ...rest];
+}
+
+async function getTrafficLearningBias(db: Db, companyId: string | null): Promise<TrafficLearningBias> {
+  const defaultBias: TrafficLearningBias = {
+    channelScores: {
+      reddit: 1,
+      twitter: 1,
+      indie_hackers: 1,
+      hacker_news: 1,
+    },
+    preferredSubreddits: [],
+  };
+  if (!companyId) return defaultBias;
+
+  const rows = await db
+    .select({ action: activityLog.action, details: activityLog.details })
+    .from(activityLog)
+    .where(eq(activityLog.companyId, companyId))
+    .orderBy(desc(activityLog.createdAt))
+    .limit(240)
+    .catch(() => []);
+
+  const channelTotals: Record<Channel, { score: number; count: number }> = {
+    reddit: { score: 0, count: 0 },
+    twitter: { score: 0, count: 0 },
+    indie_hackers: { score: 0, count: 0 },
+    hacker_news: { score: 0, count: 0 },
+  };
+  const subredditTotals = new Map<string, { score: number; count: number }>();
+
+  for (const row of rows) {
+    const action = row.action ?? "";
+    const details = (row.details ?? {}) as Record<string, unknown>;
+
+    let channel: Channel | null = null;
+    if (action.startsWith("distribution.reddit.")) channel = "reddit";
+    else if (action.startsWith("distribution.twitter.")) channel = "twitter";
+    else if (action.startsWith("distribution.indie_hackers.")) channel = "indie_hackers";
+    else if (action.startsWith("distribution.hacker_news.")) channel = "hacker_news";
+
+    if (!channel) continue;
+
+    const posted = action.endsWith(".posted");
+    const base = posted ? 1 : -0.75;
+    const upvotes = Number(details.upvotes ?? 0);
+    const comments = Number(details.comments ?? 0);
+    const conversions = Number(details.conversion ?? details.conversions ?? 0);
+    const engagementBoost = (Number.isFinite(upvotes) ? upvotes : 0) * 0.05
+      + (Number.isFinite(comments) ? comments : 0) * 0.1
+      + (Number.isFinite(conversions) ? conversions : 0) * 0.8;
+    const score = base + Math.max(0, engagementBoost);
+
+    channelTotals[channel].score += score;
+    channelTotals[channel].count += 1;
+
+    if (channel === "reddit") {
+      const subreddit = typeof details.subreddit === "string" ? details.subreddit.trim() : "";
+      if (subreddit) {
+        const current = subredditTotals.get(subreddit) ?? { score: 0, count: 0 };
+        current.score += score;
+        current.count += 1;
+        subredditTotals.set(subreddit, current);
+      }
+    }
+  }
+
+  const channelScores: Record<Channel, number> = {
+    reddit: channelTotals.reddit.count > 0 ? channelTotals.reddit.score / channelTotals.reddit.count : 1,
+    twitter: channelTotals.twitter.count > 0 ? channelTotals.twitter.score / channelTotals.twitter.count : 1,
+    indie_hackers: channelTotals.indie_hackers.count > 0 ? channelTotals.indie_hackers.score / channelTotals.indie_hackers.count : 1,
+    hacker_news: channelTotals.hacker_news.count > 0 ? channelTotals.hacker_news.score / channelTotals.hacker_news.count : 1,
+  };
+
+  const preferredSubreddits = [...subredditTotals.entries()]
+    .sort((left, right) => {
+      const leftScore = left[1].score / Math.max(1, left[1].count);
+      const rightScore = right[1].score / Math.max(1, right[1].count);
+      return rightScore - leftScore;
+    })
+    .slice(0, 3)
+    .map(([subreddit]) => subreddit);
+
+  return { channelScores, preferredSubreddits };
+}
+
+async function getRpvTrafficMultiplier(
+  db: Db,
+  companyId: string | null,
+  controls?: TrafficRuntimeControls | null,
+): Promise<number> {
+  const configuredMultiplier = controls
+    ? Math.max(1, Math.min(20, Math.floor(controls.trafficMultiplier || controls.maxMultiplier || 1)))
+    : 1;
+  if (!companyId) return 1;
+
+  const snapshot = await getRecentSystemMetricsSnapshot(db, companyId, 240).catch(() => null);
+  const rpv = snapshot ? Math.max(0, snapshot.revenue_per_visit) : 0;
+
+  const mode = controls?.trafficMode ?? "balanced";
+  let adaptiveMultiplier = 1;
+  if (rpv >= 50) adaptiveMultiplier = mode === "aggressive" ? 3 : 2;
+  else if (rpv >= 20) adaptiveMultiplier = mode === "conservative" ? 1 : 2;
+
+  if (mode === "aggressive" && adaptiveMultiplier < configuredMultiplier) {
+    adaptiveMultiplier = Math.min(configuredMultiplier, adaptiveMultiplier + 1);
+  }
+
+  return Math.min(configuredMultiplier, Math.max(1, adaptiveMultiplier));
+}
+
 function getLLMHeaders(): Record<string, string> {
   const apiKey = (process.env.OPENAI_API_KEY ?? "").trim();
   const headers: Record<string, string> = {
@@ -398,7 +605,11 @@ async function generateLLMTitle(context: string, channel: Channel, subreddit?: s
 
   const channelPrompt = channel === "twitter"
     ? `You write engaging tweet threads. Short, punchy, no hashtags spam. Return ONLY the tweet text.${skillBlock}`
-    : `You write Reddit post titles for r/${subreddit ?? "SideProject"}. Short, authentic, no clickbait. Return ONLY the title text, nothing else.${skillBlock}`;
+    : channel === "indie_hackers"
+      ? `You write Indie Hackers post titles for transparent build-in-public updates. Keep it practical and metric-driven. Return ONLY the title text.${skillBlock}`
+      : channel === "hacker_news"
+        ? `You write Hacker News Show HN style titles. Technical, direct, no hype, no clickbait. Return ONLY the title text.${skillBlock}`
+        : `You write Reddit post titles for r/${subreddit ?? "SideProject"}. Short, authentic, no clickbait. Return ONLY the title text, nothing else.${skillBlock}`;
 
   try {
     const requestBody: Record<string, unknown> = {
@@ -406,7 +617,10 @@ async function generateLLMTitle(context: string, channel: Channel, subreddit?: s
       temperature: 0.8,
       messages: [
         { role: "system", content: channelPrompt },
-        { role: "user", content: `Write a ${channel} ${channel === "reddit" ? "title" : "opening"} for:\n\n${context.slice(0, 500)}` },
+        {
+          role: "user",
+          content: `Write a ${channel} ${channel === "twitter" ? "opening" : "title"} for:\n\n${context.slice(0, 500)}`,
+        },
       ],
     };
     if (usesCompletionTokens(model)) {
@@ -1015,20 +1229,235 @@ async function postToTwitter(
   }
 }
 
-function getEnabledChannels(): Channel[] {
-  const channels: Channel[] = ["reddit"];
-  const twitterEnabled = (process.env.TRAFFIC_LOOP_TWITTER_ENABLED ?? "true").trim().toLowerCase();
-  if (twitterEnabled !== "false" && twitterEnabled !== "0") {
-    channels.push("twitter");
+function getDistributionActionPrefix(channel: Channel): string {
+  if (channel === "reddit") return "distribution.reddit";
+  if (channel === "twitter") return "distribution.twitter";
+  if (channel === "indie_hackers") return "distribution.indie_hackers";
+  return "distribution.hacker_news";
+}
+
+function getWebhookUrlForChannel(channel: Channel): string {
+  if (channel === "indie_hackers") {
+    return (process.env.TRAFFIC_LOOP_INDIE_HACKERS_WEBHOOK_URL ?? "").trim();
   }
-  return channels;
+  if (channel === "hacker_news") {
+    return (process.env.TRAFFIC_LOOP_HACKER_NEWS_WEBHOOK_URL ?? "").trim();
+  }
+  return "";
+}
+
+async function generateExpansionContent(
+  db: Db,
+  baseUrl: string,
+  channel: "indie_hackers" | "hacker_news",
+): Promise<ExpansionPostContent> {
+  const stats = await getSystemStats(db);
+  const trackingLink = `${baseUrl.replace(/\/$/, "")}/api/cold-email?utm_source=${channel}&utm_campaign=auto_loop`;
+
+  if (channel === "indie_hackers") {
+    const template = INDIE_HACKERS_TEMPLATES[Math.floor(Math.random() * INDIE_HACKERS_TEMPLATES.length)]!;
+    const body = template.body
+      .replace(/\{signups\}/g, String(stats.signups))
+      .replace(/\{revenue\}/g, stats.revenue)
+      .replace(/\{conversion_rate\}/g, stats.conversionRate)
+      .replace(/\{tracking_link\}/g, trackingLink);
+    const llmTitle = await generateLLMTitle(body, "indie_hackers", undefined, db);
+    return {
+      title: llmTitle ?? template.title,
+      body,
+      trackingLink,
+    };
+  }
+
+  const template = HACKER_NEWS_TEMPLATES[Math.floor(Math.random() * HACKER_NEWS_TEMPLATES.length)]!;
+  const body = template.text
+    .replace(/\{signups\}/g, String(stats.signups))
+    .replace(/\{revenue\}/g, stats.revenue)
+    .replace(/\{conversion_rate\}/g, stats.conversionRate)
+    .replace(/\{tracking_link\}/g, trackingLink);
+  const llmTitle = await generateLLMTitle(body, "hacker_news", undefined, db);
+  return {
+    title: llmTitle ?? template.title,
+    body,
+    trackingLink,
+  };
+}
+
+async function postToExpansionWebhook(
+  ctx: TrafficLoopContext,
+  channel: "indie_hackers" | "hacker_news",
+  content: ExpansionPostContent,
+): Promise<PostResult> {
+  const webhookUrl = getWebhookUrlForChannel(channel);
+  if (!webhookUrl) {
+    return {
+      posted: false,
+      channel,
+      method: "none",
+      error: `${channel.toUpperCase()} webhook URL not configured`,
+      retries: 0,
+    };
+  }
+
+  if (!isChannelHealthy(channel)) {
+    const health = getChannelHealth(channel);
+    return {
+      posted: false,
+      channel,
+      method: "backoff",
+      error: `Channel unhealthy (${health.consecutiveFailures} failures, backoff ${Math.round(health.backoffMs / 60_000)}min)`,
+      retries: 0,
+    };
+  }
+
+  try {
+    const result = await withRetry(async () => {
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel,
+          title: content.title,
+          body: content.body,
+          trackingLink: content.trackingLink,
+        }),
+      });
+
+      const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+      const posted = response.ok && payload.posted !== false;
+      const postUrl = typeof payload.postUrl === "string"
+        ? payload.postUrl
+        : typeof payload.url === "string"
+          ? payload.url
+          : null;
+      const error = !posted
+        ? (typeof payload.error === "string" ? payload.error : `Webhook returned ${response.status}`)
+        : null;
+      return { posted, postUrl, error };
+    }, { maxRetries: 2, delayMs: 5_000, channel });
+
+    const companyId = getTelemetryCompanyId();
+    const actionPrefix = getDistributionActionPrefix(channel);
+    if (result.posted) {
+      recordChannelSuccess(channel);
+      if (companyId) {
+        await recordSystemMetric(ctx.db, {
+          companyId,
+          sourceType: "tool_action",
+          sourceId: `${channel}_post_${Date.now()}`,
+          traffic: 1,
+          conversions: 0,
+          revenueCents: 0,
+          metadata: {
+            channel,
+            title: content.title,
+            postUrl: result.postUrl,
+          },
+        });
+        await ctx.db.insert(activityLog).values({
+          companyId,
+          actorType: "system",
+          actorId: "traffic-loop",
+          agentId: null,
+          runId: null,
+          action: `${actionPrefix}.posted`,
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            channel,
+            title: content.title,
+            postUrl: result.postUrl,
+            method: "webhook",
+            retries: result.retries,
+          },
+        });
+        await recordContentPerformance(ctx.db, companyId, channel, content.title, true, {
+          method: "webhook",
+          postUrl: result.postUrl,
+        });
+      }
+    } else {
+      recordChannelFailure(channel);
+      if (companyId) {
+        await ctx.db.insert(activityLog).values({
+          companyId,
+          actorType: "system",
+          actorId: "traffic-loop",
+          agentId: null,
+          runId: null,
+          action: `${actionPrefix}.post.failed`,
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            channel,
+            title: content.title,
+            method: "webhook",
+            retries: result.retries,
+            error: result.error,
+          },
+        }).catch(() => undefined);
+      }
+    }
+
+    return {
+      posted: result.posted,
+      channel,
+      method: "webhook",
+      postUrl: result.postUrl,
+      error: result.error ?? undefined,
+      retries: result.retries,
+    };
+  } catch (err) {
+    recordChannelFailure(channel);
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      posted: false,
+      channel,
+      method: "webhook",
+      error: message,
+      retries: 2,
+    };
+  }
+}
+
+function getEnabledChannels(controls?: TrafficRuntimeControls | null): Channel[] {
+  if (controls) {
+    if (controls.trafficChannels.length > 0) {
+      return controls.trafficChannels;
+    }
+
+    const channels: Channel[] = [];
+    if (controls.redditEnabled) channels.push("reddit");
+    if (controls.twitterEnabled) channels.push("twitter");
+    if (controls.indieHackersEnabled) channels.push("indie_hackers");
+    if (controls.hackerNewsEnabled) channels.push("hacker_news");
+    return channels;
+  }
+
+  return ["reddit", "twitter", "indie_hackers", "hacker_news"];
+}
+
+function getChannelPostPlan(
+  multiplier: number,
+  controls?: TrafficRuntimeControls | null,
+): Record<Channel, number> {
+  const basePosts = controls ? Math.max(1, Math.min(24, Math.floor(controls.postFrequency))) : 1;
+  return {
+    reddit: Math.max(0, Math.min(12, basePosts * multiplier)),
+    twitter: Math.max(0, Math.min(8, basePosts * Math.max(1, multiplier - 1))),
+    indie_hackers: 1,
+    hacker_news: 1,
+  };
 }
 
 let trafficLoopRunning = false;
 let trafficLoopInterval: ReturnType<typeof setInterval> | null = null;
 let postIndex = 0;
 
-async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSummary> {
+async function runTrafficCycle(
+  ctx: TrafficLoopContext,
+  options: TrafficCycleRunOptions = {},
+): Promise<TrafficCycleSummary> {
   if (trafficLoopRunning) {
     logger.warn("Traffic loop cycle already in progress, skipping");
     return { results: [], successCount: 0, failCount: 0, error: "already_running" };
@@ -1036,30 +1465,326 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
 
   trafficLoopRunning = true;
   const results: PostResult[] = [];
+  const cycleStartedAt = Date.now();
 
   try {
-    const subreddits = getConfiguredSubreddits();
-    const channels = getEnabledChannels();
+    const companyId = getTelemetryCompanyId();
+    const controls = companyId
+      ? await getSystemControls(ctx.db, companyId).catch(() => null)
+      : null;
+
+    if (companyId) {
+      await setCycleState(ctx.db, companyId, "traffic", {
+        status: "running",
+        stage: "planning",
+        currentAction: "building_plan",
+        lastError: null,
+        lastRunStartedAt: new Date(cycleStartedAt),
+      }).catch(() => undefined);
+    }
+
+    if (controls && !controls.trafficEnabled) {
+      if (companyId) {
+        await logActivity(ctx.db, {
+          companyId,
+          actorType: "system",
+          actorId: "traffic-loop",
+          action: "traffic.execution.result",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            status: "blocked",
+            reason: "traffic_disabled",
+            successCount: 0,
+            failCount: 0,
+          },
+        }).catch(() => undefined);
+        await setCycleState(ctx.db, companyId, "traffic", {
+          status: "blocked",
+          stage: "idle",
+          currentAction: null,
+          lastRunCompletedAt: new Date(),
+          lastRunDurationMs: Date.now() - cycleStartedAt,
+          details: { reason: "traffic_disabled" },
+        }).catch(() => undefined);
+      }
+      return { results: [], successCount: 0, failCount: 0 };
+    }
+
+    const trafficControls: TrafficRuntimeControls | null = controls
+      ? {
+          trafficEnabled: controls.trafficEnabled,
+          redditEnabled: controls.redditEnabled,
+          twitterEnabled: controls.twitterEnabled,
+          indieHackersEnabled: controls.indieHackersEnabled,
+          hackerNewsEnabled: controls.hackerNewsEnabled,
+          maxMultiplier: controls.maxMultiplier,
+          postFrequency: controls.postFrequency,
+          subredditTargets: controls.subredditTargets,
+          trafficChannels: Array.isArray(controls.trafficChannels)
+            ? controls.trafficChannels.filter((entry): entry is Channel =>
+              entry === "reddit" || entry === "twitter" || entry === "indie_hackers" || entry === "hacker_news",
+            )
+            : [],
+          trafficMultiplier: controls.trafficMultiplier,
+          trafficPostIntervalMs: controls.trafficPostIntervalMs,
+          trafficMaxPostsPerCycle: controls.trafficMaxPostsPerCycle,
+          trafficSubredditWhitelist: Array.isArray(controls.trafficSubredditWhitelist)
+            ? controls.trafficSubredditWhitelist
+            : [],
+          trafficMode: (controls.trafficMode ?? "balanced") as "conservative" | "balanced" | "aggressive",
+          decisionMode: (controls.decisionMode ?? "approval_for_high_impact") as "approval_required" | "approval_for_high_impact" | "auto_execute",
+        }
+      : null;
+
+    const learningBias = await getTrafficLearningBias(ctx.db, companyId);
+    const multiplier = await getRpvTrafficMultiplier(ctx.db, companyId, trafficControls);
+    const configuredSubredditSource =
+      trafficControls?.trafficSubredditWhitelist.length
+        ? trafficControls.trafficSubredditWhitelist
+        : trafficControls?.subredditTargets;
+    const subreddits = applySubredditBias(
+      getConfiguredSubreddits(configuredSubredditSource),
+      learningBias.preferredSubreddits,
+    );
+    const channels = sortChannelsByBias(getEnabledChannels(trafficControls), learningBias.channelScores);
+    const draftPlan = getChannelPostPlan(multiplier, trafficControls);
+    const maxPostsPerCycle = Math.max(1, Math.min(40, trafficControls?.trafficMaxPostsPerCycle ?? 8));
+    const channelPlan: Record<Channel, number> = {
+      reddit: 0,
+      twitter: 0,
+      indie_hackers: 0,
+      hacker_news: 0,
+    };
+    let postsRemaining = maxPostsPerCycle;
+    for (const channel of channels) {
+      const requested = draftPlan[channel] ?? 0;
+      const granted = Math.max(0, Math.min(requested, postsRemaining));
+      channelPlan[channel] = granted;
+      postsRemaining -= granted;
+    }
+
+    const postSpacingMs = Math.max(5_000, trafficControls?.trafficPostIntervalMs ?? 60_000);
+    const twitterStaggerMs = postSpacingMs * 2;
+
+    if (channels.length === 0) {
+      if (companyId) {
+        await logActivity(ctx.db, {
+          companyId,
+          actorType: "system",
+          actorId: "traffic-loop",
+          action: "traffic.execution.result",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            status: "blocked",
+            reason: "no_channels_enabled",
+            successCount: 0,
+            failCount: 0,
+          },
+        }).catch(() => undefined);
+        await setCycleState(ctx.db, companyId, "traffic", {
+          status: "blocked",
+          stage: "idle",
+          currentAction: null,
+          lastRunCompletedAt: new Date(),
+          lastRunDurationMs: Date.now() - cycleStartedAt,
+          details: {
+            reason: "no_channels_enabled",
+          },
+        }).catch(() => undefined);
+      }
+      return { results: [], successCount: 0, failCount: 0 };
+    }
+
+    const runtimeTrafficMode = trafficControls?.trafficMode ?? "balanced";
+    const runtimeDecisionMode = trafficControls?.decisionMode ?? "approval_for_high_impact";
+
+    const trafficDecisionKey = multiplier > 1 || runtimeTrafficMode === "aggressive"
+      ? "traffic.execution.scale"
+      : "traffic.execution.cycle";
+
+    const requiresApproval = companyId && trafficControls && !options.bypassDecisionGate
+      ? shouldRequireApprovalForAction(trafficControls.decisionMode, "run_traffic_cycle", trafficDecisionKey)
+      : false;
+
+    if (companyId && requiresApproval) {
+      const hasOpenDecision = await hasOpenDecisionForActionKey(ctx.db, companyId, trafficDecisionKey, 90);
+      let decisionId: string | null = null;
+
+      if (!hasOpenDecision) {
+        const decision = await createSystemDecision(ctx.db, {
+          companyId,
+          source: "traffic_loop",
+          actionType: "run_traffic_cycle",
+          actionKey: trafficDecisionKey,
+          reason: "Traffic cycle requires approval under current decision mode.",
+          actionPayload: {
+            baseUrl: ctx.baseUrl,
+            channels,
+            channelPlan,
+            multiplier,
+            trafficMode: runtimeTrafficMode,
+          },
+          status: "awaiting_approval",
+        });
+        decisionId = decision.id;
+      }
+
+      await logActivity(ctx.db, {
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        action: "traffic.execution.awaiting_approval",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "pending",
+          decisionMode: runtimeDecisionMode,
+          actionKey: trafficDecisionKey,
+          decisionId,
+          channels,
+          channelPlan,
+          multiplier,
+        },
+      }).catch(() => undefined);
+
+      await setCycleState(ctx.db, companyId, "traffic", {
+        status: "blocked",
+        stage: "awaiting_approval",
+        currentAction: "awaiting_operator_approval",
+        decisionId,
+        lastRunCompletedAt: new Date(),
+        lastRunDurationMs: Date.now() - cycleStartedAt,
+        details: {
+          decisionMode: runtimeDecisionMode,
+          actionKey: trafficDecisionKey,
+          channels,
+          channelPlan,
+        },
+      }).catch(() => undefined);
+
+      return {
+        results: [],
+        successCount: 0,
+        failCount: 0,
+      };
+    }
+
+    if (companyId) {
+      await logActivity(ctx.db, {
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        action: "traffic.execution.plan",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "pending",
+          decisionId: options.decisionId ?? null,
+          channels,
+          channelPlan,
+          subreddits,
+          multiplier,
+          postSpacingMs,
+          maxPostsPerCycle,
+          trafficMode: trafficControls?.trafficMode ?? "balanced",
+          decisionMode: trafficControls?.decisionMode ?? "approval_for_high_impact",
+        },
+      }).catch(() => undefined);
+
+      await setCycleState(ctx.db, companyId, "traffic", {
+        status: "running",
+        stage: "executing",
+        currentAction: channels[0] ?? "none",
+        details: {
+          channels,
+          channelPlan,
+          multiplier,
+        },
+      }).catch(() => undefined);
+    }
+
+    logger.info(
+      {
+        multiplier,
+        channels,
+        redditPlan: channelPlan.reddit,
+        twitterPlan: channelPlan.twitter,
+        preferredSubreddits: learningBias.preferredSubreddits,
+      },
+      "Traffic loop dominate plan",
+    );
 
     // Reddit post
     if (channels.includes("reddit")) {
-      const defaultSubreddit = subreddits[postIndex % subreddits.length]!;
       const stats = await getSystemStats(ctx.db);
-      const selectedSubreddit = await chooseSubredditWithLLM(subreddits, stats);
-      const subreddit = selectedSubreddit ?? defaultSubreddit;
-      logger.info({ subreddit, postIndex }, "Traffic loop: generating Reddit content");
-      const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
-      logger.info({ subreddit, title: content.title.slice(0, 60) }, "Traffic loop: posting to Reddit");
-      results.push(await postToReddit(ctx, content));
+      const llmSelectedSubreddit = await chooseSubredditWithLLM(subreddits, stats);
+
+      for (let redditIndex = 0; redditIndex < channelPlan.reddit; redditIndex++) {
+        const defaultSubreddit = subreddits[(postIndex + redditIndex) % subreddits.length]!;
+        const subreddit = redditIndex === 0
+          ? (llmSelectedSubreddit ?? defaultSubreddit)
+          : defaultSubreddit;
+        logger.info({ subreddit, postIndex, redditIndex }, "Traffic loop: generating Reddit content");
+        const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
+        logger.info({ subreddit, title: content.title.slice(0, 60), redditIndex }, "Traffic loop: posting to Reddit");
+        results.push(await postToReddit(ctx, content));
+
+        if (redditIndex < channelPlan.reddit - 1 && postSpacingMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, postSpacingMs));
+        }
+      }
     }
 
     // Twitter post (staggered 2 min after Reddit to avoid rate limits)
     if (channels.includes("twitter")) {
-      await new Promise((resolve) => setTimeout(resolve, 2 * 60_000));
-      logger.info({}, "Traffic loop: generating Twitter content");
-      const tweet = await generateTweetContent(ctx.db, ctx.baseUrl);
-      logger.info({ textPreview: tweet.text.slice(0, 60) }, "Traffic loop: posting to Twitter");
-      results.push(await postToTwitter(ctx, tweet));
+      if (twitterStaggerMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, twitterStaggerMs));
+      }
+      for (let twitterIndex = 0; twitterIndex < channelPlan.twitter; twitterIndex++) {
+        logger.info({ twitterIndex }, "Traffic loop: generating Twitter content");
+        const tweet = await generateTweetContent(ctx.db, ctx.baseUrl);
+        logger.info({ textPreview: tweet.text.slice(0, 60), twitterIndex }, "Traffic loop: posting to Twitter");
+        results.push(await postToTwitter(ctx, tweet));
+
+        if (twitterIndex < channelPlan.twitter - 1 && postSpacingMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, postSpacingMs));
+        }
+      }
+    }
+
+    if (channels.includes("indie_hackers")) {
+      logger.info({}, "Traffic loop: generating Indie Hackers content");
+      const indieContent = await generateExpansionContent(ctx.db, ctx.baseUrl, "indie_hackers");
+      logger.info({ title: indieContent.title.slice(0, 80) }, "Traffic loop: posting to Indie Hackers webhook");
+      results.push(await postToExpansionWebhook(ctx, "indie_hackers", indieContent));
+    }
+
+    if (channels.includes("hacker_news")) {
+      logger.info({}, "Traffic loop: generating Hacker News content");
+      const hnContent = await generateExpansionContent(ctx.db, ctx.baseUrl, "hacker_news");
+      logger.info({ title: hnContent.title.slice(0, 80) }, "Traffic loop: posting to Hacker News webhook");
+      results.push(await postToExpansionWebhook(ctx, "hacker_news", hnContent));
+    }
+
+    if (companyId) {
+      await logActivity(ctx.db, {
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        action: "traffic.learning.bias.applied",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "info",
+          multiplier,
+          channels,
+          channelPlan,
+          preferredSubreddits: learningBias.preferredSubreddits,
+          channelScores: learningBias.channelScores,
+        },
+      }).catch(() => undefined);
     }
 
     postIndex++;
@@ -1072,6 +1797,41 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
       failCount,
       channels: results.map((r) => `${r.channel}:${r.posted ? "ok" : r.error?.slice(0, 30) ?? "fail"}`),
     }, "Traffic loop cycle completed");
+
+    if (companyId) {
+      await logActivity(ctx.db, {
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        action: "traffic.execution.result",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: failCount > 0 ? "failed" : "success",
+          success: failCount === 0,
+          decisionId: options.decisionId ?? null,
+          successCount,
+          failCount,
+          channels: results.map((r) => ({
+            channel: r.channel,
+            posted: r.posted,
+            retries: r.retries,
+            error: r.error ?? null,
+          })),
+        },
+      }).catch(() => undefined);
+      await setCycleState(ctx.db, companyId, "traffic", {
+        status: failCount > 0 ? "failed" : "completed",
+        stage: "idle",
+        currentAction: null,
+        lastRunCompletedAt: new Date(),
+        lastRunDurationMs: Date.now() - cycleStartedAt,
+        details: {
+          successCount,
+          failCount,
+        },
+      }).catch(() => undefined);
+    }
 
     eventBus.publish("traffic.loop.cycle.completed", {
       results: results.map((r) => ({ channel: r.channel, posted: r.posted, retries: r.retries, error: r.error ?? null })),
@@ -1086,6 +1846,33 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
   } catch (err) {
     logger.error({ err }, "Traffic loop cycle failed");
     const message = err instanceof Error ? err.message : String(err);
+    const companyId = getTelemetryCompanyId();
+    if (companyId) {
+      await logActivity(ctx.db, {
+        companyId,
+        actorType: "system",
+        actorId: "traffic-loop",
+        action: "traffic.execution.result",
+        entityType: "company",
+        entityId: companyId,
+        details: {
+          status: "failed",
+          success: false,
+          decisionId: options.decisionId ?? null,
+          error: message,
+          successCount: results.filter((r) => r.posted).length,
+          failCount: results.filter((r) => !r.posted && r.method !== "none" && r.method !== "backoff").length,
+        },
+      }).catch(() => undefined);
+      await setCycleState(ctx.db, companyId, "traffic", {
+        status: "failed",
+        stage: "idle",
+        currentAction: null,
+        lastError: message,
+        lastRunCompletedAt: new Date(),
+        lastRunDurationMs: Date.now() - cycleStartedAt,
+      }).catch(() => undefined);
+    }
     return {
       results,
       successCount: results.filter((r) => r.posted).length,
@@ -1098,12 +1885,6 @@ async function runTrafficCycle(ctx: TrafficLoopContext): Promise<TrafficCycleSum
 }
 
 export function startTrafficLoop(db: Db, intervalMs = 3 * 60 * 60_000): () => void {
-  const enabled = (process.env.TRAFFIC_LOOP_ENABLED ?? "true").trim().toLowerCase();
-  if (enabled === "false" || enabled === "0" || enabled === "no") {
-    logger.info("Traffic loop disabled via TRAFFIC_LOOP_ENABLED=false");
-    return () => {};
-  }
-
   const baseUrl = resolvePublicBaseUrl();
   if (!baseUrl) {
     if (isPublicDeployment()) {
@@ -1115,11 +1896,7 @@ export function startTrafficLoop(db: Db, intervalMs = 3 * 60 * 60_000): () => vo
   }
 
   const ctx: TrafficLoopContext = { db, baseUrl: baseUrl ?? "http://localhost:3100" };
-
-  const customInterval = Number(process.env.TRAFFIC_LOOP_INTERVAL_MS);
-  const effectiveInterval = Number.isFinite(customInterval) && customInterval > 0
-    ? customInterval
-    : intervalMs;
+  const effectiveInterval = intervalMs;
 
   const channels = getEnabledChannels();
   const subreddits = getConfiguredSubreddits();
@@ -1143,4 +1920,13 @@ export function startTrafficLoop(db: Db, intervalMs = 3 * 60 * 60_000): () => vo
   };
 }
 
-export { runTrafficCycle as _runTrafficCycleForTest };
+export async function runTrafficCycleWithDecision(
+  ctx: TrafficLoopContext,
+  options: TrafficCycleRunOptions = {},
+): Promise<TrafficCycleSummary> {
+  return runTrafficCycle(ctx, options);
+}
+
+export async function _runTrafficCycleForTest(ctx: TrafficLoopContext): Promise<TrafficCycleSummary> {
+  return runTrafficCycle(ctx, { bypassDecisionGate: true });
+}

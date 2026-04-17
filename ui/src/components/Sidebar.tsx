@@ -22,6 +22,7 @@ import {
   Shield,
   HeartPulse,
   FlaskConical,
+  Command,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { SidebarSection } from "./SidebarSection";
@@ -110,6 +111,7 @@ export function Sidebar() {
         <SidebarAgents />
 
         <SidebarSection label="Intelligence">
+          <SidebarNavItem to="/command-center" label="Command Center" icon={Command} />
           <SidebarNavItem to="/strategy" label="Strategy" icon={Sparkles} />
           <SidebarNavItem to="/memory" label="Memory" icon={Brain} />
           <SidebarNavItem to="/messages" label="Messages" icon={MessageSquare} />

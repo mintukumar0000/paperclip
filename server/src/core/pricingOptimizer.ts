@@ -30,19 +30,19 @@ export interface VariantPerformance {
 
 const PRICING_VARIANTS: Record<string, PriceVariant[]> = {
   entry: [
-    { id: "entry_a", priceCents: 500, label: "$5" },
-    { id: "entry_b", priceCents: 900, label: "$9" },
-    { id: "entry_c", priceCents: 700, label: "$7" },
+    { id: "entry_9", priceCents: 900, label: "$9" },
+    { id: "entry_19", priceCents: 1900, label: "$19" },
+    { id: "entry_29", priceCents: 2900, label: "$29" },
   ],
   upsell: [
-    { id: "upsell_a", priceCents: 1500, label: "$15" },
-    { id: "upsell_b", priceCents: 1900, label: "$19" },
-    { id: "upsell_c", priceCents: 2900, label: "$29" },
+    { id: "upsell_9", priceCents: 900, label: "$9" },
+    { id: "upsell_19", priceCents: 1900, label: "$19" },
+    { id: "upsell_29", priceCents: 2900, label: "$29" },
   ],
   premium: [
-    { id: "premium_a", priceCents: 4900, label: "$49" },
-    { id: "premium_b", priceCents: 3900, label: "$39" },
-    { id: "premium_c", priceCents: 6900, label: "$69" },
+    { id: "premium_9", priceCents: 900, label: "$9" },
+    { id: "premium_19", priceCents: 1900, label: "$19" },
+    { id: "premium_29", priceCents: 2900, label: "$29" },
   ],
 };
 
@@ -54,8 +54,8 @@ const experimentState = new Map<string, {
 export function assignPriceVariant(email: string, tier: string): PriceVariant {
   const enabled = (process.env.PRICING_EXPERIMENT_ENABLED ?? "true").trim().toLowerCase();
   if (enabled === "false" || enabled === "0") {
-    const defaults: Record<string, number> = { entry: 500, upsell: 1500, premium: 4900 };
-    return { id: `${tier}_default`, priceCents: defaults[tier] ?? 500, label: `$${((defaults[tier] ?? 500) / 100).toFixed(0)}` };
+    const defaults: Record<string, number> = { entry: 900, upsell: 1900, premium: 2900 };
+    return { id: `${tier}_default`, priceCents: defaults[tier] ?? 900, label: `$${((defaults[tier] ?? 900) / 100).toFixed(0)}` };
   }
 
   const cacheKey = `${email.toLowerCase()}:${tier}`;
@@ -113,9 +113,15 @@ export async function recordPricingConversion(
   email: string,
   amountCents: number,
   tier: string,
+  options?: {
+    variantId?: string | null;
+    assignedPriceCents?: number | null;
+  },
 ): Promise<void> {
   const cacheKey = `${email.toLowerCase()}:${tier}`;
   const assignment = experimentState.get(cacheKey);
+  const resolvedVariantId = options?.variantId ?? assignment?.variant.id ?? "unknown";
+  const resolvedAssignedPrice = options?.assignedPriceCents ?? assignment?.variant.priceCents ?? null;
 
   await db.insert(activityLog).values({
     companyId,
@@ -129,8 +135,8 @@ export async function recordPricingConversion(
     details: {
       email,
       tier,
-      variantId: assignment?.variant.id ?? "unknown",
-      assignedPriceCents: assignment?.variant.priceCents ?? null,
+      variantId: resolvedVariantId,
+      assignedPriceCents: resolvedAssignedPrice,
       actualAmountCents: amountCents,
     },
   });

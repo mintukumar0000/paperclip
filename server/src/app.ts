@@ -46,6 +46,8 @@ import { simulationRoutes } from "./routes/simulation.js";
 import { waitlistRoutes } from "./routes/waitlist.js";
 import { coldEmailRoutes } from "./routes/cold-email.js";
 import { systemDebugRoutes } from "./routes/system-debug.js";
+import { systemControlsRoutes } from "./routes/system-controls.js";
+import { cycleOrchestratorRoutes } from "./routes/cycle-orchestrator.js";
 import { httpRequestDuration, httpRequestsTotal } from "./observability/metrics.js";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 
@@ -240,6 +242,8 @@ export async function createApp(
   api.use(economyRoutes(db));
   api.use(billingRoutes(db));
   api.use(governanceRoutes(db));
+  api.use(systemControlsRoutes(db));
+  api.use(cycleOrchestratorRoutes(db));
   api.use(stabilityRoutes(db));
   api.use(simulationRoutes(db));
   app.use("/api", api);

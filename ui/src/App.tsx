@@ -37,6 +37,7 @@ import { Expansion } from "./pages/Expansion";
 import { Governance } from "./pages/Governance";
 import { Stability } from "./pages/Stability";
 import { Simulation } from "./pages/Simulation";
+import { CommandCenter } from "./pages/CommandCenter";
 import { AuthPage } from "./pages/Auth";
 import { BoardClaimPage } from "./pages/BoardClaim";
 import { InviteLandingPage } from "./pages/InviteLanding";
@@ -146,6 +147,7 @@ function boardRoutes() {
       <Route path="memory" element={<Memory />} />
       <Route path="strategy" element={<Strategy />} />
       <Route path="messages" element={<Messages />} />
+      <Route path="command-center" element={<CommandCenter />} />
       <Route path="ai-dashboard" element={<AIDashboard />} />
       <Route path="ecosystem" element={<Ecosystem />} />
       <Route path="economy" element={<Economy />} />
@@ -255,6 +257,7 @@ export function App() {
           <Route path="projects/:projectId/overview" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/issues" element={<UnprefixedBoardRedirect />} />
           <Route path="projects/:projectId/issues/:filter" element={<UnprefixedBoardRedirect />} />
+          <Route path="command-center" element={<UnprefixedBoardRedirect />} />
           <Route path=":companyPrefix" element={<Layout />}>
             {boardRoutes()}
           </Route>

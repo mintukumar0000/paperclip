@@ -260,6 +260,20 @@
       "when": 1776035600000,
       "tag": "0036_fix_legacy_entitlement_path",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1776447617857,
+      "tag": "0037_striped_killer_shrike",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1776452327112,
+      "tag": "0038_striped_overlord",
+      "breakpoints": true
     }
   ]
 }

@@ -8,6 +8,7 @@ import { companiesApi } from "../api/companies";
 import { goalsApi } from "../api/goals";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
+import { systemControlsApi } from "../api/system-controls";
 import { queryKeys } from "../lib/queryKeys";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
@@ -84,7 +85,7 @@ function persistOnboardingModePreference(mode: OnboardingMode) {
 function getErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "Unknown error";
   if (/instance admin required/i.test(message)) {
-    return "Instance admin required. Run pnpm paperclipai auth bootstrap-ceo --force, open the generated invite URL, accept it as Human, then retry Create Company.";
+    return "Instance admin required. Run pnpm paperclipai auth bootstrap-ceo --force, open the generated invite URL, accept it as Human, then retry Launch Company.";
   }
   return message;
 }
@@ -415,6 +416,17 @@ export function OnboardingWizard() {
             queryKey: queryKeys.goals.list(company.id)
           });
         }
+      }
+
+      try {
+        await systemControlsApi.runCycle(
+          company.id,
+          "launch",
+          "one_click_launch_from_onboarding",
+        );
+      } catch (launchErr) {
+        // Company creation remains successful even if automatic launch fails.
+        console.warn("Automatic launch cycle failed", launchErr);
       }
 
       const companyPrefix = company.issuePrefix;
@@ -1207,7 +1219,7 @@ export function OnboardingWizard() {
                       {loading
                         ? "Creating..."
                         : onboardingMode === "quick"
-                          ? "Create Company"
+                          ? "Launch Company"
                           : "Next: Setup Agent"}
                     </Button>
                   )}

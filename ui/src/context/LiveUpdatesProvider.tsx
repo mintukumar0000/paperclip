@@ -376,6 +376,12 @@ function invalidateActivityQueries(
 
   if (entityType === "company") {
     queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    queryClient.invalidateQueries({ queryKey: queryKeys.systemControls(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["system-decisions", companyId] });
+    queryClient.invalidateQueries({ queryKey: queryKeys.cycleState(companyId) });
+    queryClient.invalidateQueries({ queryKey: ["execution-feed", companyId] });
+    queryClient.invalidateQueries({ queryKey: queryKeys.aiDashboard(companyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.dashboard(companyId) });
   }
 }
 

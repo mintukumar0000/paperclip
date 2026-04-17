@@ -124,7 +124,9 @@ export async function verifyEmail(
         inArray(activityLog.action, [
           "email.sequence.value.sent",
           "email.sequence.case_study.sent",
+          "email.sequence.objection.sent",
           "email.sequence.urgency.sent",
+          "email.sequence.last_call.sent",
           "email.sequence.opened",
           "email.sequence.clicked",
         ]),
