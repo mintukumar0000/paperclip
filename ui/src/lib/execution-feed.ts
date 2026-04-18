@@ -10,6 +10,25 @@ export interface ExecutionEvidence {
   metadata: Record<string, unknown> | null;
 }
 
+export interface TraceLink {
+  traceId: string;
+  decisionId: string | null;
+  issueId: string | null;
+  goalId: string | null;
+  agentId: string | null;
+}
+
+export interface FeedSpamSummary {
+  status: "failed" | "blocked" | "pending" | "skipped";
+  count: number;
+}
+
+export interface GroupedFeedEvent {
+  event: ExecutionFeedEventResponse;
+  count: number;
+  reason: string | null;
+}
+
 function readString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -96,6 +115,66 @@ export function getExecutionStatusLabel(status: ExecutionFeedEventResponse["stat
   if (status === "pending") return "WAITING";
   if (status === "skipped") return "SKIPPED";
   return "INFO";
+}
+
+export function getTraceLink(event: ExecutionFeedEventResponse): TraceLink {
+  return {
+    traceId: event.traceId,
+    decisionId: event.decisionId,
+    issueId: event.linkedIssueId,
+    goalId: event.linkedGoalId,
+    agentId: event.linkedAgentId,
+  };
+}
+
+export function summarizeFeedSpam(events: ExecutionFeedEventResponse[]): FeedSpamSummary[] {
+  const counts: Record<"failed" | "blocked" | "pending" | "skipped", number> = {
+    failed: 0,
+    blocked: 0,
+    pending: 0,
+    skipped: 0,
+  };
+
+  for (const event of events) {
+    if (event.status === "failed" || event.status === "blocked" || event.status === "pending" || event.status === "skipped") {
+      counts[event.status] += 1;
+    }
+  }
+
+  return (Object.keys(counts) as Array<keyof typeof counts>)
+    .map((status) => ({ status, count: counts[status] }))
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => b.count - a.count);
+}
+
+export function groupExecutionFeed(events: ExecutionFeedEventResponse[], limit = 20): GroupedFeedEvent[] {
+  const groups: GroupedFeedEvent[] = [];
+  const indexByKey = new Map<string, number>();
+
+  for (const event of events) {
+    const reason = getEventReason(event);
+    const key = [event.status, event.category, event.action, reason ?? ""].join("|");
+    const existingIndex = indexByKey.get(key);
+
+    if (existingIndex == null) {
+      indexByKey.set(key, groups.length);
+      groups.push({ event, count: 1, reason });
+      continue;
+    }
+
+    const current = groups[existingIndex];
+    const currentTs = new Date(current.event.createdAt).getTime();
+    const incomingTs = new Date(event.createdAt).getTime();
+    groups[existingIndex] = {
+      event: incomingTs > currentTs ? event : current.event,
+      count: current.count + 1,
+      reason: current.reason,
+    };
+  }
+
+  return groups
+    .sort((a, b) => new Date(b.event.createdAt).getTime() - new Date(a.event.createdAt).getTime())
+    .slice(0, limit);
 }
 
 export function extractEvidence(event: ExecutionFeedEventResponse): ExecutionEvidence | null {

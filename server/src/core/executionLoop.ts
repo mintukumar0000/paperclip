@@ -64,6 +64,7 @@ export function executionLoop(db: Db) {
     async runCycle(companyId: string): Promise<LoopCycleResult> {
       const cycleStarted = new Date().toISOString();
       const cycleStartedAtMs = Date.now();
+      const traceId = `execution_loop:${companyId}:${cycleStartedAtMs}`;
       const companyRow = await db
         .select({ id: companies.id, status: companies.status })
         .from(companies)
@@ -120,6 +121,7 @@ export function executionLoop(db: Db) {
           maxActiveAgents,
           decisionMode: controls?.decisionMode ?? null,
           autonomyLevel: controls?.autonomyLevel ?? null,
+          traceId,
         },
       }).catch(() => undefined);
 
@@ -150,6 +152,7 @@ export function executionLoop(db: Db) {
             source: "execution_loop",
             skippedBy: "hourly_execution_cap",
             maxExecutionsPerHour,
+            traceId,
           },
         }).catch(() => undefined);
         await setCycleState(db, companyId, "execution_loop", {
@@ -207,6 +210,7 @@ export function executionLoop(db: Db) {
       // 4. Auto-assign: match agents to issues by role
       let tasksDispatched = 0;
       const activatedAgentIds = new Set<string>();
+      const dispatchedIssueIds: string[] = [];
 
       for (const issue of unassignedIssues) {
         if (tasksDispatched >= maxExecutionsPerCycle) {
@@ -268,6 +272,7 @@ export function executionLoop(db: Db) {
               });
               activatedAgentIds.add(agent.id);
               tasksDispatched++;
+              dispatchedIssueIds.push(issue.id);
               hourlyBudget.executionsInWindow += 1;
             } catch (dispatchErr) {
               // Roll back the claim so the issue can be retried in a later cycle.
@@ -326,8 +331,12 @@ export function executionLoop(db: Db) {
           status: "success",
           source: "execution_loop",
           goalsAnalyzed: plan.goalSnapshots.length,
+          linkedGoalIds: plan.goalSnapshots.map((goal) => goal.goalId),
+          linkedIssueIds: dispatchedIssueIds,
+          linkedAgentIds: Array.from(activatedAgentIds),
           tasksDispatched,
           agentsActivated: activatedAgentIds.size,
+          traceId,
         },
       }).catch(() => undefined);
 
@@ -339,8 +348,12 @@ export function executionLoop(db: Db) {
         lastRunDurationMs: Date.now() - cycleStartedAtMs,
         details: {
           goalsAnalyzed: plan.goalSnapshots.length,
+          linkedGoalIds: plan.goalSnapshots.map((goal) => goal.goalId),
+          linkedIssueIds: dispatchedIssueIds,
+          linkedAgentIds: Array.from(activatedAgentIds),
           tasksDispatched,
           agentsActivated: activatedAgentIds.size,
+          traceId,
         },
       }).catch(() => undefined);
 
@@ -360,8 +373,12 @@ export function executionLoop(db: Db) {
           costPerActionCents: 0,
           metadata: {
             goalsAnalyzed: plan.goalSnapshots.length,
+            linkedGoalIds: plan.goalSnapshots.map((goal) => goal.goalId),
+            linkedIssueIds: dispatchedIssueIds,
+            linkedAgentIds: Array.from(activatedAgentIds),
             tasksDispatched,
             agentsActivated: activatedAgentIds.size,
+            traceId,
           },
         });
 

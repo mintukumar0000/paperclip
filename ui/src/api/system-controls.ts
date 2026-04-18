@@ -58,6 +58,10 @@ export interface ExecutionFeedEventResponse {
   category: "traffic" | "email" | "decision" | "execution" | "revenue" | "system";
   status: "info" | "success" | "failed" | "pending" | "blocked" | "skipped";
   reason: string | null;
+  traceId: string;
+  linkedIssueId: string | null;
+  linkedGoalId: string | null;
+  linkedAgentId: string | null;
   action: string;
   message: string;
   decisionId: string | null;

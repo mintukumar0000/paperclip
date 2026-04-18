@@ -53,7 +53,14 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { StatusBadge } from "../components/StatusBadge";
 import { ExecutionStatusBadge } from "../components/ExecutionStatusBadge";
 import { queryKeys } from "../lib/queryKeys";
-import { getEventReason } from "../lib/execution-feed";
+import {
+  extractEvidence,
+  formatRelativeTime,
+  getEventReason,
+  getTraceLink,
+  groupExecutionFeed,
+  summarizeFeedSpam,
+} from "../lib/execution-feed";
 
 interface ControlsDraft {
   trafficEnabled: boolean;
@@ -434,6 +441,25 @@ export function CommandCenter() {
     [decisions],
   );
 
+  const groupedFeed = useMemo(() => groupExecutionFeed(feedBuffer, 80), [feedBuffer]);
+  const feedSpamSummary = useMemo(() => summarizeFeedSpam(feedBuffer), [feedBuffer]);
+  const explanationEvent = groupedFeed[0]?.event ?? feedBuffer[0] ?? null;
+  const explanationTrace = explanationEvent ? getTraceLink(explanationEvent) : null;
+  const surfacedOutputs = useMemo(() => {
+    const dedupe = new Set<string>();
+    const rows: Array<{ event: ExecutionFeedEventResponse; label: string; url: string }> = [];
+    for (const event of feedBuffer) {
+      const evidence = extractEvidence(event);
+      if (!evidence?.url) continue;
+      const key = `${evidence.type}:${evidence.url}`;
+      if (dedupe.has(key)) continue;
+      dedupe.add(key);
+      rows.push({ event, label: evidence.label, url: evidence.url });
+      if (rows.length >= 4) break;
+    }
+    return rows;
+  }, [feedBuffer]);
+
   const lastSync = Math.max(controlsQuery.dataUpdatedAt, decisionsQuery.dataUpdatedAt);
 
   if (!selectedCompanyId) {
@@ -528,6 +554,62 @@ export function CommandCenter() {
           </div>
         </div>
       </div>
+
+      <section className="space-y-3 rounded-xl border border-border bg-card p-4">
+        <header>
+          <h2 className="text-sm font-semibold text-foreground">System Explanation Mode</h2>
+          <p className="text-xs text-muted-foreground">Single view of why the system moved, what it did, and which entities were linked.</p>
+        </header>
+        <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-sm text-foreground">
+          {explanationEvent
+            ? `${safeText(explanationEvent.message, safeText(explanationEvent.action))} (${formatRelativeTime(explanationEvent.createdAt)})`
+            : "No runtime explanation yet. Trigger a cycle or wait for next autonomous event."}
+        </div>
+        {explanationTrace ? (
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+            <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">trace: {explanationTrace.traceId.slice(0, 16)}</span>
+            {explanationTrace.decisionId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">decision: {explanationTrace.decisionId.slice(0, 8)}</span> : null}
+            {explanationTrace.issueId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">issue: {explanationTrace.issueId.slice(0, 8)}</span> : null}
+            {explanationTrace.goalId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">goal: {explanationTrace.goalId.slice(0, 8)}</span> : null}
+            {explanationTrace.agentId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">agent: {explanationTrace.agentId.slice(0, 8)}</span> : null}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="space-y-3 rounded-xl border border-border bg-card p-4">
+        <header className="flex items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">Forced Output Surfacing</h2>
+            <p className="text-xs text-muted-foreground">Pinned external links from recent execution so output can be verified without digging through logs.</p>
+          </div>
+          <span className="text-xs text-muted-foreground">{surfacedOutputs.length} surfaced</span>
+        </header>
+        {surfacedOutputs.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border px-3 py-4 text-sm text-muted-foreground">
+            No external outputs captured yet.
+          </div>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {surfacedOutputs.map((row) => (
+              <a
+                key={`${row.event.id}-${row.url}`}
+                href={row.url}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-md border border-border px-3 py-2 hover:bg-accent/40"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-muted-foreground">{row.label}</p>
+                    <p className="truncate text-sm text-foreground">{row.url}</p>
+                  </div>
+                  <ExecutionStatusBadge status={row.event.status} />
+                </div>
+              </a>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section className="space-y-3 rounded-xl border border-border bg-card p-4">
         <header className="flex items-center justify-between gap-2">
@@ -991,6 +1073,16 @@ export function CommandCenter() {
             <Waves className="h-4 w-4 text-muted-foreground" />
           </header>
 
+          {feedSpamSummary.length > 0 ? (
+            <div className="flex flex-wrap gap-2 text-xs">
+              {feedSpamSummary.map((entry) => (
+                <span key={entry.status} className="rounded-full border border-border bg-muted/40 px-2 py-0.5 text-muted-foreground">
+                  {entry.status.toUpperCase()} x{entry.count}
+                </span>
+              ))}
+            </div>
+          ) : null}
+
           <div className="grid gap-2 sm:grid-cols-3">
             <div className="space-y-1">
               <Label htmlFor="feed-category">Category</Label>
@@ -1027,39 +1119,55 @@ export function CommandCenter() {
               </Select>
             </div>
             <div className="flex items-end justify-end text-xs text-muted-foreground">
-              buffer: {feedBuffer.length}
+              raw: {feedBuffer.length} · grouped: {groupedFeed.length}
             </div>
           </div>
 
-          {executionFeedQuery.isLoading && feedBuffer.length === 0 ? (
+          {executionFeedQuery.isLoading && groupedFeed.length === 0 ? (
             <PageSkeleton variant="list" />
-          ) : feedBuffer.length === 0 ? (
+          ) : groupedFeed.length === 0 ? (
             <p className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted-foreground">
               No execution events for the selected filter.
             </p>
           ) : (
             <div className="max-h-[28rem] space-y-2 overflow-auto pr-1">
-              {feedBuffer.map((event) => (
+              {groupedFeed.map((group) => {
+                const event = group.event;
+                const trace = getTraceLink(event);
+                const evidence = extractEvidence(event);
+                return (
                 <article key={event.id} className="rounded-lg border border-border p-3">
                   <div className="flex items-start justify-between gap-2">
                     <div>
                       <div className="text-sm font-medium text-foreground">{safeText(event.action)}</div>
                       <div className="text-xs text-muted-foreground">{toFeedRowLabel(event)}</div>
                     </div>
-                    <ExecutionStatusBadge status={event.status} />
+                    <div className="flex items-center gap-1.5">
+                      {group.count > 1 ? <span className="text-xs text-muted-foreground">x{group.count}</span> : null}
+                      <ExecutionStatusBadge status={event.status} />
+                    </div>
                   </div>
-                  {(event.status === "blocked" || event.status === "pending" || event.status === "skipped") && (
+                  {(event.status === "blocked" || event.status === "pending" || event.status === "skipped" || event.status === "failed") && (
                     <div className="mt-1 text-xs text-muted-foreground">
-                      Reason: {getEventReason(event) ?? "Rule gate active"}
+                      Reason: {group.reason ?? "Rule gate active"}
                     </div>
                   )}
                   <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
                     <span>{safeText(event.category)}</span>
                     <span>{formatDateTime(event.createdAt)}</span>
                     {event.decisionId ? <span>decision: {event.decisionId.slice(0, 8)}</span> : null}
+                    <span>trace: {trace.traceId.slice(0, 12)}</span>
+                    {trace.issueId ? <span>issue: {trace.issueId.slice(0, 8)}</span> : null}
+                    {trace.goalId ? <span>goal: {trace.goalId.slice(0, 8)}</span> : null}
+                    {trace.agentId ? <span>agent: {trace.agentId.slice(0, 8)}</span> : null}
+                    {evidence?.url ? (
+                      <a href={evidence.url} target="_blank" rel="noreferrer" className="text-primary hover:underline">
+                        output
+                      </a>
+                    ) : null}
                   </div>
                 </article>
-              ))}
+              );})}
             </div>
           )}
         </section>

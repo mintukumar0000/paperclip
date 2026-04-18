@@ -17,7 +17,14 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { formatCents } from "../lib/utils";
 import { systemControlsApi, type ExecutionFeedEventResponse, type SystemControlsResponse } from "../api/system-controls";
-import { getEventReason } from "../lib/execution-feed";
+import {
+  extractEvidence,
+  formatRelativeTime,
+  getEventReason,
+  getTraceLink,
+  groupExecutionFeed,
+  summarizeFeedSpam,
+} from "../lib/execution-feed";
 import { billingApi } from "../api/billing";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
@@ -366,6 +373,30 @@ export function Dashboard() {
     .slice(0, 4);
 
   const showPausedByRulesBanner = !hasRunningCycle && blockedReasonSummary.length > 0;
+  const spamSummary = summarizeFeedSpam(feedBuffer);
+  const groupedFeed = groupExecutionFeed(feedBuffer, 20);
+  const latestTrace = latestEvent ? getTraceLink(latestEvent) : null;
+
+  const latestOutputRows = (() => {
+    const dedupe = new Set<string>();
+    const rows: Array<{ event: ExecutionFeedEventResponse; url: string; label: string }> = [];
+    for (const event of feedBuffer) {
+      const evidence = extractEvidence(event);
+      if (!evidence?.url) continue;
+      const key = `${evidence.type}:${evidence.url}`;
+      if (dedupe.has(key)) continue;
+      dedupe.add(key);
+      rows.push({ event, url: evidence.url, label: evidence.label });
+      if (rows.length >= 3) break;
+    }
+    return rows;
+  })();
+
+  const systemExplanation = showPausedByRulesBanner
+    ? "Execution is paused by governance gates. Approvals, duplicate prevention, or safety limits are currently holding autonomous actions."
+    : latestEvent
+      ? `Latest action was ${toTitleCase(latestEvent.action)} ${formatRelativeTime(latestEvent.createdAt)}. Next focus: ${nextAction}.`
+      : "No autonomous actions captured yet. Start or resume a cycle to generate execution traces and outputs.";
 
   const systemBusy =
     runCycleMutation.isPending
@@ -422,6 +453,62 @@ export function Dashboard() {
           </div>
         </section>
       ) : null}
+
+      <section className="rounded-xl border border-border bg-card p-4 shadow-sm">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">System Explanation Mode</h2>
+            <p className="mt-1 text-xs text-muted-foreground">Why the company is taking this action now, and what the operator should expect next.</p>
+          </div>
+          {latestEvent ? <ExecutionStatusBadge status={latestEvent.status} /> : null}
+        </div>
+        <p className="mt-3 text-sm text-foreground">{systemExplanation}</p>
+        {latestTrace ? (
+          <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
+            <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">trace: {latestTrace.traceId.slice(0, 16)}</span>
+            {latestTrace.decisionId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">decision: {latestTrace.decisionId.slice(0, 8)}</span> : null}
+            {latestTrace.issueId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">issue: {latestTrace.issueId.slice(0, 8)}</span> : null}
+            {latestTrace.goalId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">goal: {latestTrace.goalId.slice(0, 8)}</span> : null}
+            {latestTrace.agentId ? <span className="rounded-full border border-border bg-muted/40 px-2 py-0.5">agent: {latestTrace.agentId.slice(0, 8)}</span> : null}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="rounded-xl border border-border bg-card p-4 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-foreground">Forced Output Surfacing</h2>
+            <p className="mt-1 text-xs text-muted-foreground">Latest published artifacts are pinned here so operators can always verify real-world output.</p>
+          </div>
+          <span className="text-xs text-muted-foreground">{latestOutputRows.length} surfaced</span>
+        </div>
+
+        <div className="mt-3 space-y-2">
+          {latestOutputRows.length === 0 ? (
+            <div className="rounded-md border border-dashed border-border px-3 py-4 text-sm text-muted-foreground">
+              No public output links yet. Run a cycle to surface external proof.
+            </div>
+          ) : (
+            latestOutputRows.map((row) => (
+              <a
+                key={`${row.event.id}-${row.url}`}
+                href={row.url}
+                target="_blank"
+                rel="noreferrer"
+                className="block rounded-md border border-border px-3 py-2 hover:bg-accent/40"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-muted-foreground">{row.label}</p>
+                    <p className="truncate text-sm text-foreground">{row.url}</p>
+                  </div>
+                  <ExecutionStatusBadge status={row.event.status} />
+                </div>
+              </a>
+            ))
+          )}
+        </div>
+      </section>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1.35fr)]">
         <div className="space-y-4">
@@ -629,30 +716,42 @@ export function Dashboard() {
           <section className="rounded-xl border border-border bg-card p-4 shadow-sm">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-foreground">Live Execution Feed</h2>
-              <span className="text-xs text-muted-foreground">{feedBuffer.length} events</span>
+              <span className="text-xs text-muted-foreground">{feedBuffer.length} raw · {groupedFeed.length} grouped</span>
             </div>
+            {spamSummary.length > 0 ? (
+              <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                {spamSummary.map((entry) => (
+                  <span key={entry.status} className="rounded-full border border-border bg-muted/40 px-2 py-0.5 text-muted-foreground">
+                    {entry.status.toUpperCase()} x{entry.count}
+                  </span>
+                ))}
+              </div>
+            ) : null}
             <div className="mt-3 max-h-[18rem] space-y-2 overflow-auto">
-              {feedBuffer.length === 0 ? (
+              {groupedFeed.length === 0 ? (
                 <div className="rounded-md border border-dashed border-border px-3 py-5 text-sm text-muted-foreground">
                   Your AI company is not running yet. Start the first cycle.
                 </div>
               ) : (
-                feedBuffer.slice(0, 20).map((event) => (
-                  <div key={event.id} className="rounded-md border border-border px-3 py-2">
+                groupedFeed.map((group) => (
+                  <div key={group.event.id} className="rounded-md border border-border px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="truncate text-sm text-foreground">
-                        {safeText(event.message, toTitleCase(event.action))}
+                        {safeText(group.event.message, toTitleCase(group.event.action))}
                       </div>
-                      <ExecutionStatusBadge status={event.status} />
+                      <div className="flex items-center gap-1.5">
+                        {group.count > 1 ? <span className="text-xs text-muted-foreground">x{group.count}</span> : null}
+                        <ExecutionStatusBadge status={group.event.status} />
+                      </div>
                     </div>
-                    {(event.status === "blocked" || event.status === "pending" || event.status === "skipped") && (
+                    {(group.event.status === "blocked" || group.event.status === "pending" || group.event.status === "skipped" || group.event.status === "failed") && (
                       <div className="mt-1 text-xs text-muted-foreground">
-                        Reason: {getEventReason(event) ?? "Rule gate active"}
+                        Reason: {group.reason ?? "Rule gate active"}
                       </div>
                     )}
                     <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
-                      <span>{event.createdAt ? new Date(event.createdAt).toLocaleTimeString() : "-"}</span>
-                      <span>{toTitleCase(event.category)}</span>
+                      <span>{group.event.createdAt ? new Date(group.event.createdAt).toLocaleTimeString() : "-"}</span>
+                      <span>{toTitleCase(group.event.category)}</span>
                     </div>
                   </div>
                 ))

@@ -14,6 +14,10 @@ export interface ExecutionFeedEvent {
   category: ExecutionFeedCategory;
   status: ExecutionFeedStatus;
   reason: string | null;
+  traceId: string;
+  linkedIssueId: string | null;
+  linkedGoalId: string | null;
+  linkedAgentId: string | null;
   action: string;
   message: string;
   decisionId: string | null;
@@ -33,6 +37,23 @@ function normalizeActionLabel(action: string): string {
 function toRecord(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
+}
+
+function firstString(values: unknown[]): string | null {
+  for (const value of values) {
+    const normalized = readString(value);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function firstStringFromArray(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  for (const entry of value) {
+    const normalized = readString(entry);
+    if (normalized) return normalized;
+  }
+  return null;
 }
 
 function readString(value: unknown): string | null {
@@ -110,6 +131,56 @@ function inferReason(action: string, details: Record<string, unknown>, status: E
   }
 
   return null;
+}
+
+function inferTraceId(input: { id: string; companyId: string; action: string; details: Record<string, unknown> }): string {
+  const trace = firstString([
+    input.details.traceId,
+    input.details.trace_id,
+  ]);
+  if (trace) return trace;
+  return `${input.action}:${input.companyId}:${input.id}`;
+}
+
+function inferLinkedIssueId(details: Record<string, unknown>): string | null {
+  return firstString([
+    details.issueId,
+    details.issue_id,
+    details.linkedIssueId,
+    details.linked_issue_id,
+    firstStringFromArray(details.linkedIssueIds),
+    firstStringFromArray(details.issueIds),
+    firstStringFromArray(details.linked_issue_ids),
+    firstStringFromArray(details.issue_ids),
+    firstStringFromArray(details.dispatchedIssueIds),
+  ]);
+}
+
+function inferLinkedGoalId(details: Record<string, unknown>): string | null {
+  return firstString([
+    details.goalId,
+    details.goal_id,
+    details.linkedGoalId,
+    details.linked_goal_id,
+    firstStringFromArray(details.linkedGoalIds),
+    firstStringFromArray(details.goalIds),
+    firstStringFromArray(details.linked_goal_ids),
+    firstStringFromArray(details.goal_ids),
+  ]);
+}
+
+function inferLinkedAgentId(details: Record<string, unknown>): string | null {
+  return firstString([
+    details.agentId,
+    details.agent_id,
+    details.linkedAgentId,
+    details.linked_agent_id,
+    firstStringFromArray(details.linkedAgentIds),
+    firstStringFromArray(details.agentIds),
+    firstStringFromArray(details.linked_agent_ids),
+    firstStringFromArray(details.agent_ids),
+    firstStringFromArray(details.activatedAgentIds),
+  ]);
 }
 
 function inferEvidenceType(action: string, details: Record<string, unknown>): ExecutionEvidenceType | null {
@@ -217,6 +288,22 @@ function enrichDetails(action: string, details: Record<string, unknown>, status:
     next.reason = reason;
   }
 
+  if (typeof next.traceId !== "string" && typeof next.trace_id !== "string") {
+    next.traceId = null;
+  }
+
+  if (typeof next.linkedIssueId !== "string" && typeof next.issueId !== "string" && typeof next.issue_id !== "string") {
+    next.linkedIssueId = null;
+  }
+
+  if (typeof next.linkedGoalId !== "string" && typeof next.goalId !== "string" && typeof next.goal_id !== "string") {
+    next.linkedGoalId = null;
+  }
+
+  if (typeof next.linkedAgentId !== "string" && typeof next.agentId !== "string" && typeof next.agent_id !== "string") {
+    next.linkedAgentId = null;
+  }
+
   return next;
 }
 
@@ -237,6 +324,24 @@ function toFeedEvent(input: {
   const status = inferStatus(input.action, details);
   const enrichedDetails = enrichDetails(input.action, details, status);
   const reason = inferReason(input.action, enrichedDetails, status);
+  const traceId = inferTraceId({ id: input.id, companyId: input.companyId, action: input.action, details: enrichedDetails });
+  const linkedIssueId = inferLinkedIssueId(enrichedDetails);
+  const linkedGoalId = inferLinkedGoalId(enrichedDetails);
+  const linkedAgentId = inferLinkedAgentId(enrichedDetails);
+
+  if (typeof enrichedDetails.traceId !== "string") {
+    enrichedDetails.traceId = traceId;
+  }
+  if (linkedIssueId && typeof enrichedDetails.linkedIssueId !== "string") {
+    enrichedDetails.linkedIssueId = linkedIssueId;
+  }
+  if (linkedGoalId && typeof enrichedDetails.linkedGoalId !== "string") {
+    enrichedDetails.linkedGoalId = linkedGoalId;
+  }
+  if (linkedAgentId && typeof enrichedDetails.linkedAgentId !== "string") {
+    enrichedDetails.linkedAgentId = linkedAgentId;
+  }
+
   return {
     id: input.id,
     companyId: input.companyId,
@@ -244,6 +349,10 @@ function toFeedEvent(input: {
     category: inferCategory(input.action),
     status,
     reason,
+    traceId,
+    linkedIssueId,
+    linkedGoalId,
+    linkedAgentId,
     action: input.action,
     message: typeof enrichedDetails.message === "string"
       ? enrichedDetails.message
