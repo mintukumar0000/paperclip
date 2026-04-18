@@ -2,6 +2,7 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   resolveSystemDecisionSchema,
+  type UpdateSystemControls,
   updateSystemControlsSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
@@ -17,6 +18,8 @@ import {
 import { executeDecisionActionNow } from "../ai/governance/decisionEngine.js";
 import { logActivity } from "../services/activity-log.js";
 import { listCompanyCycleState } from "../services/cycle-state.js";
+import { goalService } from "../services/goals.js";
+import { getRecentSystemMetricsSnapshot } from "../ai/feedback/metricsEngine.js";
 import {
   listExecutionFeed,
   toExecutionFeedEventFromLivePayload,
@@ -59,12 +62,17 @@ const EXECUTION_FEED_STATUSES = new Set<ExecutionFeedStatus>([
 
 export function systemControlsRoutes(db: Db) {
   const router = Router();
+  const goals = goalService(db);
 
   router.get("/companies/:companyId/system-controls", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const controls = await getSystemControls(db, companyId);
-    res.json(controls);
+    res.json({
+      ...controls,
+      systemActive: controls.trafficEnabled,
+      loopIntervalSeconds: Math.max(30, Math.trunc((controls.trafficPostIntervalMs ?? 60_000) / 1000)),
+    });
   });
 
   router.get("/companies/:companyId/cycle-state", async (req, res) => {
@@ -156,6 +164,94 @@ export function systemControlsRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+
+      const current = await getSystemControls(db, companyId);
+      const patch = req.body as UpdateSystemControls;
+      const snapshot = await getRecentSystemMetricsSnapshot(db, companyId, 180).catch(() => null);
+      const activeGoals = await goals.list(companyId).catch(() => []);
+      const hasConversionGoal = activeGoals.some((goal) => {
+        if (goal.status !== "planned" && goal.status !== "active") return false;
+        const title = (goal.title ?? "").toLowerCase();
+        return title.includes("conversion") || title.includes("checkout") || title.includes("cac");
+      });
+
+      const minConversionBeforeScalingRaw = Number(process.env.GUARDRAIL_MIN_CONVERSION_BEFORE_SCALING ?? 2);
+      const minConversionBeforeScaling = Number.isFinite(minConversionBeforeScalingRaw)
+        ? Math.max(0, minConversionBeforeScalingRaw)
+        : 2;
+
+      const nextTrafficMode = (typeof patch.trafficMode === "string" ? patch.trafficMode : current.trafficMode) as string;
+      const nextTrafficMultiplier = typeof patch.trafficMultiplier === "number"
+        ? patch.trafficMultiplier
+        : current.trafficMultiplier;
+      const nextTrafficEnabled = typeof patch.trafficEnabled === "boolean"
+        ? patch.trafficEnabled
+        : current.trafficEnabled;
+
+      const scalingIntent = (
+        nextTrafficEnabled
+        && (
+          nextTrafficMode === "aggressive"
+          || nextTrafficMultiplier > current.trafficMultiplier
+          || (current.trafficEnabled === false && nextTrafficEnabled === true)
+        )
+      );
+
+      if (scalingIntent && snapshot && snapshot.conversion_rate < minConversionBeforeScaling) {
+        const reason = `Guardrail blocked scaling: conversion ${snapshot.conversion_rate.toFixed(2)}% is below ${minConversionBeforeScaling.toFixed(2)}% threshold.`;
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "system.controls.override.blocked",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            reason,
+            snapshot: {
+              conversionRate: snapshot.conversion_rate,
+              revenuePerVisit: snapshot.revenue_per_visit,
+              costPerAction: snapshot.cost_per_action,
+            },
+            patch,
+          },
+        });
+        res.status(422).json({
+          error: reason,
+          guardrail: "min_conversion_before_scaling",
+          required: minConversionBeforeScaling,
+          actual: snapshot.conversion_rate,
+        });
+        return;
+      }
+
+      if (hasConversionGoal && nextTrafficMode === "aggressive") {
+        const reason = "Guardrail blocked aggressive traffic mode because active goals prioritize conversion/CAC optimization.";
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          action: "system.controls.override.blocked",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            reason,
+            activeGoals: activeGoals.map((goal) => ({ id: goal.id, title: goal.title, status: goal.status })),
+            patch,
+          },
+        });
+        res.status(422).json({
+          error: reason,
+          guardrail: "goal_alignment",
+        });
+        return;
+      }
 
       const updated = await updateSystemControls(db, companyId, req.body);
       const actor = getActorInfo(req);

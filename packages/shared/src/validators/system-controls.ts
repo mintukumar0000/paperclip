@@ -8,6 +8,8 @@ import {
 } from "../constants.js";
 
 export const updateSystemControlsSchema = z.object({
+  systemActive: z.boolean().optional(),
+  loopIntervalSeconds: z.number().int().min(30).max(900).optional(),
   trafficEnabled: z.boolean().optional(),
   redditEnabled: z.boolean().optional(),
   twitterEnabled: z.boolean().optional(),

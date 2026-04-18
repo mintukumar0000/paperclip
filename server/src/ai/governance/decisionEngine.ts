@@ -1,6 +1,6 @@
 import type { Db } from "@paperclipai/db";
-import { and, eq, inArray } from "@paperclipai/db";
-import { activityLog, companies, issues } from "@paperclipai/db";
+import { and, asc, eq, gte, inArray } from "@paperclipai/db";
+import { activityLog, companies, goals, issues, systemDecisions, systemMetrics } from "@paperclipai/db";
 import pino from "pino";
 import { eventBus } from "../../events/eventBus.js";
 import { issueService } from "../../services/issues.js";
@@ -57,6 +57,332 @@ export interface DecisionCycleResult {
 
 const ACTION_COOLDOWN_MS = 6 * 60 * 60_000; // 6h
 const actionCooldown = new Map<string, number>();
+
+type GoalPriority = "revenue" | "conversion" | "cac" | "traffic";
+
+interface ActiveGoalContext {
+  titles: string[];
+  priorities: GoalPriority[];
+}
+
+interface ArtifactPerformanceSnapshot {
+  artifactId: string;
+  type: "reddit_post" | "deployment" | "checkout" | "email";
+  channel: "reddit" | "twitter" | "indie_hackers" | "hacker_news" | null;
+  url: string | null;
+  linkedDecisionId: string | null;
+  traceId: string | null;
+  clicks: number;
+  conversions: number;
+  revenueCents: number;
+}
+
+function readString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function toRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function parseGoalPriorities(goalsInput: string[]): GoalPriority[] {
+  const priorities = new Set<GoalPriority>();
+  for (const rawTitle of goalsInput) {
+    const title = rawTitle.toLowerCase();
+    if (title.includes("revenue") || title.includes("monet")) priorities.add("revenue");
+    if (title.includes("conversion") || title.includes("checkout") || title.includes("funnel")) priorities.add("conversion");
+    if (title.includes("cac") || title.includes("cost") || title.includes("acquisition")) priorities.add("cac");
+    if (title.includes("traffic") || title.includes("growth") || title.includes("reach")) priorities.add("traffic");
+  }
+  return Array.from(priorities);
+}
+
+async function loadActiveGoalContext(db: Db, companyId: string): Promise<ActiveGoalContext> {
+  const rows = await db
+    .select({ title: goals.title })
+    .from(goals)
+    .where(
+      and(
+        eq(goals.companyId, companyId),
+        inArray(goals.status, ["planned", "active"]),
+      ),
+    )
+    .limit(32)
+    .catch(() => []);
+
+  const titles = rows
+    .map((row) => readString(row.title))
+    .filter((value): value is string => Boolean(value));
+  return {
+    titles,
+    priorities: parseGoalPriorities(titles),
+  };
+}
+
+function inferArtifactType(action: string, details: Record<string, unknown>): ArtifactPerformanceSnapshot["type"] | null {
+  if (action.startsWith("distribution.reddit.")) return "reddit_post";
+  if (action.startsWith("distribution.twitter.")) return "reddit_post";
+  if (action.startsWith("distribution.indie_hackers.") || action.startsWith("distribution.hacker_news.")) return "reddit_post";
+  if (action.startsWith("billing.checkout.")) return "checkout";
+  if (action.startsWith("email.sequence.")) return "email";
+  if (readString(details.deploymentUrl) || readString(details.deployment_url)) return "deployment";
+  return null;
+}
+
+function inferArtifactChannel(action: string, details: Record<string, unknown>): ArtifactPerformanceSnapshot["channel"] {
+  const raw = readString(details.channel);
+  if (raw === "reddit" || raw === "twitter" || raw === "indie_hackers" || raw === "hacker_news") return raw;
+  if (action.includes("reddit")) return "reddit";
+  if (action.includes("twitter")) return "twitter";
+  if (action.includes("indie_hackers")) return "indie_hackers";
+  if (action.includes("hacker_news")) return "hacker_news";
+  return null;
+}
+
+function inferArtifactUrl(details: Record<string, unknown>): string | null {
+  return readString(details.postUrl)
+    ?? readString(details.tweetUrl)
+    ?? readString(details.checkoutUrl)
+    ?? readString(details.checkout_url)
+    ?? readString(details.deploymentUrl)
+    ?? readString(details.deployment_url)
+    ?? readString(details.url)
+    ?? null;
+}
+
+function deriveArtifactId(action: string, details: Record<string, unknown>, fallbackId: string): string | null {
+  const explicit = readString(details.artifactId) ?? readString(details.artifact_id);
+  if (explicit) return explicit;
+  const url = inferArtifactUrl(details);
+  if (url) return `${action}:${url}`;
+  const type = inferArtifactType(action, details);
+  if (!type) return null;
+  return `${action}:${fallbackId}`;
+}
+
+async function loadRecentArtifacts(
+  db: Db,
+  companyId: string,
+): Promise<ArtifactPerformanceSnapshot[]> {
+  const activityRows = await db
+    .select({
+      id: activityLog.id,
+      action: activityLog.action,
+      details: activityLog.details,
+      createdAt: activityLog.createdAt,
+    })
+    .from(activityLog)
+    .where(eq(activityLog.companyId, companyId))
+    .orderBy(asc(activityLog.createdAt))
+    .limit(500)
+    .catch(() => []);
+
+  const metricRows = await db
+    .select({
+      sourceId: systemMetrics.sourceId,
+      traffic: systemMetrics.traffic,
+      conversions: systemMetrics.conversions,
+      revenueCents: systemMetrics.revenueCents,
+      metadata: systemMetrics.metadata,
+      recordedAt: systemMetrics.recordedAt,
+    })
+    .from(systemMetrics)
+    .where(
+      and(
+        eq(systemMetrics.companyId, companyId),
+        gte(systemMetrics.recordedAt, new Date(Date.now() - 7 * 24 * 60 * 60_000)),
+      ),
+    )
+    .orderBy(asc(systemMetrics.recordedAt))
+    .limit(1000)
+    .catch(() => []);
+
+  const artifacts = new Map<string, ArtifactPerformanceSnapshot>();
+
+  for (const row of activityRows) {
+    const details = toRecord(row.details);
+    const type = inferArtifactType(row.action, details);
+    if (!type) continue;
+
+    const artifactId = deriveArtifactId(row.action, details, row.id);
+    if (!artifactId) continue;
+
+    const existing = artifacts.get(artifactId);
+    const base: ArtifactPerformanceSnapshot = existing ?? {
+      artifactId,
+      type,
+      channel: inferArtifactChannel(row.action, details),
+      url: inferArtifactUrl(details),
+      linkedDecisionId: readString(details.decisionId) ?? readString(details.decision_id),
+      traceId: readString(details.traceId) ?? readString(details.trace_id),
+      clicks: 0,
+      conversions: 0,
+      revenueCents: 0,
+    };
+
+    if (type === "reddit_post") {
+      const upvotes = Number(details.upvotes ?? 0);
+      const comments = Number(details.comments ?? 0);
+      if (Number.isFinite(upvotes) && upvotes > 0) base.clicks += Math.round(upvotes);
+      if (Number.isFinite(comments) && comments > 0) base.clicks += Math.round(comments);
+    }
+
+    artifacts.set(artifactId, base);
+  }
+
+  for (const row of metricRows) {
+    const metadata = toRecord(row.metadata);
+    const metricUrl = readString(metadata.postUrl)
+      ?? readString(metadata.tweetUrl)
+      ?? readString(metadata.checkoutUrl)
+      ?? readString(metadata.checkout_url)
+      ?? readString(metadata.url)
+      ?? null;
+    const metadataArtifactId = readString(metadata.artifactId)
+      ?? readString(metadata.artifact_id)
+      ?? (() => {
+        const sourceId = readString(row.sourceId) ?? "metric";
+        return metricUrl ? `${sourceId}:${metricUrl}` : null;
+      })();
+
+    if (!metadataArtifactId) continue;
+    const existing = artifacts.get(metadataArtifactId)
+      ?? (() => {
+        if (!metricUrl) return null;
+        return Array.from(artifacts.values()).find((artifact) => artifact.url === metricUrl) ?? null;
+      })();
+    if (!existing) continue;
+
+    existing.clicks += Math.max(0, Number(row.traffic ?? 0));
+    existing.conversions += Math.max(0, Number(row.conversions ?? 0));
+    existing.revenueCents += Math.max(0, Number(row.revenueCents ?? 0));
+  }
+
+  return Array.from(artifacts.values()).slice(-120);
+}
+
+function annotateReasonWithGoals(reason: string, goalsContext: ActiveGoalContext): string {
+  if (goalsContext.titles.length === 0) return reason;
+  const references = goalsContext.titles.slice(0, 2).join(" | ");
+  return `${reason} [goal-aligned: ${references}]`;
+}
+
+function applyGoalDrivenPolicy(
+  actions: DecisionAction[],
+  goalsContext: ActiveGoalContext,
+  metrics: SystemMetricSnapshot,
+): DecisionAction[] {
+  if (goalsContext.priorities.length === 0) return actions;
+
+  let filtered = actions.map((action) => ({
+    ...action,
+    reason: annotateReasonWithGoals(action.reason, goalsContext),
+  }));
+
+  const conversionGoal = goalsContext.priorities.includes("conversion");
+  const revenueGoal = goalsContext.priorities.includes("revenue");
+  const cacGoal = goalsContext.priorities.includes("cac");
+
+  if (conversionGoal && metrics.conversion_rate < 2) {
+    filtered = filtered.filter((action) => !action.key.includes("scale") && !action.key.includes("traffic"));
+    filtered.unshift({
+      type: "create_issue",
+      key: "goal_conversion_focus",
+      reason: annotateReasonWithGoals("Active goal requires conversion improvement before scaling traffic.", goalsContext),
+      payload: {
+        title: "Goal-first conversion optimization",
+        description: "Active company goals prioritize conversion. Improve landing and checkout flow before traffic scaling actions.",
+        priority: "urgent",
+      },
+    });
+  }
+
+  if (revenueGoal) {
+    filtered.unshift({
+      type: "create_issue",
+      key: "goal_revenue_focus",
+      reason: annotateReasonWithGoals("Revenue goal active. Prioritize monetization and pricing actions.", goalsContext),
+      payload: {
+        title: "Goal-first revenue optimization",
+        description: "Run pricing tests, offer framing improvements, and checkout optimization tied to active revenue goals.",
+        priority: "high",
+      },
+    });
+  }
+
+  if (cacGoal && metrics.cost_per_action > Math.max(1, metrics.revenue_per_visit)) {
+    filtered = filtered.filter((action) => !action.key.includes("aggressive") && !action.key.includes("expansion"));
+    filtered.unshift({
+      type: "create_issue",
+      key: "goal_cac_focus",
+      reason: annotateReasonWithGoals("CAC goal active. Holding expensive growth actions until unit economics recover.", goalsContext),
+      payload: {
+        title: "Goal-first CAC recovery",
+        description: "Reduce acquisition cost and improve traffic quality before aggressive scaling.",
+        priority: "high",
+      },
+    });
+  }
+
+  return dedupeDecisionActions(filtered);
+}
+
+function addArtifactDrivenActions(
+  actions: DecisionAction[],
+  artifacts: ArtifactPerformanceSnapshot[],
+  goalsContext: ActiveGoalContext,
+): DecisionAction[] {
+  if (artifacts.length === 0) return actions;
+
+  const withRpv = artifacts
+    .map((artifact) => ({
+      artifact,
+      rpv: artifact.clicks > 0 ? artifact.revenueCents / artifact.clicks : 0,
+      conversionRate: artifact.clicks > 0 ? artifact.conversions / artifact.clicks : 0,
+    }))
+    .sort((left, right) => right.rpv - left.rpv);
+
+  const best = withRpv[0];
+  const next = [...actions];
+
+  if (best && best.artifact.channel && best.rpv >= 20) {
+    next.unshift({
+      type: "run_traffic_cycle",
+      key: `scale_${best.artifact.channel}_from_artifact`,
+      reason: annotateReasonWithGoals(
+        `Artifact ${best.artifact.artifactId} is outperforming (RPV ${(best.rpv / 100).toFixed(3)}). Scale this channel.`,
+        goalsContext,
+      ),
+      payload: {
+        channels: [best.artifact.channel],
+        linkedArtifactId: best.artifact.artifactId,
+        linkedDecisionId: best.artifact.linkedDecisionId,
+      },
+    });
+  }
+
+  const redditArtifacts = withRpv.filter((entry) => entry.artifact.channel === "reddit");
+  const redditUnderperforming = redditArtifacts.length >= 3 && redditArtifacts.every((entry) => entry.rpv <= 5);
+  if (redditUnderperforming) {
+    next.unshift({
+      type: "run_traffic_cycle",
+      key: "explore_non_reddit_channels",
+      reason: annotateReasonWithGoals(
+        "Reddit output is stagnating. Explore Twitter and Hacker News to expand channel mix.",
+        goalsContext,
+      ),
+      payload: {
+        channels: ["twitter", "hacker_news"],
+        exploration: true,
+      },
+    });
+  }
+
+  return dedupeDecisionActions(next);
+}
 
 function cooldownKey(companyId: string, key: string): string {
   return `${companyId}:${key}`;
@@ -486,6 +812,7 @@ async function executeAction(
   db: Db,
   companyId: string,
   action: DecisionAction,
+  traceId: string,
   decisionId?: string,
 ): Promise<{ success: boolean; details?: Record<string, unknown>; error?: string }> {
   if (!shouldExecuteAction(companyId, action.key)) {
@@ -595,9 +922,17 @@ async function executeAction(
         ? action.payload.baseUrl.trim()
         : (process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL ?? "http://localhost:3100").trim();
 
+    const requestedChannels = Array.isArray(action.payload.channels)
+      ? action.payload.channels.filter((entry): entry is "reddit" | "twitter" | "indie_hackers" | "hacker_news" => (
+        entry === "reddit" || entry === "twitter" || entry === "indie_hackers" || entry === "hacker_news"
+      ))
+      : [];
+
     const summary = await runTrafficCycleWithDecision({ db, baseUrl }, {
       bypassDecisionGate: true,
       decisionId,
+      traceId,
+      channelsOverride: requestedChannels,
     });
 
     return {
@@ -803,6 +1138,78 @@ function deriveDecisionEvidence(
   return { metricName: null, metricValue: null, thresholdValue: null };
 }
 
+async function drainExecutableDecisions(
+  db: Db,
+  companyId: string,
+  source: DecisionCycleInput["source"],
+): Promise<DecisionCycleResult["executed"]> {
+  const queued = await db
+    .select()
+    .from(systemDecisions)
+    .where(
+      and(
+        eq(systemDecisions.companyId, companyId),
+        inArray(systemDecisions.status, ["approved", "pending"]),
+      ),
+    )
+    .orderBy(asc(systemDecisions.createdAt))
+    .limit(25)
+    .catch(() => []);
+
+  if (queued.length === 0) return [];
+
+  const replayed: DecisionCycleResult["executed"] = [];
+  for (const decision of queued) {
+    const payload = toRecord(decision.actionPayload);
+    const action: DecisionAction = {
+      type: decision.actionType as DecisionActionType,
+      key: decision.actionKey,
+      reason: decision.reason,
+      payload,
+    };
+
+    const result = await executeDecisionActionNow(db, companyId, action, source, decision.id);
+    await setSystemDecisionExecutionResult(db, companyId, decision.id, {
+      status: result.success ? "executed" : "failed",
+      note: result.error ?? null,
+    });
+
+    replayed.push({
+      action,
+      success: result.success,
+      details: {
+        ...(result.details ?? {}),
+        replayed: true,
+        status: result.success ? "success" : "failed",
+        decisionId: decision.id,
+      },
+      error: result.error,
+    });
+
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "decision-engine",
+      agentId: null,
+      runId: null,
+      action: "decision.execution.replayed",
+      entityType: "company",
+      entityId: companyId,
+      details: {
+        status: result.success ? "success" : "failed",
+        source,
+        decisionId: decision.id,
+        actionType: action.type,
+        actionKey: action.key,
+        replayed: true,
+        error: result.error ?? null,
+      },
+    });
+  }
+
+  return replayed;
+}
+
 export async function executeDecisionActionNow(
   db: Db,
   companyId: string,
@@ -811,8 +1218,24 @@ export async function executeDecisionActionNow(
   decisionId?: string,
 ): Promise<{ success: boolean; details?: Record<string, unknown>; error?: string }> {
   try {
-    const result = await executeAction(db, companyId, action, decisionId);
+    const payloadTraceId = readString(action.payload.traceId) ?? null;
+    const traceId = payloadTraceId ?? `decision_action:${companyId}:${decisionId ?? action.key}:${Date.now()}`;
+    const maxAttemptsRaw = Number(process.env.DECISION_ACTION_MAX_RETRIES ?? 2);
+    const maxAttempts = Number.isFinite(maxAttemptsRaw)
+      ? Math.max(1, Math.min(4, Math.trunc(maxAttemptsRaw)))
+      : 2;
+
+    let result = await executeAction(db, companyId, action, traceId, decisionId);
+    let attempts = 1;
+    while (!result.success && attempts < maxAttempts) {
+      attempts += 1;
+      result = await executeAction(db, companyId, action, traceId, decisionId);
+    }
+
     const details: Record<string, unknown> = result.details ? { ...result.details } : {};
+    details.traceId = traceId;
+    details.attempts = attempts;
+    if (decisionId) details.decisionId = decisionId;
     const issueId = typeof details.issueId === "string" ? details.issueId : null;
     const skipped = details.skipped === true;
 
@@ -845,6 +1268,8 @@ export async function executeDecisionActionNow(
       skipped,
       source,
       decisionId: decisionId ?? null,
+      traceId,
+      attempts,
     }).catch(() => {});
 
     return { success, details, error: result.error };
@@ -879,16 +1304,19 @@ export async function runAutonomousDecisionCycle(
   }
 
   const cycleStartedAt = Date.now();
+  const cycleTraceId = `decision_cycle:${input.companyId}:${cycleStartedAt}`;
   await setCycleState(db, input.companyId, "decision_engine", {
     status: "running",
     stage: "planning",
     currentAction: "collect_feedback",
     lastError: null,
     lastRunStartedAt: new Date(cycleStartedAt),
-    details: { source: input.source },
+    details: { source: input.source, traceId: cycleTraceId },
   });
 
   try {
+    const goalsContext = await loadActiveGoalContext(db, input.companyId);
+    const artifactSnapshots = await loadRecentArtifacts(db, input.companyId);
     const feedback = runBehaviorFeedback(input.companyId, {
       traffic: input.metrics.traffic,
       conversions: input.metrics.conversions,
@@ -925,14 +1353,17 @@ export async function runAutonomousDecisionCycle(
       ? dedupeDecisionActions([...ruleActions, ...llmAdvice.suggestedActions])
       : ruleActions;
 
+    const goalAlignedActions = applyGoalDrivenPolicy(proposedActions, goalsContext, input.metrics);
+    const artifactAlignedActions = addArtifactDrivenActions(goalAlignedActions, artifactSnapshots, goalsContext);
+
     const currentRpv = currentRPVCents(input.metrics);
     const rpvMode = selectRpvExecutionMode(input.metrics);
-    const actions = proposedActions.filter((action) => {
+    const actions = artifactAlignedActions.filter((action) => {
       if (rpvMode === "exploration") return true;
       if (rpvMode === "validation") return !rejectActionInValidationMode(action, currentRpv);
       return !rejectAction(action, currentRpv);
     });
-    const rejectedByRpv = proposedActions.filter((action) => {
+    const rejectedByRpv = artifactAlignedActions.filter((action) => {
       if (rpvMode === "exploration") return false;
       if (rpvMode === "validation") return rejectActionInValidationMode(action, currentRpv);
       return rejectAction(action, currentRpv);
@@ -952,7 +1383,11 @@ export async function runAutonomousDecisionCycle(
         source: input.source,
         decisionMode,
         rpvMode,
-        proposedCount: proposedActions.length,
+        traceId: cycleTraceId,
+        activeGoals: goalsContext.titles,
+        goalPriorities: goalsContext.priorities,
+        artifactsObserved: artifactSnapshots.length,
+        proposedCount: artifactAlignedActions.length,
         actionCount: actions.length,
         rejectedByRpv: rejectedByRpv.map((entry) => entry.key),
       },
@@ -975,22 +1410,35 @@ export async function runAutonomousDecisionCycle(
           channelAdvice: llmAdvice.channelAdvice,
           suggestedActionCount: llmAdvice.suggestedActions.length,
           source: input.source,
+          traceId: cycleTraceId,
         },
       });
     }
 
-    const executed: DecisionCycleResult["executed"] = [];
+    const replayedDecisions = await drainExecutableDecisions(db, input.companyId, input.source);
+    const executed: DecisionCycleResult["executed"] = [...replayedDecisions];
     await setCycleState(db, input.companyId, "decision_engine", {
       status: "running",
       stage: "executing",
       currentAction: actions[0]?.key ?? "no_actions",
       details: {
         source: input.source,
+        traceId: cycleTraceId,
+        replayedCount: replayedDecisions.length,
         actionCount: actions.length,
       },
     });
 
     for (const action of actions) {
+      const actionPayload: Record<string, unknown> = {
+        ...action.payload,
+        traceId: readString(action.payload.traceId) ?? cycleTraceId,
+        goalContext: goalsContext.titles,
+      };
+      const actionWithTrace: DecisionAction = {
+        ...action,
+        payload: actionPayload,
+      };
       const evidence = deriveDecisionEvidence(action, input.metrics);
       const requiresApproval =
         controls.autonomyLevel === "manual"
@@ -998,13 +1446,13 @@ export async function runAutonomousDecisionCycle(
       const decisionRow = await createSystemDecision(db, {
         companyId: input.companyId,
         source: input.source,
-        actionType: action.type,
-        actionKey: action.key,
-        reason: action.reason,
+        actionType: actionWithTrace.type,
+        actionKey: actionWithTrace.key,
+        reason: actionWithTrace.reason,
         metricName: evidence.metricName,
         metricValue: evidence.metricValue,
         thresholdValue: evidence.thresholdValue,
-        actionPayload: action.payload,
+        actionPayload: actionWithTrace.payload,
         status: requiresApproval ? "awaiting_approval" : "pending",
       });
 
@@ -1012,14 +1460,16 @@ export async function runAutonomousDecisionCycle(
         const pendingDetails = {
           status: "pending",
           source: input.source,
+          traceId: cycleTraceId,
           decisionMode,
           decisionId: decisionRow.id,
           pendingApproval: true,
-          actionType: action.type,
-          actionKey: action.key,
-          reason: action.reason,
+          actionType: actionWithTrace.type,
+          actionKey: actionWithTrace.key,
+          reason: actionWithTrace.reason,
+          linkedArtifactId: readString(actionWithTrace.payload.linkedArtifactId),
         };
-        executed.push({ action, success: false, details: pendingDetails });
+        executed.push({ action: actionWithTrace, success: false, details: pendingDetails });
 
         await db.insert(activityLog).values({
           companyId: input.companyId,
@@ -1036,7 +1486,7 @@ export async function runAutonomousDecisionCycle(
       }
 
       if (controls.autonomyLevel === "semi") {
-        const blockedByOverride = await isDecisionKeyBlocked(db, input.companyId, action.key, 24);
+        const blockedByOverride = await isDecisionKeyBlocked(db, input.companyId, actionWithTrace.key, 24);
         if (blockedByOverride) {
           await setSystemDecisionExecutionResult(db, input.companyId, decisionRow.id, {
             status: "overridden",
@@ -1046,12 +1496,13 @@ export async function runAutonomousDecisionCycle(
             status: "blocked",
             decisionId: decisionRow.id,
             skipped: true,
+            traceId: cycleTraceId,
             reason: "blocked_by_operator_override",
-            actionType: action.type,
-            actionKey: action.key,
+            actionType: actionWithTrace.type,
+            actionKey: actionWithTrace.key,
           };
           executed.push({
-            action,
+            action: actionWithTrace,
             success: false,
             details: blockedDetails,
           });
@@ -1070,7 +1521,7 @@ export async function runAutonomousDecisionCycle(
         }
       }
 
-      const actionResult = await executeDecisionActionNow(db, input.companyId, action, input.source, decisionRow.id);
+      const actionResult = await executeDecisionActionNow(db, input.companyId, actionWithTrace, input.source, decisionRow.id);
       await setSystemDecisionExecutionResult(db, input.companyId, decisionRow.id, {
         status: actionResult.success ? "executed" : "failed",
         note: actionResult.error ?? null,
@@ -1079,11 +1530,12 @@ export async function runAutonomousDecisionCycle(
       const details: Record<string, unknown> = {
         ...(actionResult.details ?? {}),
         status: actionResult.success ? "success" : "failed",
+        traceId: cycleTraceId,
         decisionId: decisionRow.id,
       };
       const issueId = typeof details.issueId === "string" ? details.issueId : null;
 
-      executed.push({ action, success: actionResult.success, details, error: actionResult.error });
+      executed.push({ action: actionWithTrace, success: actionResult.success, details, error: actionResult.error });
 
       await db.insert(activityLog).values({
         companyId: input.companyId,
@@ -1096,10 +1548,11 @@ export async function runAutonomousDecisionCycle(
         entityId: issueId ?? input.companyId,
         details: {
           source: input.source,
+          traceId: cycleTraceId,
           decisionMode,
-          actionType: action.type,
-          actionKey: action.key,
-          reason: action.reason,
+          actionType: actionWithTrace.type,
+          actionKey: actionWithTrace.key,
+          reason: actionWithTrace.reason,
           success: actionResult.success,
           ...details,
           error: actionResult.error ?? null,
@@ -1109,9 +1562,10 @@ export async function runAutonomousDecisionCycle(
       eventBus.publish("decision.action.executed", {
         companyId: input.companyId,
         source: input.source,
-        actionType: action.type,
-        key: action.key,
+        actionType: actionWithTrace.type,
+        key: actionWithTrace.key,
         success: actionResult.success,
+        traceId: cycleTraceId,
         details,
         error: actionResult.error ?? null,
         timestamp: new Date().toISOString(),
@@ -1133,6 +1587,7 @@ export async function runAutonomousDecisionCycle(
       actionCount: actions.length,
       executedCount: executed.length,
       successCount: executed.filter((entry) => entry.success).length,
+      traceId: cycleTraceId,
       timestamp: new Date().toISOString(),
     });
 
@@ -1148,6 +1603,8 @@ export async function runAutonomousDecisionCycle(
       details: {
         status: "success",
         source: input.source,
+        traceId: cycleTraceId,
+        replayedCount: replayedDecisions.length,
         feedbackCount: feedback.length,
         actionCount: actions.length,
         executedCount: executed.length,
@@ -1164,6 +1621,8 @@ export async function runAutonomousDecisionCycle(
       lastRunDurationMs: Date.now() - cycleStartedAt,
       details: {
         source: input.source,
+        traceId: cycleTraceId,
+        replayedCount: replayedDecisions.length,
         feedbackCount: feedback.length,
         actionCount: actions.length,
         executedCount: executed.length,
@@ -1194,6 +1653,7 @@ export async function runAutonomousDecisionCycle(
       lastRunDurationMs: Date.now() - cycleStartedAt,
       details: {
         source: input.source,
+        traceId: cycleTraceId,
       },
     }).catch(() => undefined);
     throw err;

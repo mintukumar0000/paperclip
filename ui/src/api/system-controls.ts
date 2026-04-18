@@ -12,6 +12,8 @@ import { api } from "./client";
 
 export interface SystemControlsResponse {
   companyId: string;
+  systemActive?: boolean;
+  loopIntervalSeconds?: number;
   trafficEnabled: boolean;
   redditEnabled: boolean;
   twitterEnabled: boolean;
@@ -68,6 +70,13 @@ export interface ExecutionFeedEventResponse {
   details: Record<string, unknown> & {
     type?: "reddit_post" | "deployment" | "checkout" | "email";
     url?: string;
+    artifactId?: string;
+    linkedDecisionId?: string;
+    artifactMetrics?: {
+      clicks?: number;
+      conversions?: number;
+      revenueCents?: number;
+    };
     metadata?: Record<string, unknown>;
   };
 }

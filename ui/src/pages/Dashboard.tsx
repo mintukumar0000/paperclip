@@ -749,6 +749,17 @@ export function Dashboard() {
                         Reason: {group.reason ?? "Rule gate active"}
                       </div>
                     )}
+                    {group.event.details.artifactMetrics && typeof group.event.details.artifactMetrics === "object" ? (
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {(() => {
+                          const metric = group.event.details.artifactMetrics as { clicks?: number; conversions?: number; revenueCents?: number };
+                          const clicks = Math.max(0, Number(metric.clicks ?? 0));
+                          const conversions = Math.max(0, Number(metric.conversions ?? 0));
+                          const revenue = Math.max(0, Number(metric.revenueCents ?? 0));
+                          return `Measured: clicks ${clicks} · conversions ${conversions} · revenue $${(revenue / 100).toFixed(2)}`;
+                        })()}
+                      </div>
+                    ) : null}
                     <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
                       <span>{group.event.createdAt ? new Date(group.event.createdAt).toLocaleTimeString() : "-"}</span>
                       <span>{toTitleCase(group.event.category)}</span>

@@ -93,9 +93,22 @@ function normalizeDecisionMode(value: string | undefined): DecisionMode | undefi
   return normalized;
 }
 
-function sanitizeUpdate(input: UpdateSystemControls): UpdateSystemControls {
+function sanitizeUpdate(input: UpdateSystemControls): Partial<typeof systemControls.$inferInsert> {
+  const mappedTrafficEnabled = typeof input.systemActive === "boolean"
+    ? input.systemActive
+    : input.trafficEnabled;
+  const mappedPostInterval = typeof input.loopIntervalSeconds === "number"
+    ? Math.max(5_000, Math.min(3_600_000, Math.trunc(input.loopIntervalSeconds * 1000)))
+    : typeof input.trafficPostIntervalMs === "number"
+      ? Math.max(5_000, Math.min(3_600_000, Math.trunc(input.trafficPostIntervalMs)))
+      : input.trafficPostIntervalMs;
+
   return {
-    ...input,
+    trafficEnabled: mappedTrafficEnabled,
+    redditEnabled: input.redditEnabled,
+    twitterEnabled: input.twitterEnabled,
+    indieHackersEnabled: input.indieHackersEnabled,
+    hackerNewsEnabled: input.hackerNewsEnabled,
     maxMultiplier:
       typeof input.maxMultiplier === "number"
         ? Math.max(1, Math.min(20, Math.trunc(input.maxMultiplier)))
@@ -104,20 +117,20 @@ function sanitizeUpdate(input: UpdateSystemControls): UpdateSystemControls {
       typeof input.postFrequency === "number"
         ? Math.max(1, Math.min(24, Math.trunc(input.postFrequency)))
         : input.postFrequency,
+    subredditTargets: normalizeSubredditTargets(input.subredditTargets),
+    pricingVariant: input.pricingVariant,
     paywallTriggerCount:
       typeof input.paywallTriggerCount === "number"
         ? Math.max(1, Math.min(50, Math.trunc(input.paywallTriggerCount)))
         : input.paywallTriggerCount,
-    subredditTargets: normalizeSubredditTargets(input.subredditTargets),
+    cycleMode: input.cycleMode,
+    autonomyLevel: input.autonomyLevel,
     trafficChannels: normalizeTrafficChannels(input.trafficChannels),
     trafficMultiplier:
       typeof input.trafficMultiplier === "number"
         ? Math.max(1, Math.min(20, Math.trunc(input.trafficMultiplier)))
         : input.trafficMultiplier,
-    trafficPostIntervalMs:
-      typeof input.trafficPostIntervalMs === "number"
-        ? Math.max(5_000, Math.min(3_600_000, Math.trunc(input.trafficPostIntervalMs)))
-        : input.trafficPostIntervalMs,
+    trafficPostIntervalMs: mappedPostInterval,
     trafficMaxPostsPerCycle:
       typeof input.trafficMaxPostsPerCycle === "number"
         ? Math.max(1, Math.min(40, Math.trunc(input.trafficMaxPostsPerCycle)))

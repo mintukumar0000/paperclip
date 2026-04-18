@@ -690,6 +690,14 @@ if (!isWorkerOnly) {
     logger.warn("Execution loop scheduler skipped because AUTO_EXECUTION=false");
   }
 
+  if (aiEnabled) {
+    const { startAutonomyWatchdog } = await import("./core/autonomyWatchdog.js");
+    const stopWatchdog = startAutonomyWatchdog(db as any, 15_000);
+    process.once("SIGINT", stopWatchdog);
+    process.once("SIGTERM", stopWatchdog);
+    logger.info({ tickMs: 15_000 }, "Autonomy watchdog started");
+  }
+
   // --- Traffic Generation Loop ---
   if (aiEnabled) {
     const { startTrafficLoop } = await import("./core/trafficLoop.js");

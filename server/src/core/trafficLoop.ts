@@ -197,6 +197,8 @@ Would love feedback on where you'd harden this architecture next.
 interface TrafficLoopContext {
   db: Db;
   baseUrl: string;
+  decisionId?: string | null;
+  traceId?: string | null;
 }
 
 interface PostResult {
@@ -368,6 +370,8 @@ interface TrafficRuntimeControls {
 interface TrafficCycleRunOptions {
   bypassDecisionGate?: boolean;
   decisionId?: string;
+  traceId?: string;
+  channelsOverride?: Array<"reddit" | "twitter" | "indie_hackers" | "hacker_news">;
 }
 
 function sortChannelsByBias(channels: Channel[], bias: Record<Channel, number>): Channel[] {
@@ -1012,6 +1016,7 @@ async function postToReddit(
     }, { maxRetries: 2, delayMs: 5_000, channel: "reddit" });
 
     const companyId = getTelemetryCompanyId();
+    const artifactId = `artifact:reddit:${content.subreddit}:${Date.now()}`;
     if (companyId) {
       await ctx.db.insert(activityLog).values({
         companyId,
@@ -1023,6 +1028,9 @@ async function postToReddit(
         entityType: "company",
         entityId: companyId,
         details: {
+          artifactId,
+          decisionId: ctx.decisionId ?? null,
+          traceId: ctx.traceId ?? null,
           subreddit: content.subreddit,
           title: content.title,
           hook: content.hook,
@@ -1053,6 +1061,9 @@ async function postToReddit(
           conversions: 0,
           revenueCents: 0,
           metadata: {
+            artifactId,
+            linkedDecisionId: ctx.decisionId ?? null,
+            traceId: ctx.traceId ?? null,
             channel: "reddit",
             subreddit: content.subreddit,
             title: content.title,
@@ -1187,6 +1198,7 @@ async function postToTwitter(
     if (result.posted) {
       recordChannelSuccess("twitter");
       const companyId = getTelemetryCompanyId();
+      const artifactId = `artifact:twitter:${Date.now()}`;
       if (companyId) {
         await recordSystemMetric(ctx.db, {
           companyId,
@@ -1195,7 +1207,14 @@ async function postToTwitter(
           traffic: 1,
           conversions: 0,
           revenueCents: 0,
-          metadata: { channel: "twitter", text: content.text.slice(0, 100), tweetUrl: result.tweetUrl ?? null },
+          metadata: {
+            artifactId,
+            linkedDecisionId: ctx.decisionId ?? null,
+            traceId: ctx.traceId ?? null,
+            channel: "twitter",
+            text: content.text.slice(0, 100),
+            tweetUrl: result.tweetUrl ?? null,
+          },
         });
         await ctx.db.insert(activityLog).values({
           companyId,
@@ -1206,7 +1225,16 @@ async function postToTwitter(
           action: "distribution.twitter.posted",
           entityType: "company",
           entityId: companyId,
-          details: { text: content.text.slice(0, 200), tweetUrl: result.tweetUrl ?? null, method: "playwright", retries: result.retries },
+          details: {
+            artifactId,
+            decisionId: ctx.decisionId ?? null,
+            traceId: ctx.traceId ?? null,
+            channel: "twitter",
+            text: content.text.slice(0, 200),
+            tweetUrl: result.tweetUrl ?? null,
+            method: "playwright",
+            retries: result.retries,
+          },
         });
         await recordContentPerformance(ctx.db, companyId, "twitter", content.text.slice(0, 80), true, {});
       }
@@ -1341,6 +1369,7 @@ async function postToExpansionWebhook(
     if (result.posted) {
       recordChannelSuccess(channel);
       if (companyId) {
+        const artifactId = `artifact:${channel}:${Date.now()}`;
         await recordSystemMetric(ctx.db, {
           companyId,
           sourceType: "tool_action",
@@ -1349,6 +1378,9 @@ async function postToExpansionWebhook(
           conversions: 0,
           revenueCents: 0,
           metadata: {
+            artifactId,
+            linkedDecisionId: ctx.decisionId ?? null,
+            traceId: ctx.traceId ?? null,
             channel,
             title: content.title,
             postUrl: result.postUrl,
@@ -1364,6 +1396,9 @@ async function postToExpansionWebhook(
           entityType: "company",
           entityId: companyId,
           details: {
+            artifactId,
+            decisionId: ctx.decisionId ?? null,
+            traceId: ctx.traceId ?? null,
             channel,
             title: content.title,
             postUrl: result.postUrl,
@@ -1466,6 +1501,12 @@ async function runTrafficCycle(
   trafficLoopRunning = true;
   const results: PostResult[] = [];
   const cycleStartedAt = Date.now();
+  const cycleTraceId = options.traceId ?? ctx.traceId ?? `traffic_cycle:${cycleStartedAt}`;
+  const runCtx: TrafficLoopContext = {
+    ...ctx,
+    decisionId: options.decisionId ?? ctx.decisionId ?? null,
+    traceId: cycleTraceId,
+  };
 
   try {
     const companyId = getTelemetryCompanyId();
@@ -1494,6 +1535,7 @@ async function runTrafficCycle(
           entityId: companyId,
           details: {
             status: "blocked",
+            traceId: cycleTraceId,
             reason: "traffic_disabled",
             successCount: 0,
             failCount: 0,
@@ -1548,6 +1590,14 @@ async function runTrafficCycle(
       learningBias.preferredSubreddits,
     );
     const channels = sortChannelsByBias(getEnabledChannels(trafficControls), learningBias.channelScores);
+    const requestedChannels = Array.isArray(options.channelsOverride)
+      ? options.channelsOverride.filter((entry): entry is Channel => (
+        entry === "reddit" || entry === "twitter" || entry === "indie_hackers" || entry === "hacker_news"
+      ))
+      : [];
+    const effectiveChannels = requestedChannels.length > 0
+      ? channels.filter((entry) => requestedChannels.includes(entry))
+      : channels;
     const draftPlan = getChannelPostPlan(multiplier, trafficControls);
     const maxPostsPerCycle = Math.max(1, Math.min(40, trafficControls?.trafficMaxPostsPerCycle ?? 8));
     const channelPlan: Record<Channel, number> = {
@@ -1557,7 +1607,7 @@ async function runTrafficCycle(
       hacker_news: 0,
     };
     let postsRemaining = maxPostsPerCycle;
-    for (const channel of channels) {
+    for (const channel of effectiveChannels) {
       const requested = draftPlan[channel] ?? 0;
       const granted = Math.max(0, Math.min(requested, postsRemaining));
       channelPlan[channel] = granted;
@@ -1567,7 +1617,7 @@ async function runTrafficCycle(
     const postSpacingMs = Math.max(5_000, trafficControls?.trafficPostIntervalMs ?? 60_000);
     const twitterStaggerMs = postSpacingMs * 2;
 
-    if (channels.length === 0) {
+    if (effectiveChannels.length === 0) {
       if (companyId) {
         await logActivity(ctx.db, {
           companyId,
@@ -1578,6 +1628,7 @@ async function runTrafficCycle(
           entityId: companyId,
           details: {
             status: "blocked",
+            traceId: cycleTraceId,
             reason: "no_channels_enabled",
             successCount: 0,
             failCount: 0,
@@ -1621,7 +1672,8 @@ async function runTrafficCycle(
           reason: "Traffic cycle requires approval under current decision mode.",
           actionPayload: {
             baseUrl: ctx.baseUrl,
-            channels,
+            traceId: cycleTraceId,
+            channels: effectiveChannels,
             channelPlan,
             multiplier,
             trafficMode: runtimeTrafficMode,
@@ -1643,7 +1695,8 @@ async function runTrafficCycle(
           decisionMode: runtimeDecisionMode,
           actionKey: trafficDecisionKey,
           decisionId,
-          channels,
+            traceId: cycleTraceId,
+            channels: effectiveChannels,
           channelPlan,
           multiplier,
         },
@@ -1659,7 +1712,8 @@ async function runTrafficCycle(
         details: {
           decisionMode: runtimeDecisionMode,
           actionKey: trafficDecisionKey,
-          channels,
+          traceId: cycleTraceId,
+          channels: effectiveChannels,
           channelPlan,
         },
       }).catch(() => undefined);
@@ -1682,7 +1736,8 @@ async function runTrafficCycle(
         details: {
           status: "pending",
           decisionId: options.decisionId ?? null,
-          channels,
+          traceId: cycleTraceId,
+          channels: effectiveChannels,
           channelPlan,
           subreddits,
           multiplier,
@@ -1696,9 +1751,10 @@ async function runTrafficCycle(
       await setCycleState(ctx.db, companyId, "traffic", {
         status: "running",
         stage: "executing",
-        currentAction: channels[0] ?? "none",
+        currentAction: effectiveChannels[0] ?? "none",
         details: {
-          channels,
+          traceId: cycleTraceId,
+          channels: effectiveChannels,
           channelPlan,
           multiplier,
         },
@@ -1708,7 +1764,7 @@ async function runTrafficCycle(
     logger.info(
       {
         multiplier,
-        channels,
+        channels: effectiveChannels,
         redditPlan: channelPlan.reddit,
         twitterPlan: channelPlan.twitter,
         preferredSubreddits: learningBias.preferredSubreddits,
@@ -1717,7 +1773,7 @@ async function runTrafficCycle(
     );
 
     // Reddit post
-    if (channels.includes("reddit")) {
+    if (effectiveChannels.includes("reddit")) {
       const stats = await getSystemStats(ctx.db);
       const llmSelectedSubreddit = await chooseSubredditWithLLM(subreddits, stats);
 
@@ -1727,9 +1783,9 @@ async function runTrafficCycle(
           ? (llmSelectedSubreddit ?? defaultSubreddit)
           : defaultSubreddit;
         logger.info({ subreddit, postIndex, redditIndex }, "Traffic loop: generating Reddit content");
-        const content = await generatePostContent(ctx.db, subreddit, ctx.baseUrl);
+        const content = await generatePostContent(runCtx.db, subreddit, runCtx.baseUrl);
         logger.info({ subreddit, title: content.title.slice(0, 60), redditIndex }, "Traffic loop: posting to Reddit");
-        results.push(await postToReddit(ctx, content));
+        results.push(await postToReddit(runCtx, content));
 
         if (redditIndex < channelPlan.reddit - 1 && postSpacingMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, postSpacingMs));
@@ -1738,15 +1794,15 @@ async function runTrafficCycle(
     }
 
     // Twitter post (staggered 2 min after Reddit to avoid rate limits)
-    if (channels.includes("twitter")) {
+    if (effectiveChannels.includes("twitter")) {
       if (twitterStaggerMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, twitterStaggerMs));
       }
       for (let twitterIndex = 0; twitterIndex < channelPlan.twitter; twitterIndex++) {
         logger.info({ twitterIndex }, "Traffic loop: generating Twitter content");
-        const tweet = await generateTweetContent(ctx.db, ctx.baseUrl);
+        const tweet = await generateTweetContent(runCtx.db, runCtx.baseUrl);
         logger.info({ textPreview: tweet.text.slice(0, 60), twitterIndex }, "Traffic loop: posting to Twitter");
-        results.push(await postToTwitter(ctx, tweet));
+        results.push(await postToTwitter(runCtx, tweet));
 
         if (twitterIndex < channelPlan.twitter - 1 && postSpacingMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, postSpacingMs));
@@ -1754,18 +1810,18 @@ async function runTrafficCycle(
       }
     }
 
-    if (channels.includes("indie_hackers")) {
+    if (effectiveChannels.includes("indie_hackers")) {
       logger.info({}, "Traffic loop: generating Indie Hackers content");
-      const indieContent = await generateExpansionContent(ctx.db, ctx.baseUrl, "indie_hackers");
+      const indieContent = await generateExpansionContent(runCtx.db, runCtx.baseUrl, "indie_hackers");
       logger.info({ title: indieContent.title.slice(0, 80) }, "Traffic loop: posting to Indie Hackers webhook");
-      results.push(await postToExpansionWebhook(ctx, "indie_hackers", indieContent));
+      results.push(await postToExpansionWebhook(runCtx, "indie_hackers", indieContent));
     }
 
-    if (channels.includes("hacker_news")) {
+    if (effectiveChannels.includes("hacker_news")) {
       logger.info({}, "Traffic loop: generating Hacker News content");
-      const hnContent = await generateExpansionContent(ctx.db, ctx.baseUrl, "hacker_news");
+      const hnContent = await generateExpansionContent(runCtx.db, runCtx.baseUrl, "hacker_news");
       logger.info({ title: hnContent.title.slice(0, 80) }, "Traffic loop: posting to Hacker News webhook");
-      results.push(await postToExpansionWebhook(ctx, "hacker_news", hnContent));
+      results.push(await postToExpansionWebhook(runCtx, "hacker_news", hnContent));
     }
 
     if (companyId) {
@@ -1778,8 +1834,9 @@ async function runTrafficCycle(
         entityId: companyId,
         details: {
           status: "info",
+          traceId: cycleTraceId,
           multiplier,
-          channels,
+          channels: effectiveChannels,
           channelPlan,
           preferredSubreddits: learningBias.preferredSubreddits,
           channelScores: learningBias.channelScores,
@@ -1810,8 +1867,18 @@ async function runTrafficCycle(
           status: failCount > 0 ? "failed" : "success",
           success: failCount === 0,
           decisionId: options.decisionId ?? null,
+          traceId: cycleTraceId,
           successCount,
           failCount,
+          channelMetrics: ["reddit", "twitter", "indie_hackers", "hacker_news"].map((channel) => {
+            const rows = results.filter((row) => row.channel === channel);
+            return {
+              channel,
+              attempts: rows.length,
+              successes: rows.filter((row) => row.posted).length,
+              failures: rows.filter((row) => !row.posted).length,
+            };
+          }),
           channels: results.map((r) => ({
             channel: r.channel,
             posted: r.posted,
@@ -1827,6 +1894,7 @@ async function runTrafficCycle(
         lastRunCompletedAt: new Date(),
         lastRunDurationMs: Date.now() - cycleStartedAt,
         details: {
+          traceId: cycleTraceId,
           successCount,
           failCount,
         },
@@ -1834,6 +1902,7 @@ async function runTrafficCycle(
     }
 
     eventBus.publish("traffic.loop.cycle.completed", {
+      traceId: cycleTraceId,
       results: results.map((r) => ({ channel: r.channel, posted: r.posted, retries: r.retries, error: r.error ?? null })),
       timestamp: new Date().toISOString(),
     });
@@ -1859,6 +1928,7 @@ async function runTrafficCycle(
           status: "failed",
           success: false,
           decisionId: options.decisionId ?? null,
+          traceId: cycleTraceId,
           error: message,
           successCount: results.filter((r) => r.posted).length,
           failCount: results.filter((r) => !r.posted && r.method !== "none" && r.method !== "backoff").length,

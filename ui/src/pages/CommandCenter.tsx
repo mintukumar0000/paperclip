@@ -1135,6 +1135,9 @@ export function CommandCenter() {
                 const event = group.event;
                 const trace = getTraceLink(event);
                 const evidence = extractEvidence(event);
+                const artifactMetrics = event.details.artifactMetrics && typeof event.details.artifactMetrics === "object"
+                  ? event.details.artifactMetrics as { clicks?: number; conversions?: number; revenueCents?: number }
+                  : null;
                 return (
                 <article key={event.id} className="rounded-lg border border-border p-3">
                   <div className="flex items-start justify-between gap-2">
@@ -1160,6 +1163,15 @@ export function CommandCenter() {
                     {trace.issueId ? <span>issue: {trace.issueId.slice(0, 8)}</span> : null}
                     {trace.goalId ? <span>goal: {trace.goalId.slice(0, 8)}</span> : null}
                     {trace.agentId ? <span>agent: {trace.agentId.slice(0, 8)}</span> : null}
+                    {artifactMetrics ? (
+                      <span>
+                        clicks {Math.max(0, Number(artifactMetrics.clicks ?? 0))}
+                        {" · "}
+                        conv {Math.max(0, Number(artifactMetrics.conversions ?? 0))}
+                        {" · "}
+                        rev ${((Math.max(0, Number(artifactMetrics.revenueCents ?? 0))) / 100).toFixed(2)}
+                      </span>
+                    ) : null}
                     {evidence?.url ? (
                       <a href={evidence.url} target="_blank" rel="noreferrer" className="text-primary hover:underline">
                         output

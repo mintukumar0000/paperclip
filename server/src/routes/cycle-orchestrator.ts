@@ -53,17 +53,23 @@ function mapIntentToCycle(intent: string, fallback: CycleMode): CycleMode {
   return fallback;
 }
 
-async function runCompanyCycleOrchestrator(input: {
+export async function runCompanyCycleOrchestrator(input: {
   db: Db;
   companyId: string;
   cycleType: CycleMode;
   reason?: string | null;
-  actor: ReturnType<typeof getActorInfo>;
+  actor: {
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId?: string | null;
+    runId?: string | null;
+  };
 }): Promise<SystemCycleRunResult> {
   const { db, companyId, cycleType, reason, actor } = input;
   const execution = executionLoop(db);
   const stepOrder = CYCLE_STEP_ORDER[cycleType];
   const cycleStartedAt = Date.now();
+  const traceId = `cycle_orchestrator:${companyId}:${cycleStartedAt}`;
   const startedAt = new Date(cycleStartedAt).toISOString();
   const steps: SystemCycleStepResult[] = [];
 
@@ -74,6 +80,7 @@ async function runCompanyCycleOrchestrator(input: {
     lastError: null,
     lastRunStartedAt: new Date(cycleStartedAt),
     details: {
+      traceId,
       cycleType,
       reason: reason ?? null,
       stepOrder,
@@ -91,6 +98,7 @@ async function runCompanyCycleOrchestrator(input: {
     entityId: companyId,
     details: {
       status: "pending",
+      traceId,
       cycleType,
       reason: reason ?? null,
       stepOrder,
@@ -126,7 +134,7 @@ async function runCompanyCycleOrchestrator(input: {
         };
       } else if (step === "traffic") {
         const result = await withActiveCompanyScope(companyId, async () =>
-          runTrafficCycleWithDecision({ db, baseUrl: resolvePublicBaseUrl() }),
+          runTrafficCycleWithDecision({ db, baseUrl: resolvePublicBaseUrl() }, { traceId }),
         );
         if (result.error) {
           throw new Error(result.error);
@@ -192,6 +200,7 @@ async function runCompanyCycleOrchestrator(input: {
         entityId: companyId,
         details: {
           status: "failed",
+          traceId,
           cycleType,
           step,
           error: message,
@@ -227,6 +236,7 @@ async function runCompanyCycleOrchestrator(input: {
     lastRunCompletedAt: new Date(),
     lastRunDurationMs: result.durationMs,
     details: {
+      traceId,
       cycleType,
       status,
       stepOrder,
@@ -244,6 +254,7 @@ async function runCompanyCycleOrchestrator(input: {
     entityId: companyId,
     details: {
       status,
+      traceId,
       cycleType,
       reason: reason ?? null,
       durationMs: result.durationMs,

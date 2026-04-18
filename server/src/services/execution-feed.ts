@@ -265,6 +265,34 @@ function inferEvidenceMetadata(type: ExecutionEvidenceType | null, details: Reco
   return null;
 }
 
+function inferArtifactId(type: ExecutionEvidenceType | null, action: string, details: Record<string, unknown>): string | null {
+  const explicit = readString(details.artifactId) ?? readString(details.artifact_id);
+  if (explicit) return explicit;
+
+  const url = inferEvidenceUrl(type, details);
+  if (url) return `${action}:${url}`;
+  if (type) return `${action}:${readString(details.id) ?? "artifact"}`;
+  return null;
+}
+
+function inferArtifactMetrics(type: ExecutionEvidenceType | null, details: Record<string, unknown>): Record<string, unknown> | null {
+  if (!type) return null;
+
+  const clicksRaw = Number(details.clicks ?? details.upvotes ?? 0);
+  const conversionsRaw = Number(details.conversions ?? details.paymentConversions ?? 0);
+  const revenueRaw = Number(details.revenueCents ?? details.revenue ?? 0);
+
+  const clicks = Number.isFinite(clicksRaw) ? Math.max(0, Math.round(clicksRaw)) : 0;
+  const conversions = Number.isFinite(conversionsRaw) ? Math.max(0, Math.round(conversionsRaw)) : 0;
+  const revenueCents = Number.isFinite(revenueRaw) ? Math.max(0, Math.round(revenueRaw)) : 0;
+
+  return {
+    clicks,
+    conversions,
+    revenueCents,
+  };
+}
+
 function enrichDetails(action: string, details: Record<string, unknown>, status: ExecutionFeedStatus): Record<string, unknown> {
   const next = { ...details };
   const evidenceType = inferEvidenceType(action, next);
@@ -286,6 +314,23 @@ function enrichDetails(action: string, details: Record<string, unknown>, status:
 
   if (reason && typeof next.reason !== "string") {
     next.reason = reason;
+  }
+
+  const artifactId = inferArtifactId(evidenceType, action, next);
+  if (artifactId && typeof next.artifactId !== "string") {
+    next.artifactId = artifactId;
+  }
+
+  const artifactMetrics = inferArtifactMetrics(evidenceType, next);
+  if (artifactMetrics && !("artifactMetrics" in next)) {
+    next.artifactMetrics = artifactMetrics;
+  }
+
+  if (typeof next.linkedDecisionId !== "string") {
+    const linkedDecisionId = readString(next.decisionId) ?? readString(next.decision_id);
+    if (linkedDecisionId) {
+      next.linkedDecisionId = linkedDecisionId;
+    }
   }
 
   if (typeof next.traceId !== "string" && typeof next.trace_id !== "string") {

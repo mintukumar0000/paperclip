@@ -39,6 +39,12 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
           createdAt: event.createdAt,
           status: event.status,
           action: event.action,
+          decisionId: event.decisionId,
+          artifactId: typeof event.details.artifactId === "string" ? event.details.artifactId : null,
+          artifactMetrics:
+            event.details.artifactMetrics && typeof event.details.artifactMetrics === "object"
+              ? (event.details.artifactMetrics as { clicks?: number; conversions?: number; revenueCents?: number })
+              : null,
           evidence,
         };
       })
@@ -107,6 +113,14 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
 
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>Time: {formatRelativeTime(row.createdAt)}</span>
+                  <span>
+                    clicks {Math.max(0, Number(row.artifactMetrics?.clicks ?? 0))}
+                    {" · "}
+                    conv {Math.max(0, Number(row.artifactMetrics?.conversions ?? 0))}
+                    {" · "}
+                    rev ${((Math.max(0, Number(row.artifactMetrics?.revenueCents ?? 0))) / 100).toFixed(2)}
+                  </span>
+                  {row.decisionId ? <span>decision {row.decisionId.slice(0, 8)}</span> : null}
                   <div className="flex items-center gap-1.5">
                     {row.evidence.url ? (
                       <>
