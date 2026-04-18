@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { CycleMode, TrafficChannel, TrafficMode } from "@paperclipai/shared";
@@ -337,14 +337,17 @@ export function Dashboard() {
   const activeCycleMode: CycleMode = controls?.cycleMode ?? "launch";
   const activeCycleIndex = CYCLE_VISUAL.indexOf(activeCycleMode);
 
-  const nextAction = useMemo(() => {
-    if (!activeRow) return "Awaiting next autonomous action";
-    if (activeRow.loopKey === "traffic") return "Analyze conversion and optimize targeting";
-    if (activeRow.loopKey === "decision_engine") return "Review and execute queued decisions";
-    if (activeRow.loopKey === "email_sequence") return "Advance monetization email sequence";
-    if (activeRow.loopKey === "execution_loop") return "Dispatch work to the best agent";
-    return "Continue cycle orchestration";
-  }, [activeRow]);
+  const nextAction = !activeRow
+    ? "Awaiting next autonomous action"
+    : activeRow.loopKey === "traffic"
+      ? "Analyze conversion and optimize targeting"
+      : activeRow.loopKey === "decision_engine"
+        ? "Review and execute queued decisions"
+        : activeRow.loopKey === "email_sequence"
+          ? "Advance monetization email sequence"
+          : activeRow.loopKey === "execution_loop"
+            ? "Dispatch work to the best agent"
+            : "Continue cycle orchestration";
 
   const systemBusy =
     runCycleMutation.isPending
