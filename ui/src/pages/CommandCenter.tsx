@@ -188,17 +188,29 @@ function formatNumericMetric(value: number | null): string {
   return value.toFixed(2);
 }
 
-function toActionLabel(actionType: string, actionKey: string): string {
-  const normalizedType = actionType.replace(/_/g, " ");
-  const normalizedKey = actionKey.replace(/_/g, " ").replace(/\./g, " ");
+function safeText(value: unknown, fallback = "-"): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function toActionLabel(actionType: unknown, actionKey: unknown): string {
+  const normalizedType = safeText(actionType).replace(/_/g, " ");
+  const normalizedKey = safeText(actionKey).replace(/_/g, " ").replace(/\./g, " ");
   return `${normalizedType} (${normalizedKey})`;
 }
 
 function toFeedRowLabel(event: ExecutionFeedEventResponse): string {
-  if (typeof event.details.message === "string" && event.details.message.length > 0) {
-    return event.details.message;
+  const details =
+    event.details && typeof event.details === "object"
+      ? (event.details as Record<string, unknown>)
+      : null;
+  if (details && typeof details.message === "string" && details.message.trim().length > 0) {
+    return details.message;
   }
-  return event.message;
+  const message = safeText(event.message, "");
+  if (message) return message;
+  return safeText(event.action);
 }
 
 export function CommandCenter() {
@@ -800,14 +812,14 @@ export function CommandCenter() {
                     <div className="flex flex-wrap items-start justify-between gap-2">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-foreground">{decision.actionKey}</span>
+                          <span className="text-sm font-medium text-foreground">{safeText(decision.actionKey)}</span>
                           <StatusBadge status={decision.status} />
                         </div>
-                        <p className="text-xs text-muted-foreground">{decision.reason}</p>
+                        <p className="text-xs text-muted-foreground">{safeText(decision.reason)}</p>
                       </div>
                       <div className="text-right text-xs text-muted-foreground">
                         <div>{formatDateTime(decision.createdAt)}</div>
-                        <div className="mt-1">{decision.source}</div>
+                        <div className="mt-1">{safeText(decision.source)}</div>
                       </div>
                     </div>
 
@@ -828,7 +840,7 @@ export function CommandCenter() {
                       </div>
                       <div>
                         <span className="text-foreground">Why:</span>{" "}
-                        {decision.reason}
+                        {safeText(decision.reason)}
                       </div>
                     </div>
 
@@ -1002,13 +1014,13 @@ export function CommandCenter() {
                 <article key={event.id} className="rounded-lg border border-border p-3">
                   <div className="flex items-start justify-between gap-2">
                     <div>
-                      <div className="text-sm font-medium text-foreground">{event.action}</div>
+                      <div className="text-sm font-medium text-foreground">{safeText(event.action)}</div>
                       <div className="text-xs text-muted-foreground">{toFeedRowLabel(event)}</div>
                     </div>
                     <StatusBadge status={event.status} />
                   </div>
                   <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                    <span>{event.category}</span>
+                    <span>{safeText(event.category)}</span>
                     <span>{formatDateTime(event.createdAt)}</span>
                     {event.decisionId ? <span>decision: {event.decisionId.slice(0, 8)}</span> : null}
                   </div>
