@@ -159,6 +159,30 @@ function toUpdatePayload(draft: ControlsDraft): UpdateSystemControls {
   };
 }
 
+function draftEquals(a: ControlsDraft, b: ControlsDraft): boolean {
+  return (
+    a.trafficEnabled === b.trafficEnabled
+    && a.redditEnabled === b.redditEnabled
+    && a.twitterEnabled === b.twitterEnabled
+    && a.indieHackersEnabled === b.indieHackersEnabled
+    && a.hackerNewsEnabled === b.hackerNewsEnabled
+    && a.maxMultiplier === b.maxMultiplier
+    && a.postFrequency === b.postFrequency
+    && a.subredditTargetsText === b.subredditTargetsText
+    && a.trafficChannels.join(",") === b.trafficChannels.join(",")
+    && a.trafficMultiplier === b.trafficMultiplier
+    && a.trafficPostIntervalMs === b.trafficPostIntervalMs
+    && a.trafficMaxPostsPerCycle === b.trafficMaxPostsPerCycle
+    && a.trafficSubredditWhitelistText === b.trafficSubredditWhitelistText
+    && a.trafficMode === b.trafficMode
+    && a.decisionMode === b.decisionMode
+    && a.pricingVariant === b.pricingVariant
+    && a.paywallTriggerCount === b.paywallTriggerCount
+    && a.cycleMode === b.cycleMode
+    && a.autonomyLevel === b.autonomyLevel
+  );
+}
+
 function formatDurationMs(value: number | null): string {
   if (value == null || !Number.isFinite(value)) return "-";
   if (value < 1000) return `${value}ms`;
@@ -270,12 +294,14 @@ export function CommandCenter() {
   });
 
   useEffect(() => {
-    if (!controlsQuery.data) return;
-    if (draft === null || !isDirty) {
-      setDraft(toDraft(controlsQuery.data));
-      setIsDirty(false);
-    }
-  }, [controlsQuery.data, draft, isDirty]);
+    if (!controlsQuery.data || isDirty) return;
+    const nextDraft = toDraft(controlsQuery.data);
+    setDraft((current) => {
+      if (!current) return nextDraft;
+      return draftEquals(current, nextDraft) ? current : nextDraft;
+    });
+    setIsDirty(false);
+  }, [controlsQuery.data, isDirty]);
 
   useEffect(() => {
     if (!executionFeedQuery.data) return;
