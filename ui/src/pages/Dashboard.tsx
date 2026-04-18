@@ -1,10 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { CycleMode, TrafficChannel, TrafficMode } from "@paperclipai/shared";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { StatusBadge } from "../components/StatusBadge";
+import { ExecutionStatusBadge } from "../components/ExecutionStatusBadge";
+import { OutputEvidencePanel } from "../components/OutputEvidencePanel";
+import { SystemTimeline } from "../components/SystemTimeline";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
 import { Checkbox } from "../components/ui/checkbox";
@@ -14,6 +17,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { formatCents } from "../lib/utils";
 import { systemControlsApi, type ExecutionFeedEventResponse, type SystemControlsResponse } from "../api/system-controls";
+import { getEventReason } from "../lib/execution-feed";
 import { billingApi } from "../api/billing";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
@@ -349,6 +353,23 @@ export function Dashboard() {
             ? "Dispatch work to the best agent"
             : "Continue cycle orchestration";
 
+      const blockedReasonSummary = useMemo(() => {
+        const counts = new Map<string, number>();
+        for (const event of feedBuffer) {
+          if (!(event.status === "blocked" || event.status === "pending" || event.status === "skipped")) {
+            continue;
+          }
+          const reason = getEventReason(event) ?? "Rule gate active";
+          counts.set(reason, (counts.get(reason) ?? 0) + 1);
+        }
+
+        return Array.from(counts.entries())
+          .map(([reason, count]) => ({ reason, count }))
+          .slice(0, 4);
+      }, [feedBuffer]);
+
+      const showPausedByRulesBanner = !hasRunningCycle && blockedReasonSummary.length > 0;
+
   const systemBusy =
     runCycleMutation.isPending
     || runIntentMutation.isPending
@@ -390,6 +411,20 @@ export function Dashboard() {
           </div>
         </div>
       </section>
+
+      {showPausedByRulesBanner ? (
+        <section className="rounded-xl border border-yellow-300/60 bg-yellow-50/60 p-4 text-yellow-900 shadow-sm dark:border-yellow-900/60 dark:bg-yellow-950/30 dark:text-yellow-100">
+          <p className="text-sm font-semibold">System Paused by Rules</p>
+          <p className="mt-1 text-xs opacity-90">System is not stuck. It is waiting on policy gates:</p>
+          <div className="mt-2 flex flex-wrap gap-2 text-xs">
+            {blockedReasonSummary.map((entry) => (
+              <span key={entry.reason} className="rounded-full border border-yellow-500/40 bg-yellow-100/80 px-2 py-0.5 dark:bg-yellow-900/40">
+                {entry.reason} ({entry.count})
+              </span>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(0,1.35fr)]">
         <div className="space-y-4">
@@ -611,8 +646,13 @@ export function Dashboard() {
                       <div className="truncate text-sm text-foreground">
                         {safeText(event.message, toTitleCase(event.action))}
                       </div>
-                      <StatusBadge status={event.status} />
+                      <ExecutionStatusBadge status={event.status} />
                     </div>
+                    {(event.status === "blocked" || event.status === "pending" || event.status === "skipped") && (
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        Reason: {getEventReason(event) ?? "Rule gate active"}
+                      </div>
+                    )}
                     <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
                       <span>{event.createdAt ? new Date(event.createdAt).toLocaleTimeString() : "-"}</span>
                       <span>{toTitleCase(event.category)}</span>
@@ -622,6 +662,10 @@ export function Dashboard() {
               )}
             </div>
           </section>
+
+          <OutputEvidencePanel companyId={selectedCompanyId} />
+
+          <SystemTimeline companyId={selectedCompanyId} />
 
           <section className="rounded-xl border border-border bg-card p-4 shadow-sm">
             <h2 className="text-sm font-semibold text-foreground">Performance</h2>

@@ -3,7 +3,9 @@ import { desc, eq } from "@paperclipai/db";
 import { activityLog } from "@paperclipai/db";
 
 export type ExecutionFeedCategory = "traffic" | "email" | "decision" | "execution" | "revenue" | "system";
-export type ExecutionFeedStatus = "info" | "success" | "failed" | "pending" | "blocked";
+export type ExecutionFeedStatus = "info" | "success" | "failed" | "pending" | "blocked" | "skipped";
+
+export type ExecutionEvidenceType = "reddit_post" | "deployment" | "checkout" | "email";
 
 export interface ExecutionFeedEvent {
   id: string;
@@ -11,6 +13,7 @@ export interface ExecutionFeedEvent {
   createdAt: string;
   category: ExecutionFeedCategory;
   status: ExecutionFeedStatus;
+  reason: string | null;
   action: string;
   message: string;
   decisionId: string | null;
@@ -32,6 +35,17 @@ function toRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function readString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function mapReason(value: string): string {
+  if (value === "issue_already_open") return "duplicate_prevention";
+  return value;
+}
+
 function inferCategory(action: string): ExecutionFeedCategory {
   const lower = action.toLowerCase();
   if (lower.startsWith("traffic.") || lower.startsWith("distribution.")) return "traffic";
@@ -49,11 +63,16 @@ function inferStatus(action: string, details: Record<string, unknown>): Executio
   }
   if (explicit === "failed" || explicit === "error") return "failed";
   if (explicit === "pending" || explicit === "awaiting_approval") return "pending";
-  if (explicit === "blocked" || explicit === "overridden" || explicit === "skipped") return "blocked";
+  if (explicit === "skipped") return "skipped";
+  if (explicit === "blocked" || explicit === "overridden") return "blocked";
+
+  if (details.skipped === true) return "skipped";
+  if (details.pendingApproval === true) return "pending";
 
   const lower = action.toLowerCase();
   if (lower.includes(".failed") || lower.includes(".error")) return "failed";
   if (lower.includes("awaiting_approval") || lower.includes(".pending")) return "pending";
+  if (lower.includes(".skipped")) return "skipped";
   if (lower.includes(".blocked") || lower.includes(".overridden") || lower.includes(".skipped")) return "blocked";
   if (
     lower.includes(".completed")
@@ -71,6 +90,136 @@ function inferStatus(action: string, details: Record<string, unknown>): Executio
   return "info";
 }
 
+function inferReason(action: string, details: Record<string, unknown>, status: ExecutionFeedStatus): string | null {
+  const explicitReason = readString(details.reason);
+  if (explicitReason) return mapReason(explicitReason);
+
+  const errorReason = readString(details.error);
+  if (errorReason && (status === "failed" || status === "blocked")) return errorReason;
+
+  if (status === "pending" || status === "blocked") {
+    if (details.pendingApproval === true || action.toLowerCase().includes("awaiting_approval")) {
+      return "awaiting_approval";
+    }
+  }
+
+  if (status === "skipped") {
+    if (details.skipped === true && !explicitReason) {
+      return "duplicate_prevention";
+    }
+  }
+
+  return null;
+}
+
+function inferEvidenceType(action: string, details: Record<string, unknown>): ExecutionEvidenceType | null {
+  const explicit = readString(details.type);
+  if (explicit === "reddit_post" || explicit === "deployment" || explicit === "checkout" || explicit === "email") {
+    return explicit;
+  }
+
+  const lower = action.toLowerCase();
+  if (lower.startsWith("distribution.reddit.post")) return "reddit_post";
+  if (lower.includes("checkout") || lower.startsWith("billing.")) return "checkout";
+  if (lower.startsWith("email.")) return "email";
+
+  const deploymentUrl = readString(details.deploymentUrl) ?? readString(details.deployment_url);
+  if (deploymentUrl) return "deployment";
+  if (lower.includes("deploy") || lower.includes("deployment")) return "deployment";
+
+  return null;
+}
+
+function inferEvidenceUrl(type: ExecutionEvidenceType | null, details: Record<string, unknown>): string | null {
+  if (type === "reddit_post") {
+    return readString(details.postUrl)
+      ?? readString(details.post_url)
+      ?? readString(details.permalink)
+      ?? readString(details.url);
+  }
+
+  if (type === "deployment") {
+    return readString(details.deploymentUrl)
+      ?? readString(details.deployment_url)
+      ?? readString(details.url);
+  }
+
+  if (type === "checkout") {
+    return readString(details.checkoutUrl)
+      ?? readString(details.checkout_url)
+      ?? readString(details.paymentLink)
+      ?? readString(details.url);
+  }
+
+  return null;
+}
+
+function inferEvidenceMetadata(type: ExecutionEvidenceType | null, details: Record<string, unknown>): Record<string, unknown> | null {
+  if (type === "reddit_post") {
+    return {
+      subreddit: details.subreddit ?? null,
+      title: details.title ?? null,
+      method: details.method ?? null,
+      upvotes: details.upvotes ?? null,
+      comments: details.comments ?? null,
+    };
+  }
+
+  if (type === "deployment") {
+    return {
+      deploymentId: details.deploymentId ?? details.id ?? null,
+      status: details.status ?? null,
+      source: details.source ?? null,
+    };
+  }
+
+  if (type === "checkout") {
+    return {
+      provider: details.provider ?? null,
+      sessionId: details.sessionId ?? details.session_id ?? null,
+      productId: details.productId ?? details.product_id ?? null,
+    };
+  }
+
+  if (type === "email") {
+    return {
+      email: details.email ?? null,
+      step: details.step ?? null,
+      subject: details.subject ?? null,
+      emailStatus: details.status ?? null,
+      emailId: details.emailId ?? details.email_id ?? null,
+    };
+  }
+
+  return null;
+}
+
+function enrichDetails(action: string, details: Record<string, unknown>, status: ExecutionFeedStatus): Record<string, unknown> {
+  const next = { ...details };
+  const evidenceType = inferEvidenceType(action, next);
+  const evidenceUrl = inferEvidenceUrl(evidenceType, next);
+  const evidenceMetadata = inferEvidenceMetadata(evidenceType, next);
+  const reason = inferReason(action, next, status);
+
+  if (evidenceType && typeof next.type !== "string") {
+    next.type = evidenceType;
+  }
+
+  if (evidenceUrl && typeof next.url !== "string") {
+    next.url = evidenceUrl;
+  }
+
+  if (evidenceMetadata && !("metadata" in next)) {
+    next.metadata = evidenceMetadata;
+  }
+
+  if (reason && typeof next.reason !== "string") {
+    next.reason = reason;
+  }
+
+  return next;
+}
+
 function toDecisionId(details: Record<string, unknown>): string | null {
   if (typeof details.decisionId === "string" && details.decisionId.length > 0) return details.decisionId;
   if (typeof details.decision_id === "string" && details.decision_id.length > 0) return details.decision_id;
@@ -85,16 +234,22 @@ function toFeedEvent(input: {
   details: unknown;
 }): ExecutionFeedEvent {
   const details = toRecord(input.details);
+  const status = inferStatus(input.action, details);
+  const enrichedDetails = enrichDetails(input.action, details, status);
+  const reason = inferReason(input.action, enrichedDetails, status);
   return {
     id: input.id,
     companyId: input.companyId,
     createdAt: typeof input.createdAt === "string" ? input.createdAt : input.createdAt.toISOString(),
     category: inferCategory(input.action),
-    status: inferStatus(input.action, details),
+    status,
+    reason,
     action: input.action,
-    message: typeof details.message === "string" ? details.message : normalizeActionLabel(input.action),
-    decisionId: toDecisionId(details),
-    details,
+    message: typeof enrichedDetails.message === "string"
+      ? enrichedDetails.message
+      : normalizeActionLabel(input.action),
+    decisionId: toDecisionId(enrichedDetails),
+    details: enrichedDetails,
   };
 }
 

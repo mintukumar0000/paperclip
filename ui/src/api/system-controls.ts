@@ -56,11 +56,16 @@ export interface ExecutionFeedEventResponse {
   companyId: string;
   createdAt: string;
   category: "traffic" | "email" | "decision" | "execution" | "revenue" | "system";
-  status: "info" | "success" | "failed" | "pending" | "blocked";
+  status: "info" | "success" | "failed" | "pending" | "blocked" | "skipped";
+  reason: string | null;
   action: string;
   message: string;
   decisionId: string | null;
-  details: Record<string, unknown>;
+  details: Record<string, unknown> & {
+    type?: "reddit_post" | "deployment" | "checkout" | "email";
+    url?: string;
+    metadata?: Record<string, unknown>;
+  };
 }
 
 export interface SystemDecisionResponse {

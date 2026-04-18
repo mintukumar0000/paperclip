@@ -54,6 +54,7 @@ const EXECUTION_FEED_STATUSES = new Set<ExecutionFeedStatus>([
   "failed",
   "pending",
   "blocked",
+  "skipped",
 ]);
 
 export function systemControlsRoutes(db: Db) {

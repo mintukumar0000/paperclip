@@ -51,7 +51,9 @@ import { useCompany } from "../context/CompanyContext";
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { StatusBadge } from "../components/StatusBadge";
+import { ExecutionStatusBadge } from "../components/ExecutionStatusBadge";
 import { queryKeys } from "../lib/queryKeys";
+import { getEventReason } from "../lib/execution-feed";
 
 interface ControlsDraft {
   trafficEnabled: boolean;
@@ -994,6 +996,7 @@ export function CommandCenter() {
                   <SelectItem value="failed">failed</SelectItem>
                   <SelectItem value="pending">pending</SelectItem>
                   <SelectItem value="blocked">blocked</SelectItem>
+                  <SelectItem value="skipped">skipped</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -1017,8 +1020,13 @@ export function CommandCenter() {
                       <div className="text-sm font-medium text-foreground">{safeText(event.action)}</div>
                       <div className="text-xs text-muted-foreground">{toFeedRowLabel(event)}</div>
                     </div>
-                    <StatusBadge status={event.status} />
+                    <ExecutionStatusBadge status={event.status} />
                   </div>
+                  {(event.status === "blocked" || event.status === "pending" || event.status === "skipped") && (
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Reason: {getEventReason(event) ?? "Rule gate active"}
+                    </div>
+                  )}
                   <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">
                     <span>{safeText(event.category)}</span>
                     <span>{formatDateTime(event.createdAt)}</span>
