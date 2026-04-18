@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { CycleMode, TrafficChannel, TrafficMode } from "@paperclipai/shared";
@@ -353,22 +353,19 @@ export function Dashboard() {
             ? "Dispatch work to the best agent"
             : "Continue cycle orchestration";
 
-      const blockedReasonSummary = useMemo(() => {
-        const counts = new Map<string, number>();
-        for (const event of feedBuffer) {
-          if (!(event.status === "blocked" || event.status === "pending" || event.status === "skipped")) {
-            continue;
-          }
-          const reason = getEventReason(event) ?? "Rule gate active";
-          counts.set(reason, (counts.get(reason) ?? 0) + 1);
-        }
+  const counts = new Map<string, number>();
+  for (const event of feedBuffer) {
+    if (!(event.status === "blocked" || event.status === "pending" || event.status === "skipped")) {
+      continue;
+    }
+    const reason = getEventReason(event) ?? "Rule gate active";
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  const blockedReasonSummary = Array.from(counts.entries())
+    .map(([reason, count]) => ({ reason, count }))
+    .slice(0, 4);
 
-        return Array.from(counts.entries())
-          .map(([reason, count]) => ({ reason, count }))
-          .slice(0, 4);
-      }, [feedBuffer]);
-
-      const showPausedByRulesBanner = !hasRunningCycle && blockedReasonSummary.length > 0;
+  const showPausedByRulesBanner = !hasRunningCycle && blockedReasonSummary.length > 0;
 
   const systemBusy =
     runCycleMutation.isPending
