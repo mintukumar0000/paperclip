@@ -50,8 +50,15 @@ function formatDateTime(value: string | null): string {
   return date.toLocaleTimeString();
 }
 
-function toTitleCase(value: string): string {
-  return value
+function safeText(value: unknown, fallback = "-"): string {
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function toTitleCase(value: unknown): string {
+  const text = safeText(value, "-");
+  return text
     .replace(/_/g, " ")
     .replace(/\./g, " ")
     .replace(/\s+/g, " ")
@@ -311,11 +318,15 @@ export function Dashboard() {
   const issues = issuesQuery.data ?? [];
   const goals = goalsQuery.data ?? [];
   const pendingApprovals = approvalsQuery.data ?? [];
-  const revenue = financeQuery.data?.revenueCents ?? 0;
-  const visitors = revenueQuery.data?.traffic ?? 0;
-  const conversions = revenueQuery.data?.conversions ?? 0;
-  const conversionRate = revenueQuery.data?.conversionRate ?? 0;
-  const rpv = computeRpv(revenue, visitors);
+  const revenue = Number(financeQuery.data?.revenueCents ?? 0);
+  const visitors = Number(revenueQuery.data?.traffic ?? 0);
+  const conversions = Number(revenueQuery.data?.conversions ?? 0);
+  const conversionRate = Number(revenueQuery.data?.conversionRate ?? 0);
+  const safeRevenue = Number.isFinite(revenue) ? revenue : 0;
+  const safeVisitors = Number.isFinite(visitors) ? visitors : 0;
+  const safeConversions = Number.isFinite(conversions) ? conversions : 0;
+  const safeConversionRate = Number.isFinite(conversionRate) ? conversionRate : 0;
+  const rpv = computeRpv(safeRevenue, safeVisitors);
 
   const activeRow = cycleState.find((row) => row.loopKey === "cycle_orchestrator")
     ?? cycleState.find((row) => row.status === "running")
@@ -352,7 +363,7 @@ export function Dashboard() {
             <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
               <span>🟢 Status: {systemState.toUpperCase()}</span>
               <span>🚀 Cycle: {toTitleCase(activeCycleMode)}</span>
-              <span>💰 Revenue: {formatCents(revenue)}</span>
+              <span>💰 Revenue: {formatCents(safeRevenue)}</span>
               <span>📈 RPV: ${rpv.toFixed(1)}</span>
             </div>
           </div>
@@ -522,11 +533,11 @@ export function Dashboard() {
             <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">Conversion Rate</p>
-                <p className="mt-1 text-lg font-semibold text-foreground">{conversionRate.toFixed(2)}%</p>
+                <p className="mt-1 text-lg font-semibold text-foreground">{safeConversionRate.toFixed(2)}%</p>
               </div>
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">Revenue</p>
-                <p className="mt-1 text-lg font-semibold text-foreground">{formatCents(revenue)}</p>
+                <p className="mt-1 text-lg font-semibold text-foreground">{formatCents(safeRevenue)}</p>
               </div>
             </div>
             <div className="mt-3">
@@ -594,7 +605,9 @@ export function Dashboard() {
                 feedBuffer.slice(0, 20).map((event) => (
                   <div key={event.id} className="rounded-md border border-border px-3 py-2">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="truncate text-sm text-foreground">{event.message || toTitleCase(event.action)}</div>
+                      <div className="truncate text-sm text-foreground">
+                        {safeText(event.message, toTitleCase(event.action))}
+                      </div>
                       <StatusBadge status={event.status} />
                     </div>
                     <div className="mt-1 flex items-center justify-between text-xs text-muted-foreground">
@@ -612,15 +625,15 @@ export function Dashboard() {
             <div className="mt-3 grid grid-cols-2 gap-2">
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs text-muted-foreground">Visitors</p>
-                <p className="text-lg font-semibold text-foreground">{visitors}</p>
+                <p className="text-lg font-semibold text-foreground">{safeVisitors}</p>
               </div>
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs text-muted-foreground">Conversions</p>
-                <p className="text-lg font-semibold text-foreground">{conversions}</p>
+                <p className="text-lg font-semibold text-foreground">{safeConversions}</p>
               </div>
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs text-muted-foreground">Revenue</p>
-                <p className="text-lg font-semibold text-foreground">{formatCents(revenue)}</p>
+                <p className="text-lg font-semibold text-foreground">{formatCents(safeRevenue)}</p>
               </div>
               <div className="rounded-md border border-border px-3 py-2">
                 <p className="text-xs text-muted-foreground">RPV</p>
@@ -651,7 +664,7 @@ export function Dashboard() {
                         {decision.thresholdValue == null ? "" : ` (threshold ${decision.thresholdValue})`}
                       </div>
                       <div className="mt-1 text-xs text-muted-foreground">Action: {toTitleCase(decision.actionType)}</div>
-                      <div className="mt-1 text-xs text-muted-foreground">Why: {decision.reason}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">Why: {safeText(decision.reason)}</div>
                       {actionable && (
                         <div className="mt-2 flex gap-2">
                           <Button
@@ -702,7 +715,7 @@ export function Dashboard() {
                   {issues.slice(0, 4).map((issue) => (
                     <div key={issue.id} className="flex items-center justify-between gap-2 rounded-md border border-border px-2 py-1.5 text-xs">
                       <Link to={`/issues/${issue.identifier ?? issue.id}`} className="truncate text-foreground hover:underline">
-                        {issue.title}
+                        {safeText(issue.title)}
                       </Link>
                       <select
                         className="max-w-[9rem] rounded border border-border bg-background px-1 py-0.5 text-xs"
@@ -714,7 +727,7 @@ export function Dashboard() {
                       >
                         <option value="">Unassigned</option>
                         {agents.map((agent) => (
-                          <option key={agent.id} value={agent.id}>{agent.name}</option>
+                          <option key={agent.id} value={agent.id}>{safeText(agent.name)}</option>
                         ))}
                       </select>
                     </div>
@@ -728,7 +741,7 @@ export function Dashboard() {
                   {agents.slice(0, 4).map((agent) => (
                     <div key={agent.id} className="rounded-md border border-border px-2 py-1.5 text-xs">
                       <div className="flex items-center justify-between">
-                        <span className="truncate text-foreground">{agent.name}</span>
+                        <span className="truncate text-foreground">{safeText(agent.name)}</span>
                         <StatusBadge status={agent.status} />
                       </div>
                       <div className="mt-1 flex gap-1">
@@ -760,7 +773,7 @@ export function Dashboard() {
                 <div className="mt-2 space-y-1">
                   {goals.slice(0, 4).map((goal) => (
                     <div key={goal.id} className="flex items-center justify-between rounded-md border border-border px-2 py-1.5 text-xs">
-                      <span className="truncate text-foreground">{goal.title}</span>
+                      <span className="truncate text-foreground">{safeText(goal.title)}</span>
                       <StatusBadge status={goal.status} />
                     </div>
                   ))}
