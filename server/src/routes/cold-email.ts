@@ -10,6 +10,7 @@ import {
   trackImpression,
   type LandingVariant,
 } from "../ai/distribution/landingVariants.js";
+import { getModel } from "../ai/llmRouter.js";
 import { getSystemControls } from "../services/system-controls.js";
 import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
 import { logger } from "../middleware/logger.js";
@@ -505,11 +506,7 @@ function llmConfig(): {
   const openRouterKey = (process.env.OPENROUTER_API_KEY ?? "").trim();
   if (openRouterKey) {
     const baseUrl = (process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1").trim();
-    const model = (
-      process.env.OPENROUTER_MODEL
-      ?? process.env.LOW_COST_GPT_MODEL
-      ?? "openai/gpt-4o-mini"
-    ).trim();
+    const model = getModel("email", { baseUrl, normalizeForBase: true });
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${openRouterKey}`,
@@ -523,9 +520,10 @@ function llmConfig(): {
 
   const openAiKey = (process.env.OPENAI_API_KEY ?? "").trim();
   if (!openAiKey) return null;
+  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://openrouter.ai/api/v1").trim();
   return {
-    baseUrl: (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim(),
-    model: (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim(),
+    baseUrl,
+    model: getModel("email", { baseUrl, normalizeForBase: true }),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${openAiKey}`,

@@ -7,6 +7,7 @@ import type { DecisionAction } from "./decisionEngine.js";
 import { buildMemoryContext, recordActionOutcome } from "../../memory/embeddingMemory.js";
 import { getSkillsForTask } from "../skills/applySkills.js";
 import { getStrategyState } from "../brain/strategyBrain.js";
+import { getModel } from "../llmRouter.js";
 
 const logger = pino({ name: "llm-decision-advisor" });
 
@@ -138,8 +139,8 @@ export async function analyzeMeisticsWithLLM(
     return null;
   }
 
-  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
-  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+  const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://openrouter.ai/api/v1").trim();
+  const model = getModel("decision", { baseUrl, normalizeForBase: true });
 
   const emailData = await getEmailPerformanceData(db, companyId);
   const recentDecisions = await getRecentDecisionHistory(db, companyId);

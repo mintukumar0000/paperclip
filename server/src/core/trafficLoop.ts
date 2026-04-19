@@ -8,6 +8,7 @@ import { recordContentPerformance } from "../memory/embeddingMemory.js";
 import { getSkillsByCategory } from "../ai/skills/skillStore.js";
 import { buildSkillPromptBlock } from "../ai/skills/applySkills.js";
 import { validateOutput } from "../ai/quality/executionQualityGate.js";
+import { getModel } from "../ai/llmRouter.js";
 import { getActiveCompanyId, listScopedCompanyIds } from "./companyScope.js";
 import { resolvePublicBaseUrl, isPublicDeployment } from "../public-base-url.js";
 import { resolveExistingRedditStorageStatePath, resolveRedditStorageStatePath } from "../reddit-storage-state.js";
@@ -539,7 +540,7 @@ async function chooseSubredditWithLLM(
   if (!apiKey || subreddits.length <= 1) return null;
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
-  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+  const model = getModel("content", { baseUrl, normalizeForBase: true });
   const subredditProfiles = subreddits
     .map((name) => `- ${name}: ${SUBREDDIT_DESCRIPTIONS[name.toLowerCase()] ?? "General startup/building audience."}`)
     .join("\n");
@@ -596,7 +597,7 @@ async function generateLLMTitle(context: string, channel: Channel, subreddit?: s
   if (!apiKey) return null;
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
-  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+  const model = getModel("content", { baseUrl, normalizeForBase: true });
 
   let skillBlock = "";
   if (db) {
@@ -811,7 +812,7 @@ async function scoreRedditVariantsWithLLM(
   if (!apiKey) return null;
 
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").trim();
-  const model = (process.env.OPENAI_MODEL ?? "gpt-4o-mini").trim();
+  const model = getModel("content", { baseUrl, normalizeForBase: true });
 
   const prompt = candidates.map((candidate, index) => (
     `${index}. format=${candidate.format}\nTITLE: ${candidate.title}\nBODY: ${candidate.body.slice(0, 600)}`

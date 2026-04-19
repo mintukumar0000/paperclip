@@ -3,13 +3,13 @@ import pino from "pino";
 const logger = pino({ name: "llm-router" });
 
 export type LLMTask =
-  | "reasoning"    // Strategy, root-cause analysis, planning → Anthropic Claude
-  | "decision"     // Fast structured decisions → GPT-4o
-  | "content"      // Reddit posts, tweets, blog drafts → GPT-4o-mini
-  | "reply"        // Human-sounding Reddit replies → Claude
-  | "strategy"     // Multi-week planning → Claude
-  | "email"        // Email copy generation → GPT-4o
-  | "seo";         // SEO content generation → GPT-4o
+  | "reasoning"    // Analysis/planning support → low-cost GPT
+  | "decision"     // Decision engine path → strong GPT
+  | "content"      // Reddit posts, tweets, blog drafts → low-cost GPT
+  | "reply"        // Human-sounding replies → low-cost GPT
+  | "strategy"     // Goal/strategy interpretation → strong GPT
+  | "email"        // Email copy generation → low-cost GPT
+  | "seo";         // SEO content generation → low-cost GPT
 
 interface ModelConfig {
   model: string;
@@ -19,6 +19,7 @@ interface ModelConfig {
 
 const DEFAULT_MAX_LLM_CALLS_PER_HOUR = 50;
 const LLM_BUDGET_WINDOW_MS = 60 * 60_000;
+const DEFAULT_STRONG_GPT_MODEL = "openai/gpt-4o";
 const DEFAULT_LOW_COST_GPT_MODEL = "openai/gpt-4o-mini";
 const DEFAULT_LOW_COST_MAX_TOKENS = 900;
 
@@ -35,14 +36,18 @@ function refreshLLMBudgetWindow(now = Date.now()): void {
 }
 
 const TASK_MODEL_MAP: Record<LLMTask, ModelConfig> = {
-  reasoning: { model: "anthropic/claude-sonnet-4-20250514", maxTokens: 2000, temperature: 0.3 },
-  decision:  { model: "openai/gpt-4o", maxTokens: 1000, temperature: 0.4 },
-  content:   { model: "openai/gpt-4o-mini", maxTokens: 800, temperature: 0.8 },
-  reply:     { model: "anthropic/claude-sonnet-4-20250514", maxTokens: 500, temperature: 0.6 },
-  strategy:  { model: "anthropic/claude-sonnet-4-20250514", maxTokens: 3000, temperature: 0.3 },
-  email:     { model: "openai/gpt-4o", maxTokens: 1200, temperature: 0.5 },
-  seo:       { model: "openai/gpt-4o", maxTokens: 3000, temperature: 0.6 },
+  reasoning: { model: DEFAULT_LOW_COST_GPT_MODEL, maxTokens: 2000, temperature: 0.3 },
+  decision:  { model: DEFAULT_STRONG_GPT_MODEL, maxTokens: 1000, temperature: 0.4 },
+  content:   { model: DEFAULT_LOW_COST_GPT_MODEL, maxTokens: 800, temperature: 0.8 },
+  reply:     { model: DEFAULT_LOW_COST_GPT_MODEL, maxTokens: 500, temperature: 0.6 },
+  strategy:  { model: DEFAULT_STRONG_GPT_MODEL, maxTokens: 3000, temperature: 0.3 },
+  email:     { model: DEFAULT_LOW_COST_GPT_MODEL, maxTokens: 1200, temperature: 0.5 },
+  seo:       { model: DEFAULT_LOW_COST_GPT_MODEL, maxTokens: 3000, temperature: 0.6 },
 };
+
+function isStrongTask(task: LLMTask): boolean {
+  return task === "decision" || task === "strategy";
+}
 
 function getApiConfig(): { baseUrl: string; apiKey: string } {
   const apiKey = (process.env.OPENAI_API_KEY ?? "").trim();
@@ -103,21 +108,35 @@ function resolveLowCostModel(): string {
   return `openai/${configured}`;
 }
 
-function resolveTaskConfig(task: LLMTask, overrides?: Partial<ModelConfig>): ModelConfig {
-  const base = { ...TASK_MODEL_MAP[task], ...overrides };
-  const lowCostEnabled = parseBooleanEnv(process.env.LOW_COST_GPT_MODE, false);
-  if (!lowCostEnabled) return base;
+function resolveStrongModel(): string {
+  const configured = (process.env.STRONG_GPT_MODEL ?? DEFAULT_STRONG_GPT_MODEL).trim();
+  if (!configured) return DEFAULT_STRONG_GPT_MODEL;
+  if (configured.includes("/")) return configured;
+  return `openai/${configured}`;
+}
 
-  const maxTokens = Math.min(
-    base.maxTokens,
-    readPositiveIntEnv("LOW_COST_MAX_TOKENS", DEFAULT_LOW_COST_MAX_TOKENS),
-  );
+function resolveTaskConfig(task: LLMTask, overrides?: Partial<ModelConfig>): ModelConfig {
+  const selectedModel = isStrongTask(task) ? resolveStrongModel() : resolveLowCostModel();
+  const base = { ...TASK_MODEL_MAP[task], model: selectedModel, ...overrides };
+
+  if (isStrongTask(task)) return base;
 
   return {
     ...base,
-    model: resolveLowCostModel(),
-    maxTokens,
+    maxTokens: Math.min(
+      base.maxTokens,
+      readPositiveIntEnv("LOW_COST_MAX_TOKENS", DEFAULT_LOW_COST_MAX_TOKENS),
+    ),
   };
+}
+
+export function getModel(task: LLMTask, options?: { baseUrl?: string; normalizeForBase?: boolean }): string {
+  const baseUrl = options?.baseUrl ?? getApiConfig().baseUrl;
+  const model = resolveTaskConfig(task).model;
+  if (options?.normalizeForBase) {
+    return normalizeModelForBase(model, baseUrl);
+  }
+  return model;
 }
 
 function consumeLLMBudget(task: LLMTask, model: string): boolean {
