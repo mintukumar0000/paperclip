@@ -13,6 +13,7 @@
     "reddit:verify-session": "pnpm --filter @paperclipai/server playwright:verify-reddit-session",
     "reddit:test-post": "pnpm --filter @paperclipai/server playwright:test-reddit-post",
     "waitlist:send-offers": "pnpm --filter @paperclipai/server waitlist:send-offers",
+    "hard-reset:runtime": "pnpm --filter @paperclipai/server hard-reset:runtime",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "vitest",
