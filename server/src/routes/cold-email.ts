@@ -3,6 +3,14 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, and, companies, desc, eq, sql, waitlistSignups } from "@paperclipai/db";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
 import { recordSystemMetric } from "../ai/feedback/metricsEngine.js";
+import {
+  assignVariant,
+  generateLandingVariants,
+  getDefaultLandingVariants,
+  trackImpression,
+  type LandingVariant,
+} from "../ai/distribution/landingVariants.js";
+import { getSystemControls } from "../services/system-controls.js";
 import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
 import { logger } from "../middleware/logger.js";
 import {
@@ -19,11 +27,23 @@ type AttributionContext = {
   sessionId: string | null;
 };
 
+type OfferTier = "entry" | "upsell" | "premium";
+
+type ColdEmailRuntimeControls = {
+  freeLimit: number;
+  pricingVariant: string;
+  pricingTier: OfferTier;
+  pricingVariantPriceCents: number;
+  dodoProductId: string | null;
+};
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TEMPLATE_PLACEHOLDER_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/g;
 const TEMPLATE_PLACEHOLDER_TEST_RE = /\[[^\]\n]{1,80}\]|\{\{[^}\n]{1,80}\}\}|<[^>\n]{1,80}>/;
 const scheduledFollowUps = new Set<string>();
 const LOCKED_PREVIEW_LINES = 4;
+const LANDING_VISITOR_COOKIE = "paperclip_landing_visitor_id";
+const LANDING_EXPERIMENT_ID = "cold_email_landing_ab_v1";
 
 const EMPTY_ATTRIBUTION: AttributionContext = {
   utmSource: null,
@@ -54,6 +74,61 @@ function normalizeOptionalString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function readCookieValue(req: Request, cookieName: string): string | null {
+  const raw = req.header("cookie");
+  if (!raw) return null;
+  const pairs = raw.split(";");
+  for (const pair of pairs) {
+    const [namePart, ...valueParts] = pair.split("=");
+    if (!namePart || valueParts.length === 0) continue;
+    if (namePart.trim() !== cookieName) continue;
+    const value = valueParts.join("=").trim();
+    if (!value) return null;
+    try {
+      const decoded = decodeURIComponent(value);
+      return decoded.length > 0 ? decoded : null;
+    } catch {
+      return value.length > 0 ? value : null;
+    }
+  }
+  return null;
+}
+
+function stableHash(input: string): string {
+  let hash = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    hash = ((hash << 5) - hash + input.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function resolveLandingVisitorId(req: Request, attribution: AttributionContext): {
+  visitorId: string;
+  fromCookie: boolean;
+} {
+  const cookieId = normalizeOptionalString(readCookieValue(req, LANDING_VISITOR_COOKIE));
+  if (cookieId) {
+    return { visitorId: cookieId, fromCookie: true };
+  }
+
+  const sessionId = normalizeOptionalString(attribution.sessionId);
+  if (sessionId) {
+    return { visitorId: `sess_${stableHash(sessionId)}`, fromCookie: false };
+  }
+
+  const fingerprint = `${req.ip ?? "unknown"}|${req.header("user-agent") ?? "unknown"}`;
+  return { visitorId: `anon_${stableHash(fingerprint)}`, fromCookie: false };
 }
 
 function normalizeAttributionValue(value: unknown, maxLength: number): string | null {
@@ -120,10 +195,89 @@ function isUuid(value: string | null): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
-function getFreeLimit(): number {
+function readDefaultFreeLimit(): number {
   const raw = Number(process.env.COLD_EMAIL_FREE_LIMIT ?? "3");
   if (!Number.isFinite(raw)) return 3;
   return Math.max(1, Math.round(raw));
+}
+
+function normalizePricingVariant(raw: string | null | undefined): string {
+  const normalized = normalizeOptionalString(raw)?.toLowerCase() ?? "entry_9";
+  if (normalized === "entry" || normalized === "entry_9") return "entry_9";
+  if (normalized === "entry_19" || normalized === "upsell" || normalized === "upsell_19") return "entry_19";
+  if (normalized === "entry_29" || normalized === "premium" || normalized === "premium_29") return "entry_29";
+  return normalized;
+}
+
+function pricingTierFromVariant(variant: string): OfferTier {
+  if (variant.includes("29") || variant.includes("premium")) return "premium";
+  if (variant.includes("19") || variant.includes("upsell")) return "upsell";
+  return "entry";
+}
+
+function pricingVariantToCents(variant: string): number {
+  const numericMatch = variant.match(/(\d{1,4})/);
+  if (numericMatch) {
+    const dollars = Number(numericMatch[1]);
+    if (Number.isFinite(dollars) && dollars > 0) return Math.round(dollars * 100);
+  }
+
+  const tier = pricingTierFromVariant(variant);
+  if (tier === "premium") return 2900;
+  if (tier === "upsell") return 1900;
+  return 900;
+}
+
+function productIdForTier(tier: OfferTier): string | null {
+  if (tier === "premium") {
+    return normalizeOptionalString(process.env.DODO_PRODUCT_ID_PREMIUM)
+      ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID_ENTRY)
+      ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID)
+      ?? null;
+  }
+  if (tier === "upsell") {
+    return normalizeOptionalString(process.env.DODO_PRODUCT_ID_UPSELL)
+      ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID_ENTRY)
+      ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID)
+      ?? null;
+  }
+  return normalizeOptionalString(process.env.DODO_PRODUCT_ID_ENTRY)
+    ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID)
+    ?? null;
+}
+
+async function resolveColdEmailRuntimeControls(
+  db: Db,
+  companyId: string | null,
+): Promise<ColdEmailRuntimeControls> {
+  const defaultsVariant = normalizePricingVariant(null);
+  const defaultsTier = pricingTierFromVariant(defaultsVariant);
+
+  if (!companyId) {
+    return {
+      freeLimit: readDefaultFreeLimit(),
+      pricingVariant: defaultsVariant,
+      pricingTier: defaultsTier,
+      pricingVariantPriceCents: pricingVariantToCents(defaultsVariant),
+      dodoProductId: productIdForTier(defaultsTier),
+    };
+  }
+
+  const controls = await getSystemControls(db, companyId).catch(() => null);
+  const pricingVariant = normalizePricingVariant(controls?.pricingVariant ?? null);
+  const pricingTier = pricingTierFromVariant(pricingVariant);
+  const controlsFreeLimitRaw = Number(controls?.paywallTriggerCount ?? Number.NaN);
+  const freeLimit = Number.isFinite(controlsFreeLimitRaw)
+    ? Math.max(1, Math.round(controlsFreeLimitRaw))
+    : readDefaultFreeLimit();
+
+  return {
+    freeLimit,
+    pricingVariant,
+    pricingTier,
+    pricingVariantPriceCents: pricingVariantToCents(pricingVariant),
+    dodoProductId: productIdForTier(pricingTier),
+  };
 }
 
 function getSoftTriggerGenerationCount(freeLimit: number): number {
@@ -206,16 +360,22 @@ async function resolveTelemetryCompanyIdForDb(db: Db): Promise<string | null> {
   const companyId = resolveTelemetryCompanyId();
   if (!companyId) return null;
 
-  const company = await db
-    .select({ id: companies.id })
-    .from(companies)
-    .where(eq(companies.id, companyId))
-    .limit(1)
-    .then((rows) => rows[0] ?? null)
-    .catch((error) => {
-      logger.warn({ err: error }, "Failed to validate telemetry company id for cold email route");
-      return null;
-    });
+  let company: { id: string } | null = null;
+  try {
+    company = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null)
+      .catch((error) => {
+        logger.warn({ err: error }, "Failed to validate telemetry company id for cold email route");
+        return null;
+      });
+  } catch (error) {
+    logger.warn({ err: error }, "Cold email telemetry company lookup failed with non-standard DB adapter");
+    return null;
+  }
 
   return company?.id ?? null;
 }
@@ -497,8 +657,9 @@ async function resolveCheckoutUrl(
   companyId: string | null,
   baseUrl?: string,
   attribution: AttributionContext = EMPTY_ATTRIBUTION,
+  runtimeControls?: ColdEmailRuntimeControls | null,
 ): Promise<string | null> {
-  const productId = (process.env.DODO_PRODUCT_ID ?? "").trim();
+  const productId = runtimeControls?.dodoProductId ?? normalizeOptionalString(process.env.DODO_PRODUCT_ID);
   const hosted = (process.env.DODO_PAYMENTS_CHECKOUT_URL ?? process.env.WAITLIST_OFFER_PAYMENT_LINK ?? "").trim();
   const hostedConfigured = hosted.length > 0;
 
@@ -512,6 +673,9 @@ async function resolveCheckoutUrl(
     email,
     featureKey: COLD_EMAIL_FEATURE_KEY,
     feature: "cold_email_unlimited",
+    pricingVariantId: runtimeControls?.pricingVariant ?? null,
+    pricingVariantPriceCents: runtimeControls?.pricingVariantPriceCents ?? null,
+    pricingCheckoutTier: runtimeControls?.pricingTier ?? null,
     ...attributionToMetadata(attribution),
   };
   if (companyId) metadata.companyId = companyId;
@@ -759,8 +923,18 @@ function renderLandingPage(
   opts?: {
     initialEmail?: string | null;
     paymentState?: "success" | "cancel" | null;
+    variant?: LandingVariant | null;
+    experimentId?: string | null;
   },
 ): string {
+  const selectedVariant = opts?.variant ?? null;
+  const headline = selectedVariant?.headline ?? "Write high-converting cold emails in 10 seconds";
+  const subheadline = selectedVariant?.subheadline ?? "Paste your product and get a ready-to-send email.";
+  const ctaLabel = selectedVariant?.cta ?? "Generate your first email (free)";
+  const pricingFrame = selectedVariant?.pricingFrame ?? `Intro pricing active - limited free usage: ${freeLimit} generations`;
+  const variantId = selectedVariant?.id ?? "control";
+  const experimentId = opts?.experimentId ?? null;
+
   const demoOutput = [
     "Subject: quick win for SDR teams this week",
     "",
@@ -879,9 +1053,9 @@ function renderLandingPage(
   <div class="wrap">
     <div class="hero">
       <section class="card">
-        <span id="usage-pill" class="urgency">Intro pricing active - limited free usage: ${freeLimit} generations</span>
-        <h1>Write high-converting cold emails in 10 seconds</h1>
-        <p class="sub">Paste your product and get a ready-to-send email.</p>
+        <span id="usage-pill" class="urgency">${escapeHtml(pricingFrame)}</span>
+        <h1>${escapeHtml(headline)}</h1>
+        <p class="sub">${escapeHtml(subheadline)}</p>
         <p class="sub">No templates. No copywriting skills needed.</p>
 
         <label for="email">Work Email (required before full output)</label>
@@ -896,11 +1070,12 @@ function renderLandingPage(
         <label for="benefit">Key Benefit</label>
         <input id="benefit" placeholder="Get qualified replies faster" />
 
-        <button id="generate" type="button" class="btn">Generate your first email (free)</button>
+        <button id="generate" type="button" class="btn">${escapeHtml(ctaLabel)}</button>
         <div class="hint">By generating, you agree to receive your result and 2 tactical follow-ups.</div>
         <div class="hint">Used by 1,000+ founders.</div>
         <div class="hint">Agencies often charge $50/email. Here you can generate at less than $1 per output when upgraded.</div>
         <div id="status" class="status"></div>
+        <div id="landing-variant-meta" data-variant-id="${escapeHtml(variantId)}" data-experiment-id="${escapeHtml(experimentId ?? "")}" style="display:none"></div>
       </section>
 
       <section class="card">
@@ -920,6 +1095,8 @@ function renderLandingPage(
       var usagePill = document.getElementById("usage-pill");
       var initialEmail = ${JSON.stringify(opts?.initialEmail ?? "")};
       var paymentState = ${JSON.stringify(opts?.paymentState ?? "")};
+      var assignedVariantId = ${JSON.stringify(variantId)};
+      var experimentId = ${JSON.stringify(experimentId)};
       var SESSION_STORAGE_KEY = "paperclip_cold_email_session_id";
 
       if (!statusNode || !outputNode || !button || !emailNode) {
@@ -1060,6 +1237,8 @@ function renderLandingPage(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           event: "landing_view",
+          variant_id: assignedVariantId,
+          experiment_id: experimentId,
           utm_source: attribution.utm_source,
           utm_campaign: attribution.utm_campaign,
           referrer: attribution.referrer,
@@ -1181,7 +1360,7 @@ async function createCheckoutForEmail(args: {
   email: string;
   baseUrl: string;
   attribution?: AttributionContext;
-}): Promise<{ checkoutUrl: string | null; companyId: string | null }> {
+}): Promise<{ checkoutUrl: string | null; companyId: string | null; controls: ColdEmailRuntimeControls }> {
   const telemetryCompanyId = await resolveTelemetryCompanyIdForDb(args.db);
   const signup = await args.db
     .select({
@@ -1215,9 +1394,10 @@ async function createCheckoutForEmail(args: {
   }
 
   const companyId = telemetryCompanyId ?? signup?.companyId ?? null;
+  const controls = await resolveColdEmailRuntimeControls(args.db, companyId);
 
-  const checkoutUrl = await resolveCheckoutUrl(args.email, companyId, args.baseUrl, mergedAttribution);
-  return { checkoutUrl, companyId };
+  const checkoutUrl = await resolveCheckoutUrl(args.email, companyId, args.baseUrl, mergedAttribution, controls);
+  return { checkoutUrl, companyId, controls };
 }
 
 export function coldEmailRoutes(db: Db) {
@@ -1233,6 +1413,30 @@ export function coldEmailRoutes(db: Db) {
 
     const companyId = await resolveTelemetryCompanyIdForDb(db);
     const attribution = readAttributionFromRequest(req);
+    const visitor = resolveLandingVisitorId(req, attribution);
+    const visitorId = visitor.visitorId;
+    let selectedVariant: LandingVariant | null = null;
+
+    if (companyId) {
+      const generatedVariants = await generateLandingVariants(db, companyId).catch(() => getDefaultLandingVariants());
+      const activeVariants = generatedVariants.length > 0 ? generatedVariants : getDefaultLandingVariants();
+      selectedVariant = assignVariant(visitorId, activeVariants);
+      await trackImpression(db, companyId, {
+        visitorId,
+        experimentId: LANDING_EXPERIMENT_ID,
+        variantId: selectedVariant.id,
+        timestamp: Date.now(),
+      }).catch(() => undefined);
+    } else {
+      selectedVariant = assignVariant(visitorId, getDefaultLandingVariants());
+    }
+
+    if (!visitor.fromCookie) {
+      const secure = (req.header("x-forwarded-proto") ?? "").toLowerCase() === "https";
+      const cookieValue = `${LANDING_VISITOR_COOKIE}=${encodeURIComponent(visitorId)}; Path=/; Max-Age=31536000; SameSite=Lax${secure ? "; Secure" : ""}`;
+      res.append("Set-Cookie", cookieValue);
+    }
+
     if (companyId) {
       await db.insert(activityLog).values({
         companyId,
@@ -1246,6 +1450,9 @@ export function coldEmailRoutes(db: Db) {
         details: compactJsonRecord({
           source: "public_landing",
           host: req.header("host") ?? null,
+          visitorId,
+          experimentId: LANDING_EXPERIMENT_ID,
+          variantId: selectedVariant?.id ?? null,
           ...attributionToMetadata(attribution),
         }),
       }).catch(() => undefined);
@@ -1255,6 +1462,9 @@ export function coldEmailRoutes(db: Db) {
       source: "public_landing",
       host: req.header("host") ?? null,
       distinctId: req.ip,
+      visitor_id: visitorId,
+      experiment_id: LANDING_EXPERIMENT_ID,
+      variant_id: selectedVariant?.id ?? null,
       ...attributionToMetadata(attribution),
     });
 
@@ -1269,6 +1479,9 @@ export function coldEmailRoutes(db: Db) {
         metadata: {
           source: "cold_email_landing",
           host: req.header("host") ?? null,
+          visitorId,
+          experimentId: LANDING_EXPERIMENT_ID,
+          variantId: selectedVariant?.id ?? null,
           ...attributionToMetadata(attribution),
         },
       }).catch(() => undefined);
@@ -1279,11 +1492,17 @@ export function coldEmailRoutes(db: Db) {
     const paymentState = paymentStateRaw === "success" || paymentStateRaw === "cancel"
       ? paymentStateRaw
       : null;
+    const controls = await resolveColdEmailRuntimeControls(db, companyId);
 
     res
       .status(200)
       .set({ "Content-Type": "text/html; charset=utf-8" })
-      .send(renderLandingPage(baseUrl, getFreeLimit(), { initialEmail, paymentState }));
+      .send(renderLandingPage(baseUrl, controls.freeLimit, {
+        initialEmail,
+        paymentState,
+        variant: selectedVariant,
+        experimentId: LANDING_EXPERIMENT_ID,
+      }));
   });
 
   router.get("/cold-email/access", async (req, res) => {
@@ -1307,7 +1526,10 @@ export function coldEmailRoutes(db: Db) {
     const metadata = asMetadata(signup?.metadata);
     const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
     const paid = isColdEmailPaid(metadata);
-    const freeLimit = getFreeLimit();
+    const metadataCompanyId = normalizeOptionalString(metadata.companyId);
+    const companyId = isUuid(metadataCompanyId) ? metadataCompanyId : await resolveTelemetryCompanyIdForDb(db);
+    const controls = await resolveColdEmailRuntimeControls(db, companyId);
+    const freeLimit = controls.freeLimit;
 
     res.json({
       success: true,
@@ -1485,6 +1707,7 @@ export function coldEmailRoutes(db: Db) {
         forwardedProto: req.header("x-forwarded-proto"),
       });
       const companyId = await resolveTelemetryCompanyIdForDb(db);
+      const runtimeControls = await resolveColdEmailRuntimeControls(db, companyId);
       const source = "cold_email_tool";
       const now = new Date();
       const requestAttribution = readAttributionFromRequest(req);
@@ -1519,12 +1742,12 @@ export function coldEmailRoutes(db: Db) {
 
       const metadata = asMetadata(signup.metadata);
       const attribution = mergeAttribution(requestAttribution, readAttributionFromUnknown(metadata));
-      const freeLimit = getFreeLimit();
+      const freeLimit = runtimeControls.freeLimit;
       const generationCount = Math.max(0, Number(metadata.coldEmailGenerationCount ?? 0));
       const paid = isColdEmailPaid(metadata);
 
       if (!paid && generationCount >= freeLimit) {
-        const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl, attribution);
+          const checkoutUrl = await resolveCheckoutUrl(email, companyId, baseUrl, attribution, runtimeControls);
 
         await capturePosthogEvent("cold_email_paywall_hit", {
           source,
@@ -1548,6 +1771,8 @@ export function coldEmailRoutes(db: Db) {
               email,
               generationCount,
               freeLimit,
+              pricingVariant: runtimeControls.pricingVariant,
+              pricingVariantPriceCents: runtimeControls.pricingVariantPriceCents,
               checkoutUrl,
               ...attributionToMetadata(attribution),
             },
@@ -1746,6 +1971,9 @@ export function coldEmailRoutes(db: Db) {
         paid,
         generationCount: updatedGenerationCount,
         remainingFree: paid ? Number.MAX_SAFE_INTEGER : Math.max(0, freeLimit - updatedGenerationCount),
+        freeLimit,
+        pricingVariant: runtimeControls.pricingVariant,
+        pricingVariantPriceCents: runtimeControls.pricingVariantPriceCents,
         checkoutUrl,
         resultEmailSent: sentResultEmail,
       });
@@ -1810,7 +2038,7 @@ export function coldEmailRoutes(db: Db) {
       generated: Number(activity?.generated ?? 0),
       paywallHits: Number(activity?.paywallHits ?? 0),
       paidUsers: Number(paidUsers?.count ?? 0),
-      freeLimit: getFreeLimit(),
+      freeLimit: (await resolveColdEmailRuntimeControls(db, companyId)).freeLimit,
     });
   });
 

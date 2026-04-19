@@ -22,6 +22,13 @@ interface VariantPerformance {
   conversionRate: number;
 }
 
+export interface LandingImpressionInput {
+  variantId: string;
+  visitorId?: string | null;
+  experimentId?: string | null;
+  timestamp?: number;
+}
+
 const variantCache = new Map<string, { variants: LandingVariant[]; generatedAt: number }>();
 const CACHE_TTL_MS = 6 * 60 * 60_000;
 
@@ -97,7 +104,7 @@ Goal: 5-10% visitor → signup conversion`,
   return variants;
 }
 
-function getDefaultVariants(): LandingVariant[] {
+export function getDefaultLandingVariants(): LandingVariant[] {
   return [
     {
       id: "founder_story",
@@ -166,15 +173,28 @@ function getDefaultVariants(): LandingVariant[] {
   ];
 }
 
+function getDefaultVariants(): LandingVariant[] {
+  return getDefaultLandingVariants();
+}
+
 export function assignVariantToVisitor(variants: LandingVariant[], visitorId: string): LandingVariant {
   const hash = visitorId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
   return variants[hash % variants.length]!;
+}
+
+export function assignVariant(visitorId: string, variants: LandingVariant[]): LandingVariant {
+  return assignVariantToVisitor(variants, visitorId);
 }
 
 export async function recordVariantImpression(
   db: Db,
   companyId: string,
   variantId: string,
+  metadata?: {
+    visitorId?: string | null;
+    experimentId?: string | null;
+    timestamp?: number;
+  },
 ): Promise<void> {
   await db.insert(activityLog).values({
     companyId,
@@ -185,7 +205,24 @@ export async function recordVariantImpression(
     action: "landing.variant.impression",
     entityType: "company",
     entityId: companyId,
-    details: { variantId },
+    details: {
+      variantId,
+      visitorId: metadata?.visitorId ?? null,
+      experimentId: metadata?.experimentId ?? null,
+      observedAt: metadata?.timestamp ? new Date(metadata.timestamp).toISOString() : null,
+    },
+  });
+}
+
+export async function trackImpression(
+  db: Db,
+  companyId: string,
+  input: LandingImpressionInput,
+): Promise<void> {
+  await recordVariantImpression(db, companyId, input.variantId, {
+    visitorId: input.visitorId ?? null,
+    experimentId: input.experimentId ?? null,
+    timestamp: input.timestamp,
   });
 }
 

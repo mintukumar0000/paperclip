@@ -22,6 +22,9 @@ export interface SystemControls {
   subredditTargets: string[];
   pricingVariant: string;
   paywallTriggerCount: number;
+  freeLimit?: number;
+  priceCents?: number;
+  pricingVariants?: string[];
   cycleMode: CycleMode;
   autonomyLevel: AutonomyLevel;
   trafficChannels: TrafficChannel[];
@@ -94,7 +97,7 @@ export type SystemCycleStepKey = "execution" | "traffic" | "decision" | "email";
 
 export interface SystemCycleStepResult {
   step: SystemCycleStepKey;
-  status: "success" | "failed";
+  status: "success" | "failed" | "blocked";
   startedAt: string;
   completedAt: string;
   durationMs: number;

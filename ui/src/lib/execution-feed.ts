@@ -44,6 +44,26 @@ function isEvidenceType(value: unknown): value is ExecutionEvidence["type"] {
   return value === "reddit_post" || value === "deployment" || value === "checkout" || value === "email";
 }
 
+function isHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+function isValidEvidenceUrl(type: ExecutionEvidence["type"], url: string): boolean {
+  if (!isHttpUrl(url)) return false;
+
+  const lower = url.toLowerCase();
+  if (type === "reddit_post") {
+    return lower.includes("reddit.com") || lower.includes("redd.it");
+  }
+  if (type === "checkout") {
+    return lower.includes("checkout") || lower.includes("dodo") || lower.includes("stripe");
+  }
+  if (type === "deployment") {
+    return true;
+  }
+  return true;
+}
+
 export function toTitleCase(value: unknown, fallback = "-"): string {
   const text = readString(value) ?? fallback;
   return text
@@ -180,26 +200,39 @@ export function groupExecutionFeed(events: ExecutionFeedEventResponse[], limit =
 export function extractEvidence(event: ExecutionFeedEventResponse): ExecutionEvidence | null {
   const details = event.details;
   const type = isEvidenceType(details.type) ? details.type : null;
+  if (!type) return null;
+
   const metadata = readRecord(details.metadata);
 
-  const url = readString(details.url)
-    ?? readString(details.postUrl)
-    ?? readString(details.deploymentUrl)
-    ?? readString(details.checkoutUrl)
-    ?? readString(details.checkout_url)
+  const url = (type === "reddit_post"
+    ? (readString(details.postUrl) ?? readString(details.post_url) ?? readString(details.permalink) ?? readString(details.url))
+    : type === "checkout"
+      ? (readString(details.checkoutUrl) ?? readString(details.checkout_url) ?? readString(details.paymentLink) ?? readString(details.url))
+      : type === "deployment"
+        ? (readString(details.deploymentUrl) ?? readString(details.deployment_url) ?? readString(details.url))
+        : (readString(details.previewUrl)
+          ?? readString(details.preview_url)
+          ?? readString(details.emailPreviewUrl)
+          ?? readString(details.email_preview_url)
+          ?? readString(details.url)))
     ?? null;
 
-  const inferredType: ExecutionEvidence["type"] | null = type
-    ?? (event.action.startsWith("distribution.reddit.post") ? "reddit_post" : null)
-    ?? (event.action.startsWith("billing.") || event.action.includes("checkout") ? "checkout" : null)
-    ?? (event.action.startsWith("email.") ? "email" : null)
-    ?? (event.action.includes("deploy") || readString(details.deploymentUrl) ? "deployment" : null);
+  if (!url || !isValidEvidenceUrl(type, url)) return null;
 
-  if (!inferredType) return null;
+  if (type === "email") {
+    const providerId = readString(details.emailId)
+      ?? readString(details.email_id)
+      ?? readString(details.providerMessageId)
+      ?? readString(details.provider_message_id)
+      ?? readString(details.messageId)
+      ?? readString(details.message_id)
+      ?? null;
+    if (!providerId) return null;
+  }
 
-  if (inferredType === "reddit_post") {
+  if (type === "reddit_post") {
     return {
-      type: inferredType,
+      type,
       label: "Reddit Post",
       title: "Post Created",
       url,
@@ -207,9 +240,9 @@ export function extractEvidence(event: ExecutionFeedEventResponse): ExecutionEvi
     };
   }
 
-  if (inferredType === "deployment") {
+  if (type === "deployment") {
     return {
-      type: inferredType,
+      type,
       label: "Deployment",
       title: "Deployment Created",
       url,
@@ -217,9 +250,9 @@ export function extractEvidence(event: ExecutionFeedEventResponse): ExecutionEvi
     };
   }
 
-  if (inferredType === "checkout") {
+  if (type === "checkout") {
     return {
-      type: inferredType,
+      type,
       label: "Checkout",
       title: "Checkout Link Created",
       url,
@@ -228,7 +261,7 @@ export function extractEvidence(event: ExecutionFeedEventResponse): ExecutionEvi
   }
 
   return {
-    type: inferredType,
+    type,
     label: "Email",
     title: "Email Activity",
     url,

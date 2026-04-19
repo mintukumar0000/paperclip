@@ -93,10 +93,22 @@ function normalizeDecisionMode(value: string | undefined): DecisionMode | undefi
   return normalized;
 }
 
+function normalizePricingVariantFromPrice(priceCents: number): string {
+  if (priceCents >= 2_500) return "entry_29";
+  if (priceCents >= 1_500) return "entry_19";
+  return "entry_9";
+}
+
 function sanitizeUpdate(input: UpdateSystemControls): Partial<typeof systemControls.$inferInsert> {
   const mappedTrafficEnabled = typeof input.systemActive === "boolean"
     ? input.systemActive
     : input.trafficEnabled;
+  const mappedPricingVariant = typeof input.priceCents === "number"
+    ? normalizePricingVariantFromPrice(Math.max(100, Math.round(input.priceCents)))
+    : input.pricingVariant
+      ?? (Array.isArray(input.pricingVariants) && input.pricingVariants.length > 0
+        ? input.pricingVariants[0]
+        : undefined);
   const mappedPostInterval = typeof input.loopIntervalSeconds === "number"
     ? Math.max(5_000, Math.min(3_600_000, Math.trunc(input.loopIntervalSeconds * 1000)))
     : typeof input.trafficPostIntervalMs === "number"
@@ -118,11 +130,13 @@ function sanitizeUpdate(input: UpdateSystemControls): Partial<typeof systemContr
         ? Math.max(1, Math.min(24, Math.trunc(input.postFrequency)))
         : input.postFrequency,
     subredditTargets: normalizeSubredditTargets(input.subredditTargets),
-    pricingVariant: input.pricingVariant,
+    pricingVariant: mappedPricingVariant,
     paywallTriggerCount:
-      typeof input.paywallTriggerCount === "number"
-        ? Math.max(1, Math.min(50, Math.trunc(input.paywallTriggerCount)))
-        : input.paywallTriggerCount,
+      typeof input.freeLimit === "number"
+        ? Math.max(1, Math.min(50, Math.trunc(input.freeLimit)))
+        : typeof input.paywallTriggerCount === "number"
+          ? Math.max(1, Math.min(50, Math.trunc(input.paywallTriggerCount)))
+          : input.paywallTriggerCount,
     cycleMode: input.cycleMode,
     autonomyLevel: input.autonomyLevel,
     trafficChannels: normalizeTrafficChannels(input.trafficChannels),

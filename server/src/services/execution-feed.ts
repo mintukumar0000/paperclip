@@ -190,13 +190,29 @@ function inferEvidenceType(action: string, details: Record<string, unknown>): Ex
   }
 
   const lower = action.toLowerCase();
-  if (lower.startsWith("distribution.reddit.post")) return "reddit_post";
-  if (lower.includes("checkout") || lower.startsWith("billing.")) return "checkout";
-  if (lower.startsWith("email.")) return "email";
+  const redditUrl = readString(details.postUrl)
+    ?? readString(details.post_url)
+    ?? readString(details.permalink)
+    ?? null;
+  if (redditUrl && lower.startsWith("distribution.reddit.post")) return "reddit_post";
 
-  const deploymentUrl = readString(details.deploymentUrl) ?? readString(details.deployment_url);
-  if (deploymentUrl) return "deployment";
-  if (lower.includes("deploy") || lower.includes("deployment")) return "deployment";
+  const checkoutUrl = readString(details.checkoutUrl)
+    ?? readString(details.checkout_url)
+    ?? readString(details.paymentLink)
+    ?? null;
+  if (checkoutUrl && (lower.includes("checkout") || lower.startsWith("billing."))) return "checkout";
+
+  const deploymentUrl = readString(details.deploymentUrl)
+    ?? readString(details.deployment_url)
+    ?? null;
+  if (deploymentUrl && (lower.includes("deploy") || lower.includes("deployment"))) return "deployment";
+
+  const emailPreviewUrl = readString(details.previewUrl)
+    ?? readString(details.preview_url)
+    ?? readString(details.emailPreviewUrl)
+    ?? readString(details.email_preview_url)
+    ?? null;
+  if (emailPreviewUrl && lower.startsWith("email.")) return "email";
 
   return null;
 }
@@ -219,6 +235,14 @@ function inferEvidenceUrl(type: ExecutionEvidenceType | null, details: Record<st
     return readString(details.checkoutUrl)
       ?? readString(details.checkout_url)
       ?? readString(details.paymentLink)
+      ?? readString(details.url);
+  }
+
+  if (type === "email") {
+    return readString(details.previewUrl)
+      ?? readString(details.preview_url)
+      ?? readString(details.emailPreviewUrl)
+      ?? readString(details.email_preview_url)
       ?? readString(details.url);
   }
 

@@ -33,7 +33,8 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
     const rows = events
       .map((event) => {
         const evidence = extractEvidence(event);
-        if (!evidence) return null;
+        const url = evidence?.url ?? null;
+        if (!evidence || !url) return null;
         return {
           id: event.id,
           createdAt: event.createdAt,
@@ -46,6 +47,7 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
               ? (event.details.artifactMetrics as { clicks?: number; conversions?: number; revenueCents?: number })
               : null,
           evidence,
+          url,
         };
       })
       .filter((row): row is NonNullable<typeof row> => row !== null);
@@ -98,18 +100,14 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
                   <ExecutionStatusBadge status={row.status} />
                 </div>
 
-                {row.evidence.url ? (
-                  <a
-                    href={row.evidence.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-2 block truncate text-sm text-primary hover:underline"
-                  >
-                    {row.evidence.url}
-                  </a>
-                ) : (
-                  <p className="mt-2 text-sm text-muted-foreground">No direct URL attached to this artifact.</p>
-                )}
+                <a
+                  href={row.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-2 block truncate text-sm text-primary hover:underline"
+                >
+                  {row.url}
+                </a>
 
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>Time: {formatRelativeTime(row.createdAt)}</span>
@@ -122,33 +120,31 @@ export function OutputEvidencePanel({ companyId }: OutputEvidencePanelProps) {
                   </span>
                   {row.decisionId ? <span>decision {row.decisionId.slice(0, 8)}</span> : null}
                   <div className="flex items-center gap-1.5">
-                    {row.evidence.url ? (
-                      <>
-                        <Button asChild size="sm" variant="outline" className="h-7 px-2 text-xs">
-                          <a href={row.evidence.url} target="_blank" rel="noreferrer">
-                            <ExternalLink className="mr-1 h-3 w-3" />
-                            Open
-                          </a>
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-7 px-2 text-xs"
-                          onClick={async () => {
-                            try {
-                              await navigator.clipboard.writeText(row.evidence.url!);
-                              setCopiedId(row.id);
-                              setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1400);
-                            } catch {
-                              // Ignore clipboard failures in restricted environments.
-                            }
-                          }}
-                        >
-                          <Copy className="mr-1 h-3 w-3" />
-                          {copiedId === row.id ? "Copied" : "Copy"}
-                        </Button>
-                      </>
-                    ) : null}
+                    <>
+                      <Button asChild size="sm" variant="outline" className="h-7 px-2 text-xs">
+                        <a href={row.url} target="_blank" rel="noreferrer">
+                          <ExternalLink className="mr-1 h-3 w-3" />
+                          Open
+                        </a>
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 px-2 text-xs"
+                        onClick={async () => {
+                          try {
+                            await navigator.clipboard.writeText(row.url);
+                            setCopiedId(row.id);
+                            setTimeout(() => setCopiedId((current) => (current === row.id ? null : current)), 1400);
+                          } catch {
+                            // Ignore clipboard failures in restricted environments.
+                          }
+                        }}
+                      >
+                        <Copy className="mr-1 h-3 w-3" />
+                        {copiedId === row.id ? "Copied" : "Copy"}
+                      </Button>
+                    </>
                   </div>
                 </div>
               </article>

@@ -1152,7 +1152,11 @@ export function CommandCenter() {
                   </div>
                   {(event.status === "blocked" || event.status === "pending" || event.status === "skipped" || event.status === "failed") && (
                     <div className="mt-1 text-xs text-muted-foreground">
-                      Reason: {group.reason ?? "Rule gate active"}
+                      {event.status === "blocked"
+                        ? "Blocked"
+                        : event.status === "pending"
+                          ? "Pending"
+                          : "Reason"}: {group.reason ?? "Rule gate active"}
                     </div>
                   )}
                   <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted-foreground">

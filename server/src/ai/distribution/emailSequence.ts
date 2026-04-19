@@ -493,8 +493,12 @@ export async function runEmailSequenceCycle(
       }
     }
 
+    const hardFailure = attempted > 0 && sent === 0;
+    const hardFailureReason = "email credentials missing or send failed";
+
     for (const companyId of companyIds) {
       const summary = summaryByCompany.get(companyId) ?? { sent: 0, attempted: 0 };
+      const companyFailed = hardFailure && summary.attempted > 0 && summary.sent === 0;
       await logActivity(db, {
         companyId,
         actorType: "system",
@@ -503,17 +507,19 @@ export async function runEmailSequenceCycle(
         entityType: "company",
         entityId: companyId,
         details: {
-          status: "success",
+          status: companyFailed ? "failed" : "success",
           sent: summary.sent,
           attempted: summary.attempted,
+          reason: companyFailed ? hardFailureReason : null,
           queueSize: signups.filter((signup) => signup.companyId === companyId).length,
         },
       }).catch(() => undefined);
 
       await setCycleState(db, companyId, "email_sequence", {
-        status: "completed",
+        status: companyFailed ? "failed" : "completed",
         stage: "idle",
         currentAction: null,
+        lastError: companyFailed ? hardFailureReason : null,
         lastRunCompletedAt: new Date(),
         lastRunDurationMs: Date.now() - cycleStartedAt,
         details: {
@@ -528,6 +534,16 @@ export async function runEmailSequenceCycle(
     }
 
     eventBus.publish("email.sequence.cycle.completed", { sent, timestamp: now.toISOString() });
+    if (hardFailure) {
+      return {
+        status: "failed",
+        sent,
+        attempted,
+        companyIds: Array.from(companyIds),
+        error: hardFailureReason,
+      };
+    }
+
     return {
       status: "success",
       sent,

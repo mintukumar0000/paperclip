@@ -4,6 +4,7 @@ import { waitlistSignups, aiLearningRecords, activityLog, and, desc, eq, sql } f
 import { assertBoard, assertCompanyAccess } from "./authz.js";
 import { createDodoCheckoutSession } from "../ai/tools/externalTools.js";
 import { assignPriceVariant, recordPricingImpression, getPricingExperimentResults } from "../core/pricingOptimizer.js";
+import { getSystemControls } from "../services/system-controls.js";
 import { resolvePublicBaseUrl as resolveSharedPublicBaseUrl } from "../public-base-url.js";
 
 type SignupPayload = {
@@ -112,6 +113,56 @@ function mapPriceToOfferTier(priceCents: number): OfferTier {
   }
 
   return winner;
+}
+
+type SystemPricingOverride = {
+  tier: OfferTier;
+  variantId: string;
+  priceCents: number;
+  label: string;
+};
+
+function normalizeSystemPricingVariant(raw: string | null | undefined): string {
+  const normalized = normalizeOptionalString(raw)?.toLowerCase() ?? "";
+  if (!normalized) return "";
+  if (normalized === "entry" || normalized === "entry_9") return "entry_9";
+  if (normalized === "entry_19" || normalized === "upsell" || normalized === "upsell_19") return "entry_19";
+  if (normalized === "entry_29" || normalized === "premium" || normalized === "premium_29") return "entry_29";
+  return normalized;
+}
+
+function pricingTierFromSystemVariant(variant: string): OfferTier {
+  if (variant.includes("29") || variant.includes("premium")) return "premium";
+  if (variant.includes("19") || variant.includes("upsell")) return "upsell";
+  return "entry";
+}
+
+function pricingCentsFromSystemVariant(variant: string): number {
+  const numericMatch = variant.match(/(\d{1,4})/);
+  if (numericMatch) {
+    const dollars = Number(numericMatch[1]);
+    if (Number.isFinite(dollars) && dollars > 0) return Math.round(dollars * 100);
+  }
+  const tier = pricingTierFromSystemVariant(variant);
+  if (tier === "premium") return 2900;
+  if (tier === "upsell") return 1900;
+  return 900;
+}
+
+async function resolveSystemPricingOverride(db: Db, companyId: string | null): Promise<SystemPricingOverride | null> {
+  if (!companyId) return null;
+
+  const controls = await getSystemControls(db, companyId).catch(() => null);
+  const normalizedVariant = normalizeSystemPricingVariant(controls?.pricingVariant ?? null);
+  if (!normalizedVariant) return null;
+
+  const tier = pricingTierFromSystemVariant(normalizedVariant);
+  return {
+    tier,
+    variantId: normalizedVariant,
+    priceCents: pricingCentsFromSystemVariant(normalizedVariant),
+    label: `system_controls_${tier}`,
+  };
 }
 
 function offerPriceFromEnv(tier: OfferTier): number {
@@ -662,6 +713,7 @@ export async function sendOfferEmailsToRecentSignups(
     let skipped = 0;
     const companyDispatchStats = new Map<string, { attempted: number; sent: number; skipped: number }>();
     const companyIntelligence = new Map<string, OfferLearningIntelligence>();
+    const companyPricingOverrides = new Map<string, SystemPricingOverride | null>();
     const baseUrl = resolvePublicBaseUrl({
       reqOrigin: opts.origin,
       host: opts.host,
@@ -689,10 +741,14 @@ export async function sendOfferEmailsToRecentSignups(
         if (!companyIntelligence.has(user.companyId)) {
           companyIntelligence.set(user.companyId, await resolveOfferLearningIntelligence(db, user.companyId));
         }
+        if (!companyPricingOverrides.has(user.companyId)) {
+          companyPricingOverrides.set(user.companyId, await resolveSystemPricingOverride(db, user.companyId));
+        }
         intelligence = companyIntelligence.get(user.companyId) ?? null;
       }
 
-      const tier = selectTierForSignup({ source: user.source, metadata: userMetadata }, intelligence);
+      const pricingOverride = user.companyId ? (companyPricingOverrides.get(user.companyId) ?? null) : null;
+      const tier = pricingOverride?.tier ?? selectTierForSignup({ source: user.source, metadata: userMetadata }, intelligence);
       const subjectPattern = intelligence?.subjectPattern ?? "urgency_24h";
       const trackedLink = `${baseUrl}/api/waitlist/offer-click?email=${encodeURIComponent(user.email)}&tier=${encodeURIComponent(tier)}${user.companyId ? `&companyId=${encodeURIComponent(user.companyId)}` : ""}`;
 
@@ -953,12 +1009,20 @@ export function waitlistRoutes(db: Db) {
     const requestedTier = resolveOfferTier(normalizeOptionalString(req.query.tier));
     const requestedCompanyId = normalizeOptionalString(req.query.companyId);
     const companyId = requestedCompanyId ?? await resolveCompanyIdForEmail(db, email);
+    const pricingOverride = await resolveSystemPricingOverride(db, companyId);
 
     // Pricing experiment: assign variant for this user
-    const priceVariant = email ? assignPriceVariant(email, requestedTier) : null;
-    const checkoutTier = priceVariant
+    const experimentVariant = email ? assignPriceVariant(email, requestedTier) : null;
+    const priceVariant = pricingOverride
+      ? {
+          id: pricingOverride.variantId,
+          priceCents: pricingOverride.priceCents,
+          label: pricingOverride.label,
+        }
+      : experimentVariant;
+    const checkoutTier = pricingOverride?.tier ?? (priceVariant
       ? mapPriceToOfferTier(priceVariant.priceCents)
-      : requestedTier;
+      : requestedTier);
     if (priceVariant && companyId) {
       await recordPricingImpression(db, companyId, email ?? "unknown", priceVariant, requestedTier).catch(() => {});
     }

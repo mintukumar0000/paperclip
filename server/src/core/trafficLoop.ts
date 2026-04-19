@@ -235,6 +235,8 @@ interface TrafficCycleSummary {
   results: PostResult[];
   successCount: number;
   failCount: number;
+  status: "success" | "failed" | "blocked";
+  blockReason?: string;
   error?: string;
 }
 
@@ -1495,7 +1497,14 @@ async function runTrafficCycle(
 ): Promise<TrafficCycleSummary> {
   if (trafficLoopRunning) {
     logger.warn("Traffic loop cycle already in progress, skipping");
-    return { results: [], successCount: 0, failCount: 0, error: "already_running" };
+    return {
+      results: [],
+      successCount: 0,
+      failCount: 0,
+      status: "blocked",
+      blockReason: "already_running",
+      error: "already_running",
+    };
   }
 
   trafficLoopRunning = true;
@@ -1550,7 +1559,13 @@ async function runTrafficCycle(
           details: { reason: "traffic_disabled" },
         }).catch(() => undefined);
       }
-      return { results: [], successCount: 0, failCount: 0 };
+      return {
+        results: [],
+        successCount: 0,
+        failCount: 0,
+        status: "blocked",
+        blockReason: "traffic_disabled",
+      };
     }
 
     const trafficControls: TrafficRuntimeControls | null = controls
@@ -1645,7 +1660,13 @@ async function runTrafficCycle(
           },
         }).catch(() => undefined);
       }
-      return { results: [], successCount: 0, failCount: 0 };
+      return {
+        results: [],
+        successCount: 0,
+        failCount: 0,
+        status: "blocked",
+        blockReason: "no_channels_enabled",
+      };
     }
 
     const runtimeTrafficMode = trafficControls?.trafficMode ?? "balanced";
@@ -1722,6 +1743,8 @@ async function runTrafficCycle(
         results: [],
         successCount: 0,
         failCount: 0,
+        status: "blocked",
+        blockReason: "awaiting_approval",
       };
     }
 
@@ -1911,6 +1934,7 @@ async function runTrafficCycle(
       results,
       successCount,
       failCount,
+      status: failCount > 0 ? "failed" : "success",
     };
   } catch (err) {
     logger.error({ err }, "Traffic loop cycle failed");
@@ -1947,6 +1971,7 @@ async function runTrafficCycle(
       results,
       successCount: results.filter((r) => r.posted).length,
       failCount: results.filter((r) => !r.posted && r.method !== "none" && r.method !== "backoff").length,
+      status: "failed",
       error: message,
     };
   } finally {

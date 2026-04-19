@@ -42,6 +42,18 @@ function parseCsvValues(raw: unknown): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+function inferPriceCentsFromVariant(variant: string): number {
+  const normalized = variant.toLowerCase();
+  const match = normalized.match(/(\d{1,4})/);
+  if (match) {
+    const dollars = Number(match[1]);
+    if (Number.isFinite(dollars) && dollars > 0) return Math.round(dollars * 100);
+  }
+  if (normalized.includes("29") || normalized.includes("premium")) return 2900;
+  if (normalized.includes("19") || normalized.includes("upsell")) return 1900;
+  return 900;
+}
+
 const EXECUTION_FEED_CATEGORIES = new Set<ExecutionFeedCategory>([
   "traffic",
   "email",
@@ -72,6 +84,9 @@ export function systemControlsRoutes(db: Db) {
       ...controls,
       systemActive: controls.trafficEnabled,
       loopIntervalSeconds: Math.max(30, Math.trunc((controls.trafficPostIntervalMs ?? 60_000) / 1000)),
+      freeLimit: controls.paywallTriggerCount,
+      priceCents: inferPriceCentsFromVariant(controls.pricingVariant),
+      pricingVariants: ["entry_9", "entry_19", "entry_29"],
     });
   });
 

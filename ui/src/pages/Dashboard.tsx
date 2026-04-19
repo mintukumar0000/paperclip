@@ -29,7 +29,6 @@ import { billingApi } from "../api/billing";
 import { agentsApi } from "../api/agents";
 import { issuesApi } from "../api/issues";
 import { goalsApi } from "../api/goals";
-import { approvalsApi } from "../api/approvals";
 import {
   LayoutDashboard,
   Pause,
@@ -170,13 +169,6 @@ export function Dashboard() {
     refetchInterval: 20_000,
   });
 
-  const approvalsQuery = useQuery({
-    queryKey: selectedCompanyId ? queryKeys.approvals.list(selectedCompanyId, "pending") : ["approvals", "none"],
-    queryFn: () => approvalsApi.list(selectedCompanyId!, "pending"),
-    enabled: !!selectedCompanyId,
-    refetchInterval: 15_000,
-  });
-
   useEffect(() => {
     if (!executionFeedQuery.data) return;
     setFeedBuffer(executionFeedQuery.data.slice(0, 40));
@@ -230,7 +222,6 @@ export function Dashboard() {
     queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.agents.list(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.goals.list(selectedCompanyId) });
-    queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(selectedCompanyId, "pending") });
   };
 
   const runCycleMutation = useMutation({
@@ -328,7 +319,7 @@ export function Dashboard() {
   const agents = agentsQuery.data ?? [];
   const issues = issuesQuery.data ?? [];
   const goals = goalsQuery.data ?? [];
-  const pendingApprovals = approvalsQuery.data ?? [];
+  const pendingApprovals = decisions.filter((decision) => decision.status === "awaiting_approval");
   const revenue = Number(financeQuery.data?.revenueCents ?? 0);
   const visitors = Number(revenueQuery.data?.traffic ?? 0);
   const conversions = Number(revenueQuery.data?.conversions ?? 0);
@@ -746,7 +737,11 @@ export function Dashboard() {
                     </div>
                     {(group.event.status === "blocked" || group.event.status === "pending" || group.event.status === "skipped" || group.event.status === "failed") && (
                       <div className="mt-1 text-xs text-muted-foreground">
-                        Reason: {group.reason ?? "Rule gate active"}
+                        {group.event.status === "blocked"
+                          ? "Blocked"
+                          : group.event.status === "pending"
+                            ? "Pending"
+                            : "Reason"}: {group.reason ?? "Rule gate active"}
                       </div>
                     )}
                     {group.event.details.artifactMetrics && typeof group.event.details.artifactMetrics === "object" ? (

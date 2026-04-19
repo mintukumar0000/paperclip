@@ -136,6 +136,41 @@ export async function runCompanyCycleOrchestrator(input: {
         const result = await withActiveCompanyScope(companyId, async () =>
           runTrafficCycleWithDecision({ db, baseUrl: resolvePublicBaseUrl() }, { traceId }),
         );
+        if (result.status === "blocked") {
+          const blockedReason = result.blockReason ?? "traffic_blocked";
+          steps.push({
+            step,
+            status: "blocked",
+            startedAt: stepStarted,
+            completedAt: new Date().toISOString(),
+            durationMs: Date.now() - stepStartedAt,
+            details: {
+              reason: blockedReason,
+              successCount: result.successCount,
+              failCount: result.failCount,
+              resultCount: result.results.length,
+            },
+          });
+
+          await logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            action: "cycle.execution.step.blocked",
+            entityType: "company",
+            entityId: companyId,
+            details: {
+              status: "blocked",
+              traceId,
+              cycleType,
+              step,
+              reason: blockedReason,
+            },
+          }).catch(() => undefined);
+          continue;
+        }
         if (result.error) {
           throw new Error(result.error);
         }
@@ -210,8 +245,9 @@ export async function runCompanyCycleOrchestrator(input: {
   }
 
   const failedSteps = steps.filter((step) => step.status === "failed").length;
+  const blockedSteps = steps.filter((step) => step.status === "blocked").length;
   const status: SystemCycleRunResult["status"] = failedSteps === 0
-    ? "success"
+    ? (blockedSteps === 0 ? "success" : "partial_failed")
     : failedSteps === steps.length
       ? "failed"
       : "partial_failed";
@@ -240,6 +276,7 @@ export async function runCompanyCycleOrchestrator(input: {
       cycleType,
       status,
       stepOrder,
+      blockedSteps,
     },
   }).catch(() => undefined);
 
